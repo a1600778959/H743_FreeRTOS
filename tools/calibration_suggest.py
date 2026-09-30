@@ -13,6 +13,24 @@ import re
 import sys
 from pathlib import Path
 
+# 消息版本 1（2026-09-22）：状态压平为 11 个顶层阶段，旧细粒度状态常量
+# （WAIT_ARM_*/STOP_*/COMMIT_*/APPLY_*/RESTORE_*/PROFILE_REVERSE/PROFILE_FULL
+# 及独立 Return/Braking/Deceleration 状态）全部退役，不保留别名或映射层。
+# 状态文本与固件生成的 uORB labels 同形：常量名去 STATE_ 前缀、小写、
+# 下划线转空格（如 STATE_PREFLIGHT → "preflight"）。
+STATE_LABELS = (
+    "idle", "preflight", "baseline", "straight", "turn", "magnetic", "profile",
+    "identification", "validation", "navigation", "finalize",
+)
+# 入场阶段 STATE_PREFLIGHT 的单次转换状态行是证据窗口边界；周期快照行
+# （session=N state=...）和其余阶段转换行都不构成新会话。
+SESSION_ENTRY_LABEL = "preflight"
+
+
+def canonical_enum(text: str) -> str:
+    """把标签文本转回枚举常量命名（大写、下划线）；枚举集合本身不变。"""
+    return text.strip().upper().replace(" ", "_")
+
 
 def parse_messages(path: Path) -> dict:
     """按明确会话边界清理证据，同一会话的周期摘要和重复终态保持幂等。"""
@@ -29,12 +47,17 @@ def parse_messages(path: Path) -> dict:
             session_id, line = int(tagged.group(1)), tagged.group(2).strip()
             if result["session_id"] != session_id or line == "begin":
                 result = empty(session_id)
-        elif re.fullmatch(r"(?:STATE_)?PREFLIGHT_CHECK", line):
-            # 兼容旧版单次入场行；周期的 PREFLIGHT_CHECK; ... 不是新会话。
-            result = empty(result["session_id"])
-        final = re.match(r"(SUCCESS|PARTIAL|FAILED|CANCELLED):\s*([A-Z0-9_]+)\b", line)
+        elif line in STATE_LABELS:
+            # 只有入场阶段 PREFLIGHT 的单次状态行重置证据窗口；其余阶段转换
+            # 行与周期快照都归属当前会话。
+            if line == SESSION_ENTRY_LABEL:
+                result = empty(result["session_id"])
+        # 终态/失败码文本与生成的 uORB labels 同形（如 "failed: drive
+        # envelope"），规范化回枚举常量名后进入既有建议表；失败码集合不变。
+        final = re.match(r"(SUCCESS|PARTIAL|FAILED|CANCELLED):[ \t]*([a-zA-Z0-9_ ]+)",
+                         line, re.IGNORECASE)
         if final:
-            terminal = final.groups()
+            terminal = (final.group(1).upper(), canonical_enum(final.group(2)))
             if not tagged and result["session_id"] is None and result["final"] is not None and \
                     terminal != (result["final"], result["failure"]):
                 # 旧日志只有不同终态、没有入场边界时，保守视为另一段，禁止继承。
@@ -117,8 +140,8 @@ def suggest(messages: dict, params: dict) -> list[str]:
         advice.append("最近会话未找到终态；请导出完整消息，不能据此认定校准成功。")
     if failure == "DRIVE_ENVELOPE":
         advice.append("驱动请求已到冻结包络，连续 8 秒仍无运动：核对 MOT_THR_MIN、供电、电池与机械传动；不要直接提高驱动上限。")
-    elif failure in ("FENCE_SPACE", "FENCE_BOUNDARY", "STOP_DISTANCE"):
-        advice.append("按当前载荷和地面实测可信停车距离，检查场地及 RO_CAL_RADIUS；不要缩小 RO_CAL_STOP_D 申报来通过围栏。")
+    elif failure in ("FENCE_SPACE", "FENCE_BOUNDARY", "DECELERATION", "STOP_DISTANCE"):
+        advice.append("核对直线 RO_CAL_DIST 是否足以达到全输出稳定车速并完成反向制动，以及输出方向、MOT_REV_DELAY、RTK 质量和停车观测；RO_DECEL_LIM 可由自动校准从未知初值辨识。")
     elif failure == "MOTION_UNAVAILABLE":
         advice.append("运动条件或控制余量不足：结合该会话前序消息核对输出安全链、速度配置及 FF 余量。")
     elif failure in ("RTK_QUALITY", "RTK_INCONSISTENT"):
@@ -127,6 +150,8 @@ def suggest(messages: dict, params: dict) -> list[str]:
         advice.append("磁校准未收敛：检查附近铁磁件及大电流线束布置。")
     elif failure in ("PROFILE_UNOBSERVABLE", "IDENTIFICATION", "GAIN_VALIDATION"):
         advice.append("响应或闭环证据未通过：结合前序失败阶段检查反馈、激励覆盖和 FF 余量；不凭离线文本猜测 PI 增益。")
+    elif failure == "STORAGE":
+        advice.append("参数持久化持续不可用（典型为参数 Flash 分区满）：查看同会话 param: 存储错误文本的 errno 区分 SD 镜像与擦除分支。后台不自动擦除；恢复动作在自动校准 COMMIT_LEVEL 的显式保存中完成（SD 先提交同代快照再整区擦除回写，不丢参数）——重新进入自动校准即为恢复流程；此前未落盘的参数修改已丢失，恢复后需重做。")
     elif failure not in (None, "NONE", "OPERATOR_CANCEL"):
         advice.append(f"失败码 {failure} 暂无专属规则；保留原始消息并核对对应固件说明，不能视为正常。")
     interference = messages.get("interference")
@@ -147,16 +172,21 @@ def suggest(messages: dict, params: dict) -> list[str]:
     if not params:
         advice.append("未提供参数导出，参数配置未知；未使用固件默认值代填。")
     else:
-        stop = params.get("RO_CAL_STOP_D")
+        deceleration = params.get("RO_DECEL_LIM")
+        distance = params.get("RO_CAL_DIST")
         radius = params.get("RO_CAL_RADIUS")
         speed = params.get("RO_SPEED_LIM")
         envelope = params.get("MOT_THR_MAX")
-        if any(value is None for value in (stop, radius, speed, envelope)):
-            advice.append("参数导出缺少停车距离、围栏、速度或驱动包络信息，缺项按未知处理。")
-        if stop is not None and stop <= 0:
-            advice.append("RO_CAL_STOP_D 未给出正的可信停车距离，动态阶段不可用；按当前工况实测后填写。")
-        if radius is not None and stop is not None and radius <= stop:
-            advice.append("申报停车距离已不小于围栏半径，无法据此证明动态空间充足；核对场地和停车实测值。")
+        if any(value is None for value in (deceleration, distance, radius, speed, envelope)):
+            advice.append("参数导出缺少直线距离、减速度、圆形围栏、速度或驱动包络信息，缺项按未知处理。")
+        if deceleration is not None and deceleration <= 0:
+            advice.append("RO_DECEL_LIM 尚未配置；自动校准将先低速探测，再进行两次全输出反向制动测量，成功后自动保存。")
+        if distance is not None and not 1 <= distance <= 100:
+            advice.append("RO_CAL_DIST 超出当前支持的 1–100 m 范围。")
+        if radius is not None and speed is not None and deceleration is not None and deceleration > 0:
+            stop = speed * speed / (2.0 * deceleration)
+            if radius <= stop:
+                advice.append("理论制动距离已不小于圆形半径，转圈/路径空间不足；直线长度由 RO_CAL_DIST 独立限制。")
         if speed is not None and speed <= 0:
             advice.append("RO_SPEED_LIM 非正，本会话不允许动态校准。")
         if envelope is not None and not 0.05 <= envelope <= 1.0:
