@@ -189,11 +189,25 @@ parameters:
       decimal: 2
 - group: Rover Auto Calibration
   definitions:
+    RO_CAL_XTE_MAX:
+      category: System
+      description:
+        short: 自动校准路径最大横向误差
+        long: |-
+          正式导航标定实验允许的最大横向路径偏差，必须为有限正数。
+          会话开始冻结此值；超差只判当前候选不合格，不与航点到达半径混用。
+      type: float
+      default: 0.20
+      unit: m
+      min: 0
+      increment: 0.01
+      decimal: 2
     RO_CAL_RADIUS:
       description:
         short: 自动校准位置约束半径
         long: |-
-          以进入校准时记录的 GNSS 位置为圆心的水平半径，整个会话中圆心保持固定。
+          约束转圈及二维路径校准；所有直线校准段使用独立的 RO_CAL_DIST。
+          以进入校准时记录的 GNSS 位置为圆心，整个会话中圆心保持固定。
           仅约束定位参考点，不覆盖车辆的完整外廓。
           定位不确定度、延迟和停车距离都会压缩可用空间。
       type: float
@@ -203,17 +217,18 @@ parameters:
       unit: m
       increment: 0.5
       decimal: 1
-    RO_CAL_STOP_D:
+    RO_CAL_DIST:
       description:
-        short: 经过实测确认的校准停车距离
+        short: 自动校准直线距离
         long: |-
-          在当前载荷、地面条件和允许的校准运动范围内，发出停车请求后，
-          定位参考点可能继续移动的保守最大距离，须计入执行器响应和车辆惯性。
-          0 表示未知，会禁止所有自动校准运动。
-          这是安全输入，与所请求的 RO_DECEL_LIM 减速度限值不同。
+          所有直线校准段相对入场 GNSS 点的最大目标距离，不受 RO_CAL_RADIUS 裁短。
+          直线阶段完成后返回同一入场点；到点容差为 0.5 m，不重设起点。
+          制动距离由自动辨识的 RO_DECEL_LIM 按 v²/(2a) 计算，初值可为 -1/0。
+          正式减速度测量从 MOT_THR_MAX 全输出的稳定实测车速反向驱动制动；场地不足则不保存结果。
+          较短距离可能无法取得足够有效样本，不会因此降低校准质量要求。
       type: float
-      default: 0.0
-      min: 0
+      default: 12.0
+      min: 1
       max: 100
       unit: m
       increment: 0.1
@@ -223,9 +238,12 @@ parameters:
     RO_MAX_THR_SPEED:
       category: System
       description:
-        short: 车辆在最大油门下的行驶速度
+        short: 速度前馈的等效满输入速度
         long: |-
-          用于将速度 [m/s] 线性映射为油门值 [-1, 1]。
+          用于将速度 [m/s] 线性映射为电机整形前的归一化控制输入 [-1, 1]。
+          这是可观测运行范围内的等效前馈系数，包含当前电机 MIN/EXPO 配置的影响，
+          不代表在巡航限速之外实测得到的物理最高车速。自动标定先形成动态响应候选，
+          后续响应采集和闭环验证继续检验该线性近似；最终由会话统一保存。
       type: float
       default: 0.0
       min: 0
@@ -284,6 +302,9 @@ parameters:
         long: |-
           设为 -1 时禁用。禁用后，车辆在自动模式下接近航点时不会减速。
           对于麦克纳姆轮车辆，此限制同时用于纵向和横向减速度。
+          自动校准允许 -1/0 初值，先低速探测，再从全输出稳定车速执行两次反向驱动制动。
+          两次有效测量通过后自动保存保守减速度；低速临时模型不作为正式结果保存。
+          正式全输出测量允许超过 RO_SPEED_LIM，但仍受 RO_CAL_DIST、加速度和时间边界约束。
       type: float
       default: -1.0
       unit: m/s^2
