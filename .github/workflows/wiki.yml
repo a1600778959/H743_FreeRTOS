@@ -1,0 +1,82 @@
+name: wiki
+
+# 跟随 main 分支提交自动重建文档站：
+# 1) VitePress 构建  2) headless Chrome 预渲染 Mermaid 为内联 SVG（file:// 可直开）
+# 3) 发布 GitHub Pages  4) 产出离线 zip 工件
+# 首次使用需在仓库 Settings → Pages → Build and deployment 选择 Source: GitHub Actions。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'wiki/**'
+      - 'docs/**'
+      - '.github/workflows/wiki.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: wiki-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: wiki/package-lock.json
+      - name: Install wiki dependencies
+        working-directory: wiki
+        run: npm ci
+      - name: Build site
+        working-directory: wiki
+        run: npm run build
+      - name: Install Chrome for pre-render
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+      - name: Pre-render mermaid diagrams (static SVG)
+        working-directory: wiki
+        env:
+          WIKI_BROWSER: ${{ steps.chrome.outputs.chrome-path }}
+          WIKI_ORIGIN: http://127.0.0.1:8931/
+        run: |
+          python3 -m http.server 8931 --bind 127.0.0.1 --directory .vitepress/dist &
+          SERVER_PID=$!
+          sleep 2
+          node render-static.mjs
+          kill $SERVER_PID
+      - name: Build offline package
+        working-directory: wiki/.vitepress
+        run: |
+          mkdir -p package/Dima-Wiki
+          cp -r dist/* package/Dima-Wiki/
+          printf 'Dima H743 Rover Wiki offline package\nBuild: %s\nCommit: %s\nOpen index.html directly (offline).\n' \
+            "$(date -u +%F)" "$GITHUB_SHA" > package/Dima-Wiki/README-open-me.txt
+          cd package && zip -qr Dima-Wiki-offline.zip Dima-Wiki
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dima-Wiki-offline
+          path: wiki/.vitepress/package/Dima-Wiki-offline.zip
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: wiki/.vitepress/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
