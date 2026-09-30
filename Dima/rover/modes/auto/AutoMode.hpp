@@ -43,8 +43,8 @@ public:
     void stop() override;
     dima::middleware::lifecycle::ModuleState state() const override;
     bool calibration_parameters_applied(std::uint32_t instance, float heading_p,
-                                        float lookahead_gain) const noexcept;
-    bool calibration_configuration_ready(std::uint32_t instance) const noexcept;
+                                        float lookahead_gain, float jerk, float reduction) const noexcept;
+    bool calibration_configuration_ready(std::uint32_t instance, float experiment_speed, float observed_speed) const noexcept;
 
 private:
     static constexpr std::uint32_t kRunIntervalUs = 20000U;
@@ -120,7 +120,7 @@ private:
     void enter_error(std::uint32_t event_id) noexcept;
 
     static bool finite(float value) noexcept;
-    static bool valid_config(const Config &config) noexcept;
+    static bool valid_config(const Config &config, float maximum_cruise) noexcept;
     static float wrap_pi(float angle) noexcept;
     static std::uint8_t control_state(
         dima::lib::rover::DrivingState state) noexcept;
@@ -199,8 +199,8 @@ private:
     std::uint32_t applied_parameter_set_count_{0U};
     float applied_heading_p_{0.0F};
     float applied_lookahead_gain_{0.0F};
+    float applied_jerk_{0.0F}, applied_reduction_{0.0F};
     bool applied_snapshot_valid_{false};
-    bool applied_configuration_ready_{false};
     std::uint16_t segment_sequence_{0U};
     std::uint8_t xy_reset_counter_{0U};
     std::uint8_t velocity_reset_counter_{0U};

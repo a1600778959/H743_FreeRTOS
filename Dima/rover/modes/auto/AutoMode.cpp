@@ -1,3 +1,5 @@
+#include "api/Flash.hpp"
+#include "api/Services.hpp"
 #define MODULE_NAME "rover_auto_mode"
 
 #include "AutoMode.hpp"
@@ -27,20 +29,6 @@ float angular_parameter_to_radians(float value) noexcept
     // PX4 的 RO_YAW_* 参数以 deg、deg/s 或 deg/s^2 暴露；控制核统一使用
     // rad、rad/s、rad/s^2。负值是“-1 禁用”哨兵，不能乘角度换算系数。
     return value < 0.0F ? value : value * kDegreesToRadians;
-}
-
-float vector_bearing(const dima::lib::rover::Position2f &from,
-                     const dima::lib::rover::Position2f &to) noexcept
-{
-    return std::atan2(to.east_m - from.east_m,
-                      to.north_m - from.north_m);
-}
-
-float vector_length(const dima::lib::rover::Position2f &from,
-                    const dima::lib::rover::Position2f &to) noexcept
-{
-    return std::hypot(to.north_m - from.north_m,
-                      to.east_m - from.east_m);
 }
 
 } // namespace
@@ -389,7 +377,7 @@ bool AutoMode::bind_parameters() noexcept
 void AutoMode::invalidate_parameter_bindings() noexcept
 {
     px4::AtomicTransaction transaction;
-    applied_snapshot_valid_ = applied_configuration_ready_ = false;
+    applied_snapshot_valid_ = false;
     lookahead_gain_.invalidate();
     lookahead_min_.invalidate();
     lookahead_max_.invalidate();
@@ -421,7 +409,7 @@ bool AutoMode::apply_parameter_snapshot() noexcept
     // 锁不仅覆盖 param_get，还覆盖控制器 configure/安全抑制和最终确认快照。
     // 其他线程不能把“读到了候选”误认为“这一代已经实际配置完毕”。
     px4::AtomicTransaction apply_transaction;
-    applied_snapshot_valid_ = applied_configuration_ready_ = false;
+    applied_snapshot_valid_ = false;
     if (!lookahead_gain_.bound() || !lookahead_min_.bound() ||
         !lookahead_max_.bound() || !acceptance_radius_.bound() ||
         !yaw_p_.bound() || !yaw_rate_limit_.bound() ||
@@ -518,6 +506,9 @@ bool AutoMode::apply_parameter_snapshot() noexcept
     dima::lib::rover::SpeedController speed_validator{};
     dima::lib::rover::YawRateController yaw_rate_validator{};
     const auto finish_application = [&](bool configured) {
+        // 保留本代真实参数供校准确认；正常AUTO仍受parameters_valid_约束。
+        // 不另建配置镜像，也不让任务巡航速度替代校准的实测实验速度。
+        if (loaded) config_ = candidate;
         parameters_valid_ = configured;
         reset_control_state();
         // loaded 但非法的旧 heading=0 回滚只确认已抑制，不伪造配置 ready。
@@ -528,12 +519,13 @@ bool AutoMode::apply_parameter_snapshot() noexcept
             applied_parameter_set_count_ = pending_parameter_set_count_;
             applied_heading_p_ = candidate.heading.proportional_gain;
             applied_lookahead_gain_ = candidate.pure_pursuit.lookahead_gain;
-            applied_configuration_ready_ = configured;
+            applied_jerk_ = candidate.jerk_limit_m_s3;
+            applied_reduction_ = candidate.speed_reduction_gain;
             applied_snapshot_valid_ = true;
         }
         return configured;
     };
-    if (!loaded || !valid_config(candidate) ||
+    if (!loaded || !valid_config(candidate, candidate.speed_inner.speed_at_full_throttle_m_s) ||
         !speed_validator.configure(candidate.speed_inner) ||
         !yaw_rate_validator.configure(candidate.yaw_rate_inner) ||
         !pure_pursuit_.configure(candidate.pure_pursuit) ||
@@ -572,30 +564,38 @@ bool AutoMode::apply_parameter_snapshot() noexcept
 }
 
 bool AutoMode::calibration_parameters_applied(std::uint32_t instance,
-                                             float heading_p, float lookahead_gain) const noexcept
+                                             float heading_p, float lookahead_gain, float jerk, float reduction) const noexcept
 {
     px4::AtomicTransaction transaction;
     return applied_snapshot_valid_ && applied_parameter_instance_ == instance &&
         applied_parameter_set_count_ == param_set_count() &&
-        applied_heading_p_ == heading_p && applied_lookahead_gain_ == lookahead_gain;
+        applied_heading_p_ == heading_p && applied_lookahead_gain_ == lookahead_gain &&
+        applied_jerk_ == jerk && applied_reduction_ == reduction;
 }
 
-bool AutoMode::calibration_configuration_ready(std::uint32_t instance) const noexcept
+bool AutoMode::calibration_configuration_ready(std::uint32_t instance, float experiment_speed, float observed_speed) const noexcept
 {
     // 与回滚确认分离：正常候选要进入导航验收时，还必须是完整四环/路径配置。
     px4::AtomicTransaction transaction;
+    auto experiment = config_;
+    experiment.cruise_speed_m_s = experiment_speed;
     return applied_snapshot_valid_ && applied_parameter_instance_ == instance &&
-        applied_parameter_set_count_ == param_set_count() && applied_configuration_ready_;
+        applied_parameter_set_count_ == param_set_count() && valid_config(experiment, observed_speed);
 }
 
 void AutoMode::apply_pending_parameters(std::uint64_t now) noexcept
 {
+    // 自动校准保持 Armed；只在物理停波锁确认后应用整份候选，普通 AUTO 仍冻结。
+    const bool calibration_stopped = vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 &&
+        dima::platform::services().armed_flash.calibration_output_stopped();
     if (!parameter_update_pending_ || !safety_snapshot_fresh(now) ||
-        control_mode_.flag_armed ||
-        vehicle_status_.arming_state == vehicle_status_s::ARMING_STATE_ARMED) {
+        (!calibration_stopped && (control_mode_.flag_armed ||
+         vehicle_status_.arming_state == vehicle_status_s::ARMING_STATE_ARMED))) {
         return;
     }
 
+    dima::platform::ConfigurationUpdateLease lease{dima::platform::services().armed_flash};
+    if (!lease) return;
     parameter_update_pending_ = false;
     const bool previous_parameters_valid = parameters_valid_;
     if (!apply_parameter_snapshot() && previous_parameters_valid) {
@@ -907,33 +907,11 @@ bool AutoMode::prepare_segment(
             return false;
         }
 
-        const float incoming_length =
-            vector_length(candidate_start, candidate_target);
-        const float outgoing_length =
-            vector_length(candidate_target, next_position);
-        if (incoming_length > FLT_EPSILON && outgoing_length > FLT_EPSILON) {
-            const float turn_angle = std::fabs(wrap_pi(
-                vector_bearing(candidate_target, next_position) -
-                vector_bearing(candidate_start, candidate_target)));
-            if (!finite(turn_angle)) {
-                return false;
-            }
-
-            // 大转角的到达速度固定为零；小转角按 RO_SPEED_RED 计算非零
-            // 通过速度。该值在进入航段时冻结，避免逐周期任务锁竞争和抖动。
-            if (turn_angle <=
-                config_.driving.drive_to_turn_yaw_error_rad) {
-                arrival_speed = dima::lib::rover::
-                    reduce_speed_for_heading_error(
-                        config_.cruise_speed_m_s, turn_angle,
-                        config_.speed_inner.speed_at_full_throttle_m_s,
-                        config_.speed_reduction_gain);
-                if (!finite(arrival_speed)) {
-                    return false;
-                }
-                arrival_speed = std::fmax(arrival_speed, 0.0F);
-            }
-        }
+        arrival_speed = dima::lib::rover::segment_arrival_speed(candidate_start, candidate_target,
+            next_position, false, config_.cruise_speed_m_s,
+            config_.speed_inner.speed_at_full_throttle_m_s,
+            config_.driving.drive_to_turn_yaw_error_rad, config_.speed_reduction_gain);
+        if (!finite(arrival_speed)) return false;
     }
 
     segment_start_ = candidate_start;
@@ -1021,28 +999,15 @@ AutoMode::GuidanceOutput AutoMode::run_guidance(
                                 : rover_navigation_status_s::WAYPOINT_ACTIVE;
     output.valid = segment.valid;
 
-    const bool stopped = std::fabs(measured_speed.speed_m_s) <=
-                         config_.driving.stopped_speed_threshold_m_s;
+    bool &arrival_latched = segment_final_waypoint_ ? mission_complete_pending_ : waypoint_advance_pending_;
+    const auto progress = dima::lib::rover::update_waypoint_progress(
+        speed_plan.waypoint_inside_acceptance, segment_final_waypoint_, segment_arrival_speed_m_s_,
+        measured_speed.speed_m_s, config_.driving.stopped_speed_threshold_m_s, arrival_latched);
+    if (progress.hold) {
+        output.speed_setpoint_m_s = output.yaw_rate_setpoint_rad_s = 0.0F;
+    }
+    if (!progress.ready) return output;
     if (segment_final_waypoint_) {
-        if (speed_plan.waypoint_inside_acceptance) {
-            // 最终航点一旦进入 acceptance radius 就锁存停车意图。
-            // GNSS 在车辆减速期间抖出半径不得重新给速度，否则会在
-            // 到达边界反复起停；完成事件仍必须等实测速度收敛。
-            mission_complete_pending_ = true;
-        }
-        if (!mission_complete_pending_) {
-            return output;
-        }
-
-        output.speed_setpoint_m_s = 0.0F;
-        // 最终航点进入 acceptance 后的目标是完整停车，不再追踪
-        // Pure Pursuit 的瞬时航向。减速确认期同时置零 yaw-rate，
-        // 防止纵向速度已很低时又进入非预期原地转向。
-        output.yaw_rate_setpoint_rad_s = 0.0F;
-        if (!stopped) {
-            return output;
-        }
-
         // 进入半径与实测已停均成立后才提交完成；Mission mutex
         // 短暂忙时保留锁存，继续零输出并重试，不丢失最终到达事件。
         output.yaw_rate_setpoint_rad_s = 0.0F;
@@ -1067,29 +1032,6 @@ AutoMode::GuidanceOutput AutoMode::run_guidance(
         } else if (completed != -EAGAIN) {
             output.valid = false;
         }
-        return output;
-    }
-
-    if (speed_plan.waypoint_inside_acceptance) {
-        // 停车型中间航点也在首次进圈时锁存；后续即使 GNSS
-        // 抖出半径，仍等设定/实测速度归零再推进。带速通过航点
-        // 则会在本周期直接尝试 advance。
-        waypoint_advance_pending_ = true;
-    }
-    if (!waypoint_advance_pending_) {
-        return output;
-    }
-
-    const bool stop_required = segment_arrival_speed_m_s_ <=
-                               config_.driving.stopped_speed_threshold_m_s;
-    if (stop_required) {
-        output.speed_setpoint_m_s = 0.0F;
-        // 大转角中间航点必须先完整停车再切换到下一航段。
-        // 在 advance 成功前同时压住 yaw-rate，确保“停车确认→
-        // 新航段 StoppingForTurn→SpotTurning”之间没有一帧旧转向量。
-        output.yaw_rate_setpoint_rad_s = 0.0F;
-    }
-    if (stop_required && !stopped) {
         return output;
     }
 
@@ -1236,9 +1178,9 @@ void AutoMode::reset_runtime_state() noexcept
 {
     {
         px4::AtomicTransaction transaction;
-        applied_snapshot_valid_ = applied_configuration_ready_ = false;
+        applied_snapshot_valid_ = false;
         applied_parameter_instance_ = applied_parameter_set_count_ = 0U;
-        applied_heading_p_ = applied_lookahead_gain_ = 0.0F;
+        applied_heading_p_ = applied_lookahead_gain_ = applied_jerk_ = applied_reduction_ = 0.0F;
     }
     reset_control_state();
     config_ = {};
@@ -1279,7 +1221,7 @@ void AutoMode::enter_error(std::uint32_t event_id) noexcept
 {
     {
         px4::AtomicTransaction transaction;
-        applied_snapshot_valid_ = applied_configuration_ready_ = false;
+        applied_snapshot_valid_ = false;
     }
     state_ = dima::middleware::lifecycle::ModuleState::Error;
     ScheduleCancelAndDrain();
@@ -1292,7 +1234,7 @@ bool AutoMode::finite(float value) noexcept
     return std::isfinite(value);
 }
 
-bool AutoMode::valid_config(const Config &config) noexcept
+bool AutoMode::valid_config(const Config &config, float maximum_cruise) noexcept
 {
     const auto &pp = config.pure_pursuit;
     const auto &heading = config.heading;
@@ -1307,7 +1249,8 @@ bool AutoMode::valid_config(const Config &config) noexcept
         finite(config.default_acceptance_radius_m) &&
         config.default_acceptance_radius_m > 0.0F &&
         finite(config.cruise_speed_m_s) && config.cruise_speed_m_s > 0.0F &&
-        config.cruise_speed_m_s <= speed.speed_at_full_throttle_m_s &&
+        // 正常AUTO沿用前馈模型上限；校准传入本轮实测能力，不能反过来用模型裁掉实测量。
+        finite(maximum_cruise) && config.cruise_speed_m_s <= maximum_cruise &&
         finite(config.jerk_limit_m_s3) && config.jerk_limit_m_s3 > 0.0F &&
         finite(config.deceleration_limit_m_s2) &&
         config.deceleration_limit_m_s2 > 0.0F &&
