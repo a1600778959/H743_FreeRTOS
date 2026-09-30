@@ -44,7 +44,7 @@ PX4 来源文件继续保留原始版权头。当前许可证状态仍为 `PENDI
 - 接口预留 `SOURCE_NAVIGATION + MODE_SPEED_YAW_RATE`，但阶段 5 不创建空 Navigation 模块，也不接受该组合驱动输出。
 - 阶段 9 Navigation 必须发布 `rover_motion_request`，不得直接依赖 DifferentialDrive、`actuator_motors`、MotorOutput 或板级 PWM。
 
-中心双向油门保持 Rover 语义：零命令对应停车中心点，负值表示反向，正值表示正向。Manual 倒车转向由 `RD_REV_STEER` 控制；混控先应用 `RD_STR_THR_MIX` 饱和优先级，再应用最小非零输出、最大输出、slew、推力曲线、反向不对称、独立换向延时和解锁 ramp。所有中间值都要求有限并限制在归一化范围内。
+中心双向油门保持 Rover 语义：零命令对应停车中心点，负值表示反向，正值表示正向。Manual 前进与倒车均保持正转向为车头顺时针。两轴先同比缩放、执行油门 slew，再按 `RD_STR_THR_MIX` 分配非对称推力域内的饱和优先级，随后执行逐轮整形、解锁 ramp 和独立换向延时。所有中间值都要求有限并限制在归一化范围内。
 
 ## 4. 六路 PWM 电气契约与参数
 
@@ -157,7 +157,7 @@ Signed App 占 768 KiB Primary Slot 约 25.73%，低于 85% 发布控制线。MC
 2. 默认配置实际产生 1000/1500/2000 us，扩展边界实际产生 500/2500 us，且 TIM8 N 通道极性正确。
 3. 冷启动、Runtime 启动失败和 stop 后六路真实保持低电平，没有窄脉冲或残余输出。
 4. Arm/Disarm、Kill/Unkill、Termination、Failsafe、RC 丢失和命令超时波形符合 fail-closed 行为。
-5. 油门中位、正反向、倒车转向、静摩擦补偿、换向延时、slew、解锁 ramp 和左右多路映射符合实车驱动器要求。
+5. 油门中位、正反向、前进与倒车的统一转向符号、静摩擦补偿、换向延时、slew、解锁 ramp 和左右多路映射符合实车驱动器要求。
 6. USB 日志在高负载、断开、Busy 和 Ring 满时不阻塞控制 WorkQueue。
 7. 四个候选口自动进入原始反相 SBUS 电气状态，禁用、失败回滚和 Runtime shutdown 后真实恢复普通 UART。
 8. 未接接收机时不再产生周期性后端故障洪泛；真实 UART/DMA 故障只记录一次，收到有效帧后才开启下一故障周期。

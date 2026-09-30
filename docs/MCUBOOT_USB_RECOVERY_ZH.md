@@ -214,9 +214,11 @@ USB 预检。板上已运行相同 active/confirmed hash 时默认跳过重写�
 
 构建新增 `[BUILD] total=`，覆盖主机准备到命令结束，并输出临时目录中的 JSON 计时报告；
 `DIMA_BUILD_TRACE=1` 才包装各编译调用并列出最慢文件，正常快速 OTA 不增加逐对象 Python 进程。
-默认自动缓存固定 ccache 4.11.3（Windows x64 归档及 exe 均核对 SHA-256）；不可用时回退 GCC，
-也可用 `DIMA_CCACHE=off` 关闭。对象缓存保存在主机工具缓存下的 `compiler-cache`，不随项目
-`clean` 清除；链接、签名和设备身份校验不使用该缓存。Python 依赖按解释器/依赖/安装配方内容
+默认 `DIMA_CCACHE=on`，应用 C/C++ 和 MCUboot C 编译均启用缓存。Windows x64 自动准备固定
+ccache 4.11.3（归档及 exe 均核对 SHA-256）；Linux/WSL 使用 PATH 中至少 4.5 的系统版本。
+缓存不可用时明确报错；显式 `DIMA_CCACHE=auto` 允许回退 GCC，`DIMA_CCACHE=off` 可关闭。
+对象缓存保存在主机工具缓存下的 `compiler-cache`，不随项目 `clean` 清除；未变化对象仍由 Make
+直接跳过。链接、汇编、签名和设备身份校验不使用该缓存。Python 依赖按解释器/依赖/安装配方内容
 隔离在 `host-python-envs`，与旧版可整体替换的 `host-python` 并列，安装使用跨进程锁。
 完整改动范围、无缓存/缓存重建与未授权板测的证据边界见 `BUILD_SPEED_OPTIMIZATION_ZH.md`。
 当前开发阶段不会因 Primary 仍是 active 但未 confirmed 的测试镜像而阻止上传；再次上传会直接覆盖

@@ -138,7 +138,7 @@ ArduPilot 当前仅用于功能需求、状态机和验收行为参考；其他�
 | PX4 `src/lib/pure_pursuit`、`src/lib/rover_control`、`src/lib/pid`、`src/lib/slew_rate`、`src/lib/mathlib/math/TrajMath.hpp` | `Dima/lib/rover/PurePursuit.*`、`RoverControl.*`、`Dima/lib/mathlib/TrajMath.hpp` | 以 PX4 v1.17.0 tag 对应 commit `d6f12ad1c4f70ad3230afd7d86e971421e02fef4` 为 BSD-3-Clause 来源，保留 Pure Pursuit、Speed PI、Heading P、YawRate PI、setpoint slew 与差速运动学前馈；现有 TrajMath 以薄包装入口补齐 matrix 头依赖，航点制动速度直接调用上游 `computeMaxSpeedFromDistance()`，不复制 jerk/deceleration 公式。本地增加条件积分反饱和、停车确认滞回和全中文安全/公式说明，不依赖 uORB、Parameter、WorkQueue、HAL/RTOS 或动态分配 | ADAPTED / RUNTIME CONSUMER INTEGRATED / WINDOWS BUILD VERIFIED / BOARD PENDING |
 | ArduPilot `libraries/AR_Motors/AP_MotorsUGV.cpp`、Rover pre-arm 与 watchdog 行为 | `Dima/lib/rover/DifferentialDrive.*`、`Dima/modules/safety/Commander.*`、IWDG 健康合同 | 仅参考倒车车头方向、饱和优先级、slew、静摩擦补偿、反向不对称、左右映射 pre-arm、换向延时和主循环停滞复位行为；未复制 GPL 源码 | BEHAVIOR REFERENCE ONLY |
 | 旧 Dima `speed_to_pwm` 固定六路转换 | 已移除 | 自建仓以来没有生产调用，历史唯一消费者为已删除的 Host Test；当前六路参数化转换与 safe-off 所有权统一由 `Dima/modules/motor/MotorOutput.*` 承担 | RETIRED / SUPERSEDED |
-| Stage 5 Rover 控制与油门保护参数 | `Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml` | 请求超时、倒车转向、混控优先级、最小/最大输出、slew、换向延时、expo、反向不对称及解锁 ramp 只由 PX4 YAML 定义；运行期仅在新鲜 DISARMED 快照后整体应用 | DIMA PARAMETER YAML / TARGET VERIFY PASS |
+| Stage 5 Rover 控制与油门保护参数 | `Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml` | 请求超时、混控优先级、最小/最大输出、slew、换向延时、expo、反向不对称及解锁 ramp 只由 PX4 YAML 定义；运行期仅在新鲜 DISARMED 快照后整体应用 | DIMA PARAMETER YAML / TARGET VERIFY PASS |
 | 六路 PWM 映射参数 | `Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml` | S1～S6 的 `FUNC/MIN/CENT/MAX/REV` 名称、范围和默认值由同一 YAML→官方 XML/JSON/Header 链产生；完整 DISARMED 快照中逐通道校验，只有至少一右一左时允许 ACTIVE | DIMA PARAMETER YAML / TARGET VERIFY PASS / BOARD PENDING |
 | PX4 RC/Commander/QGC、传感器、GPS、串口与 DroneCAN 参数及 Metadata | `Dima/middleware/parameters/definitions/module_*.yaml` | 所有产品参数直接由受版本控制的 YAML 统一汇入锁定上游正式链；固件目录、Metadata 与协议索引只读生成物，不存在串口/DroneCAN JSON 或专用参数生成器。五个已删除的可选校准参数不通过别名/虚拟参数恢复，当前缺失状态保持用户确认的可校准基线 | ADAPTED / SINGLE YAML SOURCE / BOARD PENDING |
 | Dima Rover 生命周期、BootHealth 与 Parameter Autosave 写门控 | `Dima/rover/ApplicationContext.*`、`Dima/modules/boot_health/BootHealthService.*`、`Dima/modules/parameters/ParameterService.*`、`Dima/middleware/maintenance/`、`Dima/middleware/uORB/`、`Dima/middleware/work_queue/`、`Dima/platform/api/{Services,Execution,Flash,Memory,Synchronization,TaskRuntime}.*` | ApplicationContext 只注入 capability；BootHealth 依据安全/输出 Topic 进展推进 generation，不跨队列读取普通模块状态。设备维护票据仍要求 Disarmed、neutral/hard-safe、`appMain` reload 确认和单调进度；参数保存取消该票据，只保留后台存储互斥与原子 Disarmed/Arm interlock；shutdown 在释放资源前确认六路物理 hard-off | DIMA INTEGRATION / SOURCE AND TARGET GATE PASS / BOARD PENDING |
@@ -170,7 +170,7 @@ ArduPilot 当前仅用于功能需求、状态机和验收行为参考；其他�
 | `Middlewares/Third_Party/FatFs/src/ff.c` | 同路径 | 原样复制，未修改 | UNMODIFIED |
 | `Middlewares/Third_Party/FatFs/src/ff.h` | 同路径 | 原样复制 | UNMODIFIED |
 | `Middlewares/Third_Party/FatFs/src/integer.h` | 同路径 | 原样复制 | UNMODIFIED |
-| `Middlewares/Third_Party/FatFs/src/ffconf_template.h` | `ffconf.h` | 定制配置：`_FS_REENTRANT=0`（Parameter/Log 所有物理调用由共享 FatFs backend mutex 串行化）、`_USE_LFN=0`、`_CODE_PAGE=1`（ASCII 8.3）、`_USE_MKFS=0`、`_USE_FASTSEEK=0`、`_FS_LOCK=0`、`_VOLUMES=1`、`_FS_NORTC=1` | ADAPTED |
+| `Middlewares/Third_Party/FatFs/src/ffconf_template.h` | `ffconf.h` | 定制配置：`_FS_REENTRANT=0`（Parameter/Log 所有物理调用由共享 FatFs backend mutex 串行化）、`_USE_LFN=0`、`_CODE_PAGE=1`（ASCII 8.3）、`_USE_MKFS=0`、`_USE_FASTSEEK=0`、`_FS_LOCK=0`、`_VOLUMES=1`、`_FS_NORTC=0`（storage 用已确认 UTC + 单调时间生成北京时间）、`_USE_CHMOD=1`（晚到授时用 `f_utime` 补齐修改日期） | ADAPTED |
 | `Middlewares/Third_Party/FatFs/src/diskio.c`；PX4 v1.17.0 `boards/matek/h743/src/sdio.c` | `Boards/H743/Src/fatfs_diskio.cpp` | 保留 FatFs C ABI 的板级 C++ SDMMC1 owner；HAL 负责识卡，运行期 LL 命令/IDMA 使用任务等待与强 IRQ。D1 对齐数据支持直接 DMA，其余使用两个 4 KiB 非缓存半区；DMA/卡忙共用 500 ms 截止，先停止硬件再让缓冲复用。无 NCD 会话探测、FlashFS 主存储及 SD 恢复边界保持 | REWRITTEN / BOARD OWNED / PX4 NO-NCD SEMANTICS |
 | `Middlewares/Third_Party/FatFs/src/diskio.h` | 同路径 | 重写，移除 `ff_gen_drv` 依赖 | REWRITTEN |
 
@@ -354,12 +354,28 @@ Windows 原生 `E:\freertos\H743_FreeRTOS` 已通过 `git diff --check`、`make 
 
 当前目录映射：自动校准协调器、阶段实现与私有 `CalibrationParameters` 事务位于 `Dima/rover/modes/auto_calibration/`；共享纯算法位于 `Dima/lib/rover/`。模式类名、命名空间与参数/消息生成合同保持原有定义。
 
+2026-09-21 自动校准依赖合同更新：当前实现保留生成的状态/消息编号，新增的
+依赖逻辑只使用内部运行态；`STAGE_MOTOR_PROFILE` 不计入结果，INNER 由 SPEED
+和 TURN 双侧证据闭合，HEADING/PATH 按增益链级联。MAG 使用开环旋转和
+`array_heading_rad` 覆盖，不修改磁 scale；IMU 自动流程只提交 offset。首轮无
+制动模型时使用同会话 0.8 m/s 速度帽，正式制动候选形成后解除，受限样本不进入
+`RO_MAX_THR_SPEED` 拟合。组级失败与会话级安全故障分别走 MANEUVER_ABORT/ABORT。
+
+2026-09-21 内联制动重构（本地产品逻辑，无新增上游来源）：制动观测改为从直行
+3 秒稳定平台内联触发（`AutoCalibrationBraking.begin_braking_observation`），低速
+初探轮、Ustart 锁定、BRAKING_SPEED_LIMIT 零输出握手、临时模型、观测重试与双档
+稳态判据全部退役；主制动为有界比例反向 `-clamp(0.5×(v−v_stop),0,0.30)` 随速度
+渐退。制动/Level 组失败局部化（标记 unavailable 后继续独立组），同上电跨轮复用
+缓存 `reused_stages_` 删除。消息/参数/生成合同零修改；`BRAKING_SPEED_LIMIT`
+相位值保留在消息中但不再发布。统一 FINALIZE（全组单份累积事务 + Disarm 后一次
+性保存）为下一阶段工作，前半场各组仍逐组原子提交。
+
 该扩展不新增第三方依赖；继续复用第 17 节锁定 PX4 ARX、生产 Rover 四控制器和参数事务。会话授权、固定圆内低速反转/渐进输出探测、等效响应及关联验收均是本地产品逻辑，不宣称源自上游现成的 Rover Autotune。
 
 | 依据/入口 | 本地扩展与边界 |
 |---|---|
-| Commander 正常 preflight 与 ArmedFlashCoordinator | 只有首次正常人工 Arm 创建 session grant；内部 Disarm 保留授权，消费者确认与正常检查后续行。外部 Disarm 在内部提交窗口也清授权，RC/Kill/退出/故障/重启不能恢复旧 grant |
-| 权威 Rover 参数 YAML 与 CalibrationFence | `RO_SPEED_LIM` 新默认 0，兼容旧 -1；新增 `RO_CAL_VMAX`，分别锁存入场 V_session/驱动上限。原固定圆余量改用冻结速度，不由后续运行参数写回改变；停车距离仍是外部真实安全配置 |
+| Commander 正常 preflight 与 ArmedFlashCoordinator | 显式进入后由正常人工 Arm 建立真实 Armed；静态/提交时锁住 PWM 并保持 Armed，消费者确认与运动就绪后续行。真实 Disarm/退出取消会话，不保留阶段授权缓存或内部 Arm/Disarm 请求 |
+| 权威 Rover 参数 YAML 与 CalibrationFence | `RO_SPEED_LIM` 新默认 0，兼容旧 -1，锁存入场 V_session；本行曾记录的 `RO_CAL_VMAX` 与 `RO_CAL_THR_MAX`/`RO_CAL_TURN_MAX` 已随 commit `3b06c29` 从定义 YAML 删除（2026-09-22 状态机替换确认无恢复）。原固定圆余量改用冻结速度，不由后续运行参数写回改变；停车距离仍是外部真实安全配置 |
 | DifferentialDrive/RoverDifferential 生产控制链 | 指定阶段负向请求与真实 PI，保留换向延时；只在前进 FULL 段允许冻结驱动上限，最后 0.15/s slew 始终保留。原始未零区速度和真实限制原因从本地 schema 生成，不用请求端点冒充 RPM |
 | 既有 EKF stable bias、VehicleImu 实际校正快照 | `AutoCalibrationImu` 按 `Rᵀ*bias/scale` 回传感器坐标，统一提交 ID/offset，保持 scale；前端/EKF/新鲜稳定残差确认后保存，不绑定另一设备的旧比例 |
 | 本地固定容量响应数学 | `CalibrationResponse` 使用 Welford、双向六平台、非零阶跃 20%–80% 斜率置信下界和生产逆整形模型 `v=a*r+b*r²`；保留测量噪声及共同 MIN/EXPO 不确定性。全局整形不能由局部低速数据授权 |
@@ -405,6 +421,8 @@ Windows 原生 `E:\freertos\H743_FreeRTOS` 已通过 `git diff --check`、`make 
 
 ## 2026-09-09 构建到上传优化
 
+2026-09-18 本地构建适配更新：默认要求启用 ccache，Linux/WSL 接受系统提供的兼容版本（至少 4.5），Windows 固定包及下列摘要不变。应用 C/C++ 与 MCUboot C 对象均接入，保持 compiler_check=content 和完整编译输入键；不引入固件依赖或额外上游源码。不可用时默认报错，只有显式 auto 才降级；实际版本与每会话统计由现有构建工具输出。
+
 本地构建薄适配沿用 GNU Make、正式生成器、Arm GNU 10.3.1 与 MCUboot 上传合同。主机对象缓存使用 ccache 上游 v4.11.3 Windows x86_64 发行包，归档 SHA-256 为 `bfd031cad091b7db7e68c3303be542b0f7fee7a3e716d76ec6f7e6c7ef4b3526`，仅在主机缓存安装已核对的 exe，不引入固件依赖。生成器保留上游内容与权威清单，只对未变化产物保留 mtime；ApplicationContext 的引用类型前置声明不改变对象或算法。上传仅收敛同轮串口占用处理和注册表快照，不修改 wire、窗口、回滚或设备身份检查。实测与并发归因边界见 `BUILD_SPEED_OPTIMIZATION_ZH.md`。
 
 ## 2026-09-09 普通运行期实现统一移出头文件
@@ -430,3 +448,23 @@ Windows 原生 `E:\freertos\H743_FreeRTOS` 已通过 `git diff --check`、`make 
 本轮最终 Linux 原生构建 `make PYTHON=python3 BUILD_DIR=build-linux dima_rover` 通过（82.62 s，exit=0），包含 APM 行为修正和 Manual QGC 分层诊断；未执行独立 verify、烧录、串口或车辆操作，板端停车中位与运动轨迹待验收。
 
 2026-09-15 PWM 追加复核：以 APM SRV_Channel 中位两侧量化和 ChibiOS TIMv1 PWM 配置为行为参考，修正本地量化、运行寄存器/GPIO 校验、完整停波、零帧启动顺序及六路写入临界区/读回。MCU 操作仍只在 Board 后端，无 APM 源码导入。内存寄存器模型和 120006 组 PWM 映射对照通过，Linux 正常构建通过；预装载确认不等于引脚波形/边沿时间实测，详细证据见 MANUAL_DRIVE_DIRECTION_AUDIT_ZH.md。
+
+## 2026-09-15 定位状态与 ULog 长格式修正
+
+EKF2 本地输入适配使用处理时单调时钟判断 vehicle_status 的 3 s 新鲜度，Core 观测时间仍取 IMU 采样时刻，避免未解锁静止标志随异步发布时间抖动。Logger 正式生成工具消费原有 uORBMessageFieldsGenerated.hpp 的长度上限，推导解码和 ULog F 正文缓存；producer 将解码余留与输出展开分离，避免 auto_calibration_status 等长格式超过上游 1600 字节工作数组后停止整份日志。沿用现有 uORB/PX4 ULog 来源与线格式，不修改上游快照、参数或消息权威字段，不新增测试。源码/构建证据不代替板端日志增长、航向有效性或静止漂移验收。
+
+## 2026-09-22 自动校准状态机整体替换（本地产品逻辑）
+
+`AutoCalibrationStatus.msg` 状态区由 47 个主状态压平为 11 个顶层阶段并重新编号
+（`STATE_IDLE=0` … `STATE_FINALIZE=10`），删除全部旧状态常量，不保留旧数值兼容、别名、
+映射层或日志转换层；消息版本递增为 `MESSAGE_VERSION=1`（2026-09-22 注释），版本证据为
+终态正式生成后的 topic hash 与 logger contract，全部由构建链生成、不手写。阶段内部推进为
+本地内部调度合同（非 uORB，无上游来源）：`SessionController` 的 `PhaseSubstate`/
+`TransactionKind`/`TransactionPhase` 集中于 `AutoCalibrationMode.hpp/.cpp`；阶段文件只返回
+结果、不再调用 `transition()`。删除能力：倒退校准（`PROFILE_REVERSE`/反向速度证据）、
+`PROFILE_FULL`；参数 `RO_CAL_THR_MAX`/`RO_CAL_TURN_MAX`/`RO_CAL_VMAX` 已随 commit
+`3b06c29` 从 `module_rover_control_params.yaml` 删除，本轮全库 grep 确认零残留。制动观测的
+瞬时反向轮端输出不是倒退校准，两轮协议保留。Arm/Disarm 安全边界、真实停波证据、
+0.65/0.90 会话包络、公式法 PI 与 FF 余量门禁、前端确认、统一回滚/`FAILURE_STORAGE` 与
+失败组依赖传播位语义不变。11 状态与旧状态的逐项能力映射记录于
+`AUTO_CALIBRATION_STATE_MACHINE_ZH.md`（2026-09-22 条目）。

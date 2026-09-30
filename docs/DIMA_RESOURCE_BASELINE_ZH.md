@@ -241,3 +241,21 @@ uORB 初始化使用带 `allocate/deallocate` 的受控 D1 Heap backend；初始
 阶段 2 新增资源主要来自 Parameter Layer/Core、24 项 metadata、官方生成结果、TinyBSON/flashparams、Autosave、USB RX Ring 和单扇区 Flash Journal，以及参数区 ECC 安全读/BusFault 受控恢复。参数数量由生成结果确定，不存在固定 64 项容量。
 
 项目自有测试目录已移除，不保留 Host Test、SITL 或仿真入口。阶段 2 尚未完成目标板实车验收，包括 USB 在线调参、自动保存时序、掉电恢复、CRC 尾部损坏回退、ENOSPC 和人工擦除流程。
+
+## 9. 2026-09-21 LTO 链接时优化与固件瘦身
+
+`make/project.mk` 为 Dima/Boards 项目编译单元与最终链接启用 `-flto`（`DIMA_LTO=off` 可整体退回逐翻译单元编译）。启用前已完成死代码审计：gc-sections 已剥离约 408 KiB 不可达节，300/300 参数、49 个 uORB 话题与全部模块均在消费链上，无可删除的经典死代码；体积收益来自跨翻译单元折叠重复内联与常量。
+
+LTO 配套改动：
+
+- `tools/elf_support/layout.py`：组合根 storage 符号匹配剥除 `.lto_priv.<N>` 私有化后缀，"唯一对象、正确段、地址在段内"合同不变。
+- `Boards/H743/Src/fatfs_diskio.cpp`：`dima_sdmmc_get_io_stats` 增补 `used` 属性，保持只读诊断合同的强链接（固件内无调用者，LTO 否则会将其内部化移除）。
+
+| 项目 | LTO 前（bytes） | LTO 后（bytes） | 变化（bytes） |
+|---|---:|---:|---:|
+| `.text` | 624,752 | 588,800 | -35,952 |
+| 应用 Flash 占用 | 626,220（80.0%） | 591,560（75.6%） | -34,660 |
+| Signed BIN | 627,396 | 592,736 | -34,660 |
+| Factory HEX | 1,627,621 | 1,544,209 | -83,412 |
+
+验证范围：Windows 本地 `make verify`（应用 ELF 布局/ISR 强弱绑定/向量、签名、MCUboot 镜像、未解析符号）与显式 `make check-architecture`（full 全量审计）全部通过；构建期无 LTO 告警。目标板运行验收不在本次范围，LTO 产物首次上板前建议执行一次完整实车冒烟。
