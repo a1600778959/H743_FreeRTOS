@@ -1,3 +1,5 @@
+#include "api/Flash.hpp"
+#include "api/Services.hpp"
 #include "MotorOutput.hpp"
 #include "api/Time.hpp"
 
@@ -93,7 +95,9 @@ dima::platform::ActuatorPwmResult MotorOutput::apply_frame(
 
 dima::platform::ActuatorPwmResult MotorOutput::force_safe_off() noexcept
 {
+    auto &armed_flash = dima::platform::services().armed_flash;
     if (pwm_ == nullptr) {
+        armed_flash.confirm_calibration_output_stopped(false);
         backend_ready_ = false;
         safe_off_ = false;
         return dima::platform::ActuatorPwmResult::Fault;
@@ -101,6 +105,7 @@ dima::platform::ActuatorPwmResult MotorOutput::force_safe_off() noexcept
     if (safe_off_ && !pwm_->started()) {
         applied_right_ = applied_left_ = 0.0F;
         applied_output_timestamp_ = hrt_absolute_time();
+        armed_flash.confirm_calibration_output_stopped(true);
         return dima::platform::ActuatorPwmResult::Applied;
     }
 
@@ -108,6 +113,7 @@ dima::platform::ActuatorPwmResult MotorOutput::force_safe_off() noexcept
     applied_frame_ = dima::platform::ActuatorPwmFrame{};
     backend_ready_ = result == dima::platform::ActuatorPwmResult::Applied;
     safe_off_ = backend_ready_;
+    armed_flash.confirm_calibration_output_stopped(safe_off_);
     if (safe_off_) {
         applied_right_ = applied_left_ = 0.0F;
         applied_output_timestamp_ = hrt_absolute_time();

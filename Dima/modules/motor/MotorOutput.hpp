@@ -144,6 +144,8 @@ private:
     bool have_motor_command_{false};
     bool parameters_valid_{false};
     bool parameter_update_pending_{false};
+    /* 参数应用租约冲突的连续起点；0 表示无待重试的推迟窗口。 */
+    std::uint64_t parameter_update_deferred_since_{0U};
     bool safety_inhibit_observed_{true};
     bool hard_safe_inhibit_observed_{true};
     bool backend_ready_{false};

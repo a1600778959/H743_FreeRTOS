@@ -1,3 +1,5 @@
+#include "api/Flash.hpp"
+#include "api/Services.hpp"
 #include "MotorOutput.hpp"
 #include "rover/RoverModeContract.hpp"
 
@@ -223,8 +225,9 @@ bool MotorOutput::motor_control_inhibit_valid(
         return false;
     }
 
-    const std::uint64_t timeout_us = static_cast<std::uint64_t>(
+    std::uint64_t timeout_us = static_cast<std::uint64_t>(
         parameters_.command_timeout_s * 1000000.0F);
+    if (modes::auto_calibration(safety_.vehicle_status.nav_state) && timeout_us > 100000ULL) timeout_us = 100000ULL;
     if (timeout_us == 0U ||
         now_us - actuator_motors_.timestamp > timeout_us) {
         return false;

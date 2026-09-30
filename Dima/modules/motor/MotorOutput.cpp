@@ -1,3 +1,5 @@
+#include "api/Flash.hpp"
+#include "api/Services.hpp"
 #include "MotorOutput.hpp"
 
 #include "events/events.hpp"
@@ -10,6 +12,11 @@ constexpr std::uint32_t kEventParameterInvalid = 0x524D4F01U;
 constexpr std::uint32_t kEventBackendFault = 0x524D4F02U;
 constexpr std::uint32_t kEventPublishFailure = 0x524D4F03U;
 constexpr std::uint32_t kEventScheduleFailure = 0x524D4F04U;
+constexpr std::uint32_t kEventParameterDeferred = 0x524D4F05U;
+
+/* 放弃时限必须远小于 IWDG 2048 ms：pending 期间 BootHealth 判输出不健康，
+ * 超时只用于让 Arm 沿等瞬态窗口收敛，绝不让未应用参数拖垮喂狗链。 */
+constexpr std::uint64_t kParameterApplyDeferTimeoutUs = 250000ULL;
 
 static_assert(dima::platform::kActuatorPwmChannelCount ==
               actuator_output_status_s::NUM_OUTPUTS);
@@ -90,6 +97,7 @@ void MotorOutput::stop()
     applied_frame_ = dima::platform::ActuatorPwmFrame{};
     parameters_valid_ = false;
     parameter_update_pending_ = false;
+    parameter_update_deferred_since_ = 0U;
     invalidate_parameter_bindings();
     if (!backend_ready_) {
         state_ = dima::middleware::lifecycle::ModuleState::Error;
@@ -137,21 +145,47 @@ void MotorOutput::Run()
     refresh_safety_snapshot(now);
     // PWM 映射与范围只能在同时间戳、完整且新鲜的 Disarmed 安全快照后整体切换，
     // 防止 Armed 或安全 Topic 尚未收敛时应用半套新参数。
-    if (parameter_update_pending_ && fresh_disarmed_snapshot(now)) {
-        parameter_update_pending_ = false;
-        if (!apply_parameter_snapshot()) {
-            (void)enter_parameter_safe_off();
-            return;
+    if (parameter_update_pending_ && (fresh_disarmed_snapshot(now) ||
+        (active_snapshot_fresh(now) && safety_.vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 &&
+         dima::platform::services().armed_flash.calibration_output_stopped()))) {
+        dima::platform::ConfigurationUpdateLease lease{dima::platform::services().armed_flash};
+        if (!lease) {
+            // 租约冲突只应出现在 Arm 沿等瞬态窗口；此时可能已 Armed，禁止
+            // 停波、禁止跳过状态帧发布，保持 pending 等待下一周期重试。
+            // 持续冲突说明安全快照与协调器出现分歧，超时后放弃本次应用并
+            // 沿用上一套合法映射；模块合同要求电机侧问题不得阻塞
+            // BootHealth/USB/MAVLink，未应用参数不允许演变为复位循环。
+            if (parameter_update_deferred_since_ == 0U) {
+                parameter_update_deferred_since_ = now;
+            } else if (now - parameter_update_deferred_since_ > kParameterApplyDeferTimeoutUs) {
+                parameter_update_deferred_since_ = 0U;
+                parameter_update_pending_ = false;
+                (void)dima::events::report(kEventParameterDeferred,
+                                           dima::events::Severity::Error);
+            }
+        } else {
+            parameter_update_deferred_since_ = 0U;
+            parameter_update_pending_ = false;
+            if (!apply_parameter_snapshot()) {
+                (void)enter_parameter_safe_off();
+                return;
+            }
         }
     }
 
     const bool output_permitted = parameters_valid_ &&
         parameters_.drive_available && safety_permits_output(now);
-    const bool command_valid = motor_command_valid(now);
-    const bool control_inhibited = output_permitted && !command_valid &&
-        motor_control_inhibit_valid(now);
+    // 独立原子停波锁优先于任何旧命令；只有后端确认停止后才允许 Armed 维护。
+    auto &armed_flash = dima::platform::services().armed_flash;
+    const bool calibration_inhibit = armed_flash.calibration_output_inhibited();
+    const bool command_valid = !calibration_inhibit && motor_command_valid(now);
+    const bool control_inhibited = !command_valid && motor_control_inhibit_valid(now) &&
+        (output_permitted || (calibration_inhibit && !hard_safe_inhibit_observed_ && active_snapshot_fresh(now) &&
+         safety_.vehicle_status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 &&
+         !safety_.vehicle_status.failsafe && !safety_.actuator_armed.kill &&
+         !safety_.actuator_armed.termination && !safety_.actuator_armed.lockdown));
     const bool active_output = output_permitted && command_valid;
-    const bool disarmed_neutral = !active_output &&
+    const bool disarmed_neutral = !calibration_inhibit && !active_output &&
         safety_permits_disarmed_neutral(now);
 
     // 输出策略：Active 写入受控波形；Disarmed Neutral 保持可配置的中位；
@@ -220,6 +254,7 @@ void MotorOutput::reset_runtime_state() noexcept
     have_motor_command_ = false;
     parameters_valid_ = false;
     parameter_update_pending_ = false;
+    parameter_update_deferred_since_ = 0U;
     safety_inhibit_observed_ = true;
     hard_safe_inhibit_observed_ = true;
     backend_ready_ = false;
