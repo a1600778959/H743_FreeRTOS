@@ -14,6 +14,8 @@ public:
     void reset() noexcept;
     void update() noexcept;
     bool forward_output(std::uint64_t sample_time, float &longitudinal) const noexcept;
+    bool reverse_impulse(std::uint64_t from, std::uint64_t to, float &impulse_s,
+        float &squared_impulse_s, std::uint64_t &reverse_at) const noexcept;
 
 private:
     struct Sample { std::uint64_t timestamp{}; float right{}, left{}; bool valid{}; };

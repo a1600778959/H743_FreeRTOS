@@ -52,4 +52,36 @@ bool MagMotorOutputHistory::forward_output(std::uint64_t sample_time, float &lon
     return false;
 }
 
+bool MagMotorOutputHistory::reverse_impulse(std::uint64_t from, std::uint64_t to, float &impulse,
+    float &squared_impulse, std::uint64_t &reverse_at) const noexcept
+{
+    impulse = squared_impulse = 0.0F;
+    reverse_at = 0U;
+    if (from == 0U || to < from || count_ == 0U) return false;
+    if (to == from) return true;
+    // 复用已有32条后端历史，按已应用时间零阶保持积分；不另建请求/轮端缓存。
+    // 只积分两轮负向幅值的平均，正向和中立不贡献制动输入。未知区间拒绝，
+    // 不能把未执行的请求、缺帧或区间末端之外的输出当成制动力。
+    const Sample *previous = nullptr;
+    std::uint64_t cursor = from;
+    for (std::size_t age = count_; age > 0U; --age) {
+        const auto &sample = samples_[(next_ + 32U - age) % 32U];
+        if (sample.timestamp <= from) { previous = &sample; continue; }
+        if (previous == nullptr || !previous->valid || sample.timestamp - previous->timestamp > 100000ULL) return false;
+        const auto end = std::min(to, sample.timestamp);
+        const float magnitude = 0.5F * (std::fmax(0.0F, -previous->right) + std::fmax(0.0F, -previous->left));
+        const float dt = 1.0e-6F * static_cast<float>(end - cursor);
+        impulse += magnitude * dt;
+        squared_impulse += magnitude * magnitude * dt;
+        // 两侧都已反向才确认方向切换完成；零等待只影响延迟，不参与输入权重。
+        if (reverse_at == 0U && previous->right < 0.0F && previous->left < 0.0F && end > cursor)
+            reverse_at = cursor;
+        if (sample.timestamp >= to) return true;
+        cursor = sample.timestamp;
+        previous = &sample;
+    }
+    // 调用方以已取得的后端应用时刻为积分终点，不外推尚未记录的区间。
+    return cursor == to && previous != nullptr && previous->valid;
+}
+
 } // namespace dima::modules::sensors
