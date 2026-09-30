@@ -23,21 +23,120 @@ constexpr const char *kTemporaryPath = "0:/dima/params.tmp";
 constexpr const char *kMissionPrimaryPath = "0:/dima/mission.bin";
 constexpr const char *kMissionBackupPath = "0:/dima/mission.bak";
 constexpr const char *kMissionTemporaryPath = "0:/dima/mission.tmp";
+constexpr const char *kDroneCanPrimaryPath = "0:/dima/dnacan.bin";
+constexpr const char *kDroneCanBackupPath = "0:/dima/dnacan.bak";
+constexpr const char *kDroneCanTemporaryPath = "0:/dima/dnacan.tmp";
 constexpr const char *kLogDirectoryPath = "0:/log";
 constexpr const char *kLogListPath = "0:/logdata.bin";
 constexpr const char *kLogListTemporaryPath = "0:/logtmp.bin";
 constexpr std::size_t kMaximumLogPathLength = 60U;
-constexpr const char *kUlogFilename = "log100.ulg";
+constexpr char kUlogFilename[] = "log100.ulg";
 constexpr const char *kMetadataFilename = "meta.bin";
 constexpr std::size_t kMaximumLogSessions = 999U;
 constexpr std::size_t kRecoveryChunkBytes = 4096U;
 constexpr std::uint64_t kSpaceCorrectionIntervalUs = 60000000ULL;
-constexpr std::uint64_t kMinimumFreeBytes = 50ULL * 1024ULL * 1024ULL;
-constexpr std::uint64_t kMaximumFreeBytes = 300ULL * 1024ULL * 1024ULL;
+/* 停止线 10 MiB 只为参数/任务/DroneCan 三代事务和未来固件文件保留最小空闲；
+ * 日志按滚动窗口写满全卡——空闲真正触线时才回收最旧已关闭会话，触线前
+ * 不因空间预防性删除任何历史。回收目标与停止线同值，无中间缓冲带。 */
+constexpr std::uint64_t kMinimumFreeBytes = 10ULL * 1024ULL * 1024ULL;
 constexpr std::uint8_t kUlogMagic[]{
     'U', 'L', 'o', 'g', 0x01U, 0x12U, 0x35U, 0x01U};
 
 namespace log_sidecar = dima::modules::logging::generated::sidecar;
+
+// 该映射只属于本次上电；拔卡、会话关闭不清除，也不从历史 meta.bin 恢复。
+// 所有读写和 FatFs 回调均处于唯一 volume mutex 内，不另加可重入锁。
+LogTimeReference g_fat_time_reference{};
+constexpr DWORD kUnknownFatTime = (1UL << 21U) | (1UL << 16U);
+constexpr std::uint64_t kMaximumUtcUs =
+    static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) *
+        1000000ULL + 999999ULL;
+
+struct CivilDateTime {
+    std::uint32_t year{0U};
+    std::uint32_t month{0U};
+    std::uint32_t day{0U};
+    std::uint32_t hour{0U};
+    std::uint32_t minute{0U};
+    std::uint32_t second{0U};
+};
+
+bool civil_from_utc(std::uint64_t utc_us, CivilDateTime &out) noexcept
+{
+    if (utc_us < log_sidecar::kMinimumUtcUs || utc_us > kMaximumUtcUs) {
+        return false;
+    }
+
+    // 先加 UTC+8 再拆分日期，使跨日、跨年和闰年进位一起完成。以三月为
+    // 年首按 400 年周期（146097 天）还原公历，719468 是 Unix 纪元偏移；
+    // 全程整数换算，不依赖 libc 本地时区或 32-bit time_t 的 2038 年边界。
+    const std::uint64_t local_seconds = utc_us / 1000000ULL +
+        static_cast<std::uint64_t>(kLogUtcOffsetSeconds);
+    const std::uint32_t civil_days =
+        static_cast<std::uint32_t>(local_seconds / 86400ULL) + 719468U;
+    const std::uint32_t era = civil_days / 146097U;
+    const std::uint32_t day_of_era = civil_days % 146097U;
+    const std::uint32_t year_of_era =
+        (day_of_era - day_of_era / 1460U + day_of_era / 36524U -
+         day_of_era / 146096U) / 365U;
+    std::uint32_t year = year_of_era + era * 400U;
+    const std::uint32_t day_of_year = day_of_era -
+        (365U * year_of_era + year_of_era / 4U - year_of_era / 100U);
+    const std::uint32_t march_month = (5U * day_of_year + 2U) / 153U;
+    const std::uint32_t day =
+        day_of_year - (153U * march_month + 2U) / 5U + 1U;
+    const std::uint32_t month = march_month < 10U
+        ? march_month + 3U : march_month - 9U;
+    year += month <= 2U ? 1U : 0U;
+    const std::uint32_t seconds_of_day =
+        static_cast<std::uint32_t>(local_seconds % 86400ULL);
+
+    out = CivilDateTime{};
+    out.year = year;
+    out.month = month;
+    out.day = day;
+    out.hour = seconds_of_day / 3600U;
+    out.minute = (seconds_of_day / 60U) % 60U;
+    out.second = seconds_of_day % 60U;
+    return true;
+}
+
+DWORD fat_time_from_utc(std::uint64_t utc_us) noexcept
+{
+    CivilDateTime civil{};
+    if (!civil_from_utc(utc_us, civil)) {
+        // FAT 没有“时间未知”标志，用最早合法日期 1980-01-01 占位；
+        // 对外真实时间仍以 sidecar 的 UtcValid 为准，不能伪装成当前日期。
+        return kUnknownFatTime;
+    }
+
+    // FAT 日期位宽为年偏移 7 位/月 4 位/日 5 位；时间最低 5 位以 2 秒为单位。
+    return static_cast<DWORD>(((civil.year - 1980U) << 25U) |
+        (civil.month << 21U) | (civil.day << 16U) | (civil.hour << 11U) |
+        (civil.minute << 5U) | (civil.second / 2U));
+}
+
+void set_fat_time_reference(const LogTimeReference &reference) noexcept
+{
+    const std::uint64_t now_us = hrt_absolute_time();
+    if (!reference.valid || reference.boot_utc_us > kMaximumUtcUs ||
+        now_us > kMaximumUtcUs - reference.boot_utc_us ||
+        reference.boot_utc_us + now_us < log_sidecar::kMinimumUtcUs) {
+        return;
+    }
+    g_fat_time_reference = reference;
+}
+
+DWORD current_fat_time() noexcept
+{
+    const std::uint64_t now_us = hrt_absolute_time();
+    if (!g_fat_time_reference.valid ||
+        now_us > kMaximumUtcUs - g_fat_time_reference.boot_utc_us) {
+        return kUnknownFatTime;
+    }
+    // 已确认后用单调时钟延续墙上时间；接收机短时失联不让文件日期退回占位值。
+    return fat_time_from_utc(g_fat_time_reference.boot_utc_us + now_us);
+}
 
 struct LogIndexEntry {
     std::uint32_t time_utc{0U};
@@ -119,6 +218,61 @@ bool ascii_equal(const char *left, const char *right) noexcept
     return *left == '\0' && *right == '\0';
 }
 
+// 会话 ULog 文件名编码：0 表示旧版固定名 log100.ulg；非 0 表示北京时间
+// “月日时分”各两位十进制拼成的整数（09-18 14:30 -> 09181430.ulg）。FatFs
+// 关闭 LFN，名字必须保持 8.3；两位十进制字段可无损还原回文件名，编码本身
+// 与 sidecar 无关，扫描时以目录里的真实文件名为准。
+constexpr std::size_t kUlogFilenameCapacity = 13U;
+
+void format_ulog_filename(std::uint32_t code,
+                          char (&destination)[kUlogFilenameCapacity]) noexcept
+{
+    if (code == 0U) {
+        std::memcpy(destination, kUlogFilename, sizeof(kUlogFilename));
+        return;
+    }
+    std::uint32_t divider = 10000000U;
+    for (std::size_t index = 0U; index < 8U; ++index) {
+        destination[index] = static_cast<char>('0' + (code / divider) % 10U);
+        divider /= 10U;
+    }
+    constexpr char kTimeSuffix[] = ".ulg";
+    std::memcpy(destination + 8U, kTimeSuffix, sizeof(kTimeSuffix));
+}
+
+bool parse_ulog_filename(const char *name, std::uint32_t &code) noexcept
+{
+    code = 0U;
+    if (name == nullptr) {
+        return false;
+    }
+    if (ascii_equal(name, kUlogFilename)) {
+        return true;
+    }
+    std::uint32_t value = 0U;
+    for (std::size_t index = 0U; index < 8U; ++index) {
+        if (name[index] < '0' || name[index] > '9') {
+            return false;
+        }
+        value = value * 10U + static_cast<std::uint32_t>(name[index] - '0');
+    }
+    if (!ascii_equal(name + 8U, ".ulg")) {
+        return false;
+    }
+    const std::uint32_t month = value / 1000000U;
+    const std::uint32_t day = (value / 10000U) % 100U;
+    const std::uint32_t hour = (value / 100U) % 100U;
+    const std::uint32_t minute = value % 100U;
+    // 字段范围校验降低把用户同名文件误认成 Logger 会话的概率；多余的
+    // “09311430”这类不合法日期仍会被当作未知内容保护。
+    if (month < 1U || month > 12U || day < 1U || day > 31U ||
+        hour > 23U || minute > 59U) {
+        return false;
+    }
+    code = value;
+    return true;
+}
+
 bool numbered_directory(const char *name, const char *prefix,
                         std::uint16_t &number) noexcept
 {
@@ -154,9 +308,9 @@ bool session_file_path(std::uint16_t number, const char *filename,
 bool valid_log_path(const char *path) noexcept
 {
     constexpr char kPrefix[] = "0:/log/";
-    constexpr char kSuffix[] = "/log100.ulg";
+    constexpr std::size_t kPrefixLength = sizeof(kPrefix) - 1U;
     if (path == nullptr ||
-        std::strncmp(path, kPrefix, sizeof(kPrefix) - 1U) != 0) {
+        std::strncmp(path, kPrefix, kPrefixLength) != 0) {
         return false;
     }
     const void *terminator = std::memchr(path, '\0', kMaximumLogPathLength);
@@ -164,14 +318,20 @@ bool valid_log_path(const char *path) noexcept
         return false;
     }
     const std::size_t length = static_cast<const char *>(terminator) - path;
-    if (length != (sizeof(kPrefix) - 1U) + 7U + (sizeof(kSuffix) - 1U) ||
-        !ascii_equal(path + sizeof(kPrefix) - 1U + 7U, kSuffix)) {
+    // 最短合法形态 = "0:/log/" + sessNNN + "/" + log100.ulg
+    if (length < kPrefixLength + 7U + 1U + (sizeof(kUlogFilename) - 1U) ||
+        path[kPrefixLength + 7U] != '/') {
         return false;
     }
     char directory_name[8]{};
-    std::memcpy(directory_name, path + sizeof(kPrefix) - 1U, 7U);
+    std::memcpy(directory_name, path + kPrefixLength, 7U);
     std::uint16_t number = 0U;
-    return numbered_directory(directory_name, "sess", number);
+    if (!numbered_directory(directory_name, "sess", number)) {
+        return false;
+    }
+    // 文件名可能是旧版 log100.ulg，也可能是北京时间命名的新会话。
+    std::uint32_t name_code = 0U;
+    return parse_ulog_filename(path + kPrefixLength + 7U + 1U, name_code);
 }
 
 std::uint16_t session_number_from_log_path(const char *path) noexcept
@@ -199,6 +359,9 @@ struct SessionCatalogEntry {
     std::uint64_t sequence{0U};
     std::uint32_t time_utc{0U};
     std::uint32_t file_size{0U};
+    /* ULog 文件名编码（0=旧版 log100.ulg，非 0=北京时间月日时分）；扫描时从
+     * 目录真实文件名解析，恢复/索引/删除都用它还原路径，不依赖 sidecar。 */
+    std::uint32_t ulog_name_code{0U};
     std::uint16_t session_number{0U};
     std::uint8_t sidecar_flags{0U};
     std::uint8_t metadata_records{0U};
@@ -206,7 +369,7 @@ struct SessionCatalogEntry {
     std::uint8_t reserved{0U};
 };
 
-static_assert(sizeof(SessionCatalogEntry) == 24U,
+static_assert(sizeof(SessionCatalogEntry) == 32U,
               "bounded SD log catalogue RAM contract changed");
 
 enum class LogMaintenancePhase : std::uint8_t {
@@ -237,6 +400,13 @@ const char *file_path(AtomicFileDomain domain, AtomicFile file) noexcept
         case AtomicFile::Primary:   return kMissionPrimaryPath;
         case AtomicFile::Backup:    return kMissionBackupPath;
         case AtomicFile::Temporary: return kMissionTemporaryPath;
+        }
+        break;
+    case AtomicFileDomain::DroneCan:
+        switch (file) {
+        case AtomicFile::Primary:   return kDroneCanPrimaryPath;
+        case AtomicFile::Backup:    return kDroneCanBackupPath;
+        case AtomicFile::Temporary: return kDroneCanTemporaryPath;
         }
         break;
     }
@@ -336,6 +506,7 @@ struct FatFsAtomicFileStoreState {
     dima::platform::Synchronization *synchronization{nullptr};
     dima::platform::MutexHandle mutex{};
     std::uint16_t active_session_number{0U};
+    std::uint32_t active_ulog_name_code{0U};
     std::uint16_t log_reader_session_number{0U};
     std::uint16_t maximum_log_directories{0U};
     std::uint8_t active_metadata_records{0U};
@@ -763,6 +934,9 @@ public:
             context.start_monotonic_us == 0U) {
             return -EINVAL;
         }
+        // 必须在 f_mkdir/f_open 之前安装已确认映射，让新文件的创建/修改时间
+        // 都通过 FatFs 正式 get_fattime 回调取得北京时间。
+        set_fat_time_reference(context.time_reference);
         state_.pending_log_context = context;
         state_.pending_log_context_valid = true;
         state_.maximum_log_directories = context.maximum_directories;
@@ -787,11 +961,34 @@ public:
             return space;
         }
         // 8.3 名称的新会话最多需要 sess 目录、首个 sidecar 和父目录扩展各一簇；
-        // 先为元数据分配留出空间，避免刚创建空文件就越过 50 MiB 停止线。
+        // 先为元数据分配留出空间，避免刚创建空文件就越过 10 MiB 停止线。
         const int reclaimed = reclaim_log_space_locked(3U * state_.cluster_bytes);
         if (reclaimed != 0) {
             return reclaimed;
         }
+
+        /* 文件名直接采用会话开始时刻的北京时间“月日时分”（09181430.ulg）。
+         * 授时无效或越界时退回旧版固定名；时间晚到只补 FAT 日期和 sidecar，
+         * 不对已打开的 writer 中途改名（FatFs 无 LFN，且重命名打开中的文件
+         * 会使其目录项引用失效）。civil_from_utc 的边界与下方 sidecar
+         * kUtcValidFlag 判定完全一致，因此“时间命名 ⟺ sidecar 带 UTC”。 */
+        std::uint32_t ulog_name_code = 0U;
+        if (context.time_reference.valid &&
+            context.time_reference.boot_utc_us <=
+                std::numeric_limits<std::uint64_t>::max() -
+                    context.start_monotonic_us) {
+            CivilDateTime start_civil{};
+            if (civil_from_utc(
+                    context.time_reference.boot_utc_us +
+                        context.start_monotonic_us,
+                    start_civil)) {
+                ulog_name_code = start_civil.month * 1000000U +
+                    start_civil.day * 10000U + start_civil.hour * 100U +
+                    start_civil.minute;
+            }
+        }
+        char ulog_filename[kUlogFilenameCapacity]{};
+        format_ulog_filename(ulog_name_code, ulog_filename);
 
         char directory[kMaximumLogPathLength]{};
         char filepath[kMaximumLogPathLength]{};
@@ -810,7 +1007,7 @@ public:
             if (directory_result != FR_OK) {
                 return handle(directory_result);
             }
-            if (!join_path(directory, kUlogFilename, filepath,
+            if (!join_path(directory, ulog_filename, filepath,
                            sizeof(filepath))) {
                 const FRESULT cleanup_result = f_unlink(directory);
                 return finish_fatfs_results_locked(
@@ -871,6 +1068,7 @@ public:
             log_sidecar::crc32_finish(log_sidecar::kCrc32Initial);
         state_.active_metadata_records = 0U;
         state_.active_session_number = selected_session;
+        state_.active_ulog_name_code = ulog_name_code;
         state_.active_crc_state = log_sidecar::kCrc32Initial;
         state_.log_writer_open = true;
 
@@ -929,6 +1127,7 @@ public:
         entry.sequence = state_.active_metadata.session_sequence;
         entry.file_size = 0U;
         entry.session_number = selected_session;
+        entry.ulog_name_code = ulog_name_code;
         entry.sidecar_flags = state_.active_metadata.flags;
         entry.metadata_records = state_.active_metadata_records;
         /* 文件刚创建时尚无 ULog magic，不能提前向 QGC 宣称有效；首个 append
@@ -1104,6 +1303,15 @@ public:
             return -ERANGE;
         }
 
+        set_fat_time_reference(reference);
+        // 冷启动时文件可能早于授时创建。先同步内容，再用 FatFs 正式接口补齐
+        // 活动文件和会话目录的修改时间；后续 f_sync 自动继续采用北京时间。
+        // f_utime 不修改创建时间，原始创建时刻以 sidecar 的 start_utc_us 为准。
+        const int timestamp_result = update_active_timestamps_locked(start_utc);
+        if (timestamp_result != 0) {
+            return timestamp_result;
+        }
+
         const log_sidecar::Metadata previous = state_.active_metadata;
         state_.active_metadata.flags |= log_sidecar::kUtcValidFlag;
         state_.active_metadata.boot_utc_us = reference.boot_utc_us;
@@ -1200,6 +1408,18 @@ public:
         state_.log_reader_open = true;
         state_.log_reader_session_number =
             session_number_from_log_path(indexed.filepath);
+        // 活动会话的索引 size 来自内存写入计数，可能超前已刷盘数据；
+        // 下载前先同步活动 writer，使实际 f_size 覆盖列表承诺的字节。
+        // 正在记录的日志允许导出；volume mutex 已串行化 writer 并发。
+        if (state_.log_writer_open &&
+            state_.log_reader_session_number == state_.active_session_number) {
+            const FRESULT synchronized = f_sync(&state_.log_writer);
+            if (synchronized != FR_OK) {
+                const int close_error = close_log_reader_locked();
+                const int sync_error = handle(synchronized);
+                return close_error != 0 ? close_error : sync_error;
+            }
+        }
         if (f_size(&state_.log_reader) < indexed.size_bytes) {
             const int close_error = close_log_reader_locked();
             const int size_error = invalidate_with_io_error();
@@ -1286,6 +1506,7 @@ private:
         state_.active_metadata = {};
         state_.active_metadata_records = 0U;
         state_.active_session_number = 0U;
+        state_.active_ulog_name_code = 0U;
         state_.active_crc_state = log_sidecar::kCrc32Initial;
     }
 
@@ -1454,6 +1675,36 @@ private:
         }
     }
 
+    int update_active_timestamps_locked(std::uint64_t start_utc_us) noexcept
+    {
+        const FRESULT synchronized = f_sync(&state_.log_writer);
+        if (synchronized != FR_OK) {
+            return handle(synchronized);
+        }
+        char path[kMaximumLogPathLength]{};
+        char ulog_filename[kUlogFilenameCapacity]{};
+        format_ulog_filename(state_.active_ulog_name_code, ulog_filename);
+        if (!session_file_path(state_.active_session_number, ulog_filename,
+                               path, sizeof(path))) {
+            return -ENAMETOOLONG;
+        }
+        const DWORD modified = current_fat_time();
+        FILINFO information{};
+        information.fdate = static_cast<WORD>(modified >> 16U);
+        information.ftime = static_cast<WORD>(modified);
+        const FRESULT file_result = f_utime(path, &information);
+        if (file_result != FR_OK) {
+            return handle(file_result);
+        }
+        if (!session_path(state_.active_session_number, path, sizeof(path))) {
+            return -ENAMETOOLONG;
+        }
+        const DWORD started = fat_time_from_utc(start_utc_us);
+        information.fdate = static_cast<WORD>(started >> 16U);
+        information.ftime = static_cast<WORD>(started);
+        return handle(f_utime(path, &information));
+    }
+
     int inspect_session_directory_locked(
         std::uint16_t session, SessionCatalogEntry &entry) noexcept
     {
@@ -1469,6 +1720,9 @@ private:
         }
         state_.log_child_open = true;
         bool unknown = false;
+        bool ulog_seen = false;
+        std::uint32_t ulog_name_code = 0U;
+        char ulog_name[kUlogFilenameCapacity]{};
         for (;;) {
             FILINFO child{};
             result = f_readdir(&state_.log_child_directory, &child);
@@ -1482,8 +1736,21 @@ private:
                 unknown = true;
                 break;
             }
-            if (!ascii_equal(child.fname, kUlogFilename) &&
-                !ascii_equal(child.fname, kMetadataFilename)) {
+            std::uint32_t child_code = 0U;
+            if (parse_ulog_filename(child.fname, child_code)) {
+                if (ulog_seen) {
+                    /* 合法目录最多一个 ULog 文件；第二个无法判断哪份才是本会话
+                     * 数据，按未知用户内容保护而不是猜测。 */
+                    unknown = true;
+                    break;
+                }
+                ulog_seen = true;
+                ulog_name_code = child_code;
+                const std::size_t child_length = std::strlen(child.fname);
+                std::memcpy(ulog_name, child.fname, child_length + 1U);
+                continue;
+            }
+            if (!ascii_equal(child.fname, kMetadataFilename)) {
                 unknown = true;
                 break;
             }
@@ -1498,12 +1765,20 @@ private:
         if (unknown) {
             entry.state |= kCatalogProtectedUnknown;
         }
+        if (!ulog_seen) {
+            if (!unknown) {
+                entry.state |= kCatalogDeleteEmpty;
+            } else {
+                entry.sidecar_flags |= log_sidecar::kCorruptFlag;
+            }
+            return 0;
+        }
+        entry.ulog_name_code = ulog_name_code;
 
-        /* 合法 Logger 目录最多有两个唯一文件，遇到首个未知项即可停止枚举；
-         * 再用精确路径查询 ULog，既保持扫描有界，也不会因目录顺序漏掉有效日志。 */
+        /* 遇到首个未知项即可停止枚举；再用枚举捕获的文件名精确查询 ULog，
+         * 既保持扫描有界，也不会因目录顺序漏掉有效日志。 */
         char ulog_path[kMaximumLogPathLength]{};
-        if (!session_file_path(session, kUlogFilename,
-                               ulog_path, sizeof(ulog_path))) {
+        if (!join_path(directory, ulog_name, ulog_path, sizeof(ulog_path))) {
             return -ENAMETOOLONG;
         }
         FILINFO information{};
@@ -1693,8 +1968,11 @@ private:
             return -EINVAL;
         }
         char path[kMaximumLogPathLength]{};
+        char ulog_filename[kUlogFilenameCapacity]{};
+        format_ulog_filename(state_.log_catalog[index].ulog_name_code,
+                             ulog_filename);
         if (!session_file_path(state_.log_catalog[index].session_number,
-                               kUlogFilename, path, sizeof(path))) {
+                               ulog_filename, path, sizeof(path))) {
             return -ENAMETOOLONG;
         }
         const FRESULT result = f_open(
@@ -1782,20 +2060,63 @@ private:
         if (!delete_path(session, directory, sizeof(directory))) {
             return -ENAMETOOLONG;
         }
-        char path[kMaximumLogPathLength]{};
-        if (!join_path(directory, kUlogFilename, path, sizeof(path))) {
-            return -ENAMETOOLONG;
+        /* delNNN 内的 ULog 文件名不固定（旧版 log100.ulg 或时间命名），先枚举
+         * 收集 Logger 已知文件再逐个删除；未知内容/子目录不触碰，由最后的
+         * rmdir FR_DENIED 兜底保留。枚举轮次有界，防止用户内容拖住 storage
+         * worker。正常断电遗留只有 ULog/meta.bin，会在本步骤完整收敛。 */
+        char names[4][kUlogFilenameCapacity]{};
+        std::size_t name_count = 0U;
+        FRESULT result = f_opendir(&state_.log_child_directory, directory);
+        if (result == FR_NO_FILE || result == FR_NO_PATH) {
+            return 0;
         }
-        int first_error = unlink_if_exists_locked(path);
-        if (!state_.mounted) {
-            return first_error;
+        if (result != FR_OK) {
+            return handle(result);
         }
-        if (!join_path(directory, kMetadataFilename, path, sizeof(path))) {
-            return first_error != 0 ? first_error : -ENAMETOOLONG;
+        state_.log_child_open = true;
+        for (std::size_t iterations = 0U; iterations < 16U; ++iterations) {
+            FILINFO child{};
+            result = f_readdir(&state_.log_child_directory, &child);
+            if (result != FR_OK || child.fname[0] == '\0') {
+                break;
+            }
+            if (ascii_equal(child.fname, ".") || ascii_equal(child.fname, "..")) {
+                continue;
+            }
+            std::uint32_t child_code = 0U;
+            if ((child.fattrib & AM_DIR) == 0U &&
+                (parse_ulog_filename(child.fname, child_code) ||
+                 ascii_equal(child.fname, kMetadataFilename)) &&
+                name_count < std::size(names)) {
+                const std::size_t child_length = std::strlen(child.fname);
+                std::memcpy(names[name_count], child.fname,
+                            child_length + 1U);
+                ++name_count;
+            }
         }
-        const int metadata_error = unlink_if_exists_locked(path);
-        if (first_error == 0) {
-            first_error = metadata_error;
+        const FRESULT closed = f_closedir(&state_.log_child_directory);
+        state_.log_child_open = false;
+        const int enumerate_result =
+            finish_fatfs_results_locked(result, closed);
+        if (enumerate_result != 0) {
+            return enumerate_result;
+        }
+        int first_error = 0;
+        for (std::size_t index = 0U; index < name_count; ++index) {
+            char path[kMaximumLogPathLength]{};
+            if (!join_path(directory, names[index], path, sizeof(path))) {
+                if (first_error == 0) {
+                    first_error = -ENAMETOOLONG;
+                }
+                break;
+            }
+            const int file_error = unlink_if_exists_locked(path);
+            if (first_error == 0) {
+                first_error = file_error;
+            }
+            if (!state_.mounted) {
+                return first_error;
+            }
         }
         if (!state_.mounted) {
             return first_error;
@@ -1808,8 +2129,7 @@ private:
                 first_error = error;
             }
         }
-        /* FR_DENIED 表示 delNNN 中出现非 Logger 文件；保留未知内容。正常断电
-         * 遗留只有 log100.ulg/meta.bin，会在本步骤完整收敛。 */
+        /* FR_DENIED 表示 delNNN 中仍有非 Logger 文件；保留未知内容。 */
         return first_error;
     }
 
@@ -1827,6 +2147,7 @@ private:
         }
         state_.log_child_open = true;
         owned = true;
+        bool ulog_seen = false;
         for (;;) {
             FILINFO child{};
             result = f_readdir(&state_.log_child_directory, &child);
@@ -1836,13 +2157,22 @@ private:
             if (ascii_equal(child.fname, ".") || ascii_equal(child.fname, "..")) {
                 continue;
             }
+            std::uint32_t child_code = 0U;
+            const bool child_is_ulog =
+                (child.fattrib & AM_DIR) == 0U &&
+                parse_ulog_filename(child.fname, child_code);
             if ((child.fattrib & AM_DIR) != 0U ||
-                (!ascii_equal(child.fname, kUlogFilename) &&
-                 !ascii_equal(child.fname, kMetadataFilename))) {
+                (!child_is_ulog &&
+                 !ascii_equal(child.fname, kMetadataFilename)) ||
+                (child_is_ulog && ulog_seen)) {
                 owned = false;
-                /* 合法目录只有两个固定文件；首个未知项已足以撤销删除权，立即
-                 * 结束枚举，避免用户内容让 storage worker 长时间占用。 */
+                /* 合法目录最多一个 ULog 加一个 meta.bin；首个未知项或第二个
+                 * ULog 已足以撤销删除权，立即结束枚举，避免用户内容让 storage
+                 * worker 长时间占用。 */
                 break;
+            }
+            if (child_is_ulog) {
+                ulog_seen = true;
             }
         }
         const FRESULT closed = f_closedir(&state_.log_child_directory);
@@ -2029,15 +2359,15 @@ private:
             return result;
         }
         const std::uint64_t total = information.total_bytes;
-        /* PX4 v1.17 util::check_free_space 的回收目标为 min(容量*10%, 300 MiB)，
-         * 停止记录门限独立为 50 MiB。小卷的回收目标至少覆盖停止门限，确保
-         * 先尝试清理再停写；不能把回收目标本身当成 ENOSPC 条件。
+        /* 本地策略不采用 PX4 的 min(容量×10%, 300 MiB) 回收目标：回收目标与
+         * 停止线同为 10 MiB——只有空闲真正触线时才回收最旧已关闭会话，日志
+         * 先写满全卡；触线前不因空间预防性删除任何历史。回收目标本身不是
+         * ENOSPC 条件，仍需等无安全候选且分配会突破停止线才停写。
          * 常态按簇扣减、60 s 校正，触线决策前另行读取 FatFs 空闲簇计数。 */
         state_.cluster_bytes = cluster_bytes;
         state_.total_bytes = total;
         state_.available_bytes_estimate = information.available_bytes;
-        state_.free_space_threshold_bytes = std::max(
-            kMinimumFreeBytes, std::min(total / 10U, kMaximumFreeBytes));
+        state_.free_space_threshold_bytes = kMinimumFreeBytes;
         state_.last_space_correction_us = now_us;
         return total != 0U ? 0 : -ENODEV;
     }
@@ -2070,8 +2400,8 @@ private:
             return deleted;
         }
 
-        // 无安全候选时仍可使用回收目标与 50 MiB 停止线之间的空间。
-        // allocation_cost=0 的已分配簇尾部允许冲刷，不再消耗任何空闲簇。
+        // 无安全候选时停止线以下为参数/固件预留缓冲，不可再分配；只剩
+        // allocation_cost=0 的已分配簇尾部允许冲刷，不消耗任何空闲簇。
         if (allocation_cost <= state_.available_bytes_estimate &&
             (state_.available_bytes_estimate - allocation_cost >=
                  kMinimumFreeBytes ||
@@ -2293,7 +2623,9 @@ private:
             LogIndexEntry entry{};
             entry.time_utc = catalog.time_utc;
             entry.size_bytes = catalog.file_size;
-            if (!session_file_path(catalog.session_number, kUlogFilename,
+            char ulog_filename[kUlogFilenameCapacity]{};
+            format_ulog_filename(catalog.ulog_name_code, ulog_filename);
+            if (!session_file_path(catalog.session_number, ulog_filename,
                                    entry.filepath, sizeof(entry.filepath))) {
                 continue;
             }
@@ -2637,3 +2969,9 @@ LogFileStore &log_file_store() noexcept
 }
 
 } // namespace dima::platform::freertos
+
+extern "C" DWORD get_fattime(void)
+{
+    // FatFs 已在 volume mutex 内调用；这里只读时间，不再次加锁或触碰介质。
+    return dima::platform::freertos::current_fat_time();
+}

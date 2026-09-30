@@ -5,6 +5,7 @@
 - **固定资源：** 16 个 task slot、12 个 mutex slot、16 个 signal slot；八个 WorkQueue 加 `appMainTask` 使用 36 KiB 静态栈，任务栈来自 DTCM 中独立的 48 KiB `.dima_task_pool`，通用 `heap_5` 固定为 D1 中 256 KiB `.dima_heap`。
 - **栈初始化：** 任务栈池保持单池 bitmap 分配和每次创建前清栈，栈大小、优先级与回收流程不变。内核 Idle/Timer 的 512 B/1024 B 栈仍由 Core 静态回调提供于 D2，不计入该池；MSP 保留 DTCM 上部 64 KiB。DTCM 栈上的 I/O 数据必须经过各端口已有的专用 DMA 缓冲策略。
 - **时间与超时：** 公共层只传微秒/毫秒和 `Timeout`；本后端向上取整到 1 kHz tick，不向调用者暴露 `TickType_t`、`TaskHandle_t` 或 `portMAX_DELAY`。
+- **文件日期：** storage 通过 `LogTimeReference` 接收业务层已确认的 UTC，不订阅设备消息；在唯一 volume mutex 内安装本次上电映射。FatFs 的 `get_fattime` 只读映射和单调时钟，以固定 UTC+8 生成本地 FAT 日期，不改硬件时钟。晚到授时通过 `f_sync/f_utime` 补齐活动文件与会话目录的修改日期；创建日期不能由 `f_utime` 回填，准确开始时间保留在 sidecar。无授时时用 `1980-01-01` 占位，不将占位值写为有效 UTC。
 - **实时约束：** ISR 和标记为 realtime 的 WorkQueue 禁止动态分配；中间件与业务不得直接调用 FreeRTOS API。
 - **硬件归属：** TIM2 HRT、cache、MPU、DMA、Flash、USB、UART、CAN、SPI 和 EXTI 的基础控制均位于 `platform/stm32h7`，通过公共 capability 使用；SBUS、UM982、ICM-42688-P、DroneCAN 等协议与设备策略属于 `lib/protocols` 和 `drivers`。
 - **SD 边界：** `FatFsAtomicFileStore.cpp` 独占 FATFS、参数镜像文件、ULog writer、下载 reader 和目录扫描对象，公共 backend mutex 串行所有物理调用；`Boards/H743/Src/fatfs_diskio.cpp` 独占 `hsd1`、HAL_SD 识卡以及 D1 `.dima_sd_dma` 中的两个 4 KiB 缓冲。运行期 I/O 只在 `wq:storage` 推进；MAVLink 仅交换固定请求/响应 Ring，Mission 与导航不以 SD 卡存在为前提，运行期 IDMA/命令事务共享 500 ms 有限截止，识卡仍沿用 HAL。板上没有 card-detect GPIO，因此 `disk_status()==0` 只表示旧会话未被判错；复用挂载前必须用同样受限的 `CTRL_SYNC` 主动命令确认“当前可用”，不能对外声称已证明物理卡在位。
