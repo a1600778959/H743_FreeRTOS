@@ -1,14 +1,18 @@
 #define MODULE_NAME "auto_cal"
 #include "AutoCalibrationMode.hpp"
-#include "auto/AutoMode.hpp"
-#include "control/RoverDifferential.hpp"
 #include "logging/logging.hpp"
 
 #include <algorithm>
 #include <cmath>
 
 namespace dima::rover::modes {
-namespace math = dima::lib::rover::calibration;
+
+// —— 整定链调度适配（Tuning 支撑）———————————————————————————————
+// 状态区压平后本文件只保留调度器与阶段 helper 共用的无状态支撑：整定配置
+// 读取、姿态解算、估计器代次校验、闭环反馈有效性与采样节流。阶段推进、
+// 事务与子状态全部由 AutoCalibrationMode.cpp 的调度器（PhaseSubstate/
+// TransactionKind）及各阶段文件的 StepResult helper 承担，这里不再有任何
+// 状态跳转或事务判断。
 
 bool AutoCalibrationMode::read_tuning_config() noexcept
 {
@@ -35,6 +39,10 @@ bool AutoCalibrationMode::read_tuning_config() noexcept
     if (!loaded) return false;
     // RO_YAW_* 的限制沿用 PX4 deg/s、deg/s^2；PI 本身使用 rad/s 误差，
     // 因此 P/I 不作角度换算。RD_TRANS_* 已是 rad，不能再转换一次。
+    // 本轮实测范围仅约束实验目标，未写回用户巡航参数；重读前端时保留
+    // 已选择的范围交集，避免把目标恢复到尚未观测/不可执行的更高速度。
+    if (runtime_cohort_ && std::isfinite(tuning_config_.speed_limit) && tuning_config_.speed_limit > 0.0F)
+        next.speed_limit = std::min(next.speed_limit, tuning_config_.speed_limit);
     next.rate_limit *= kRadians;
     next.rate_threshold *= kRadians;
     next.rate_acceleration *= kRadians;
@@ -49,94 +57,6 @@ float AutoCalibrationMode::body_yaw() const noexcept
     const auto &q = attitude_sub_.get().q;
     return std::atan2(2.0F * (q[0] * q[3] + q[1] * q[2]),
         1.0F - 2.0F * (q[2] * q[2] + q[3] * q[3]));
-}
-
-void AutoCalibrationMode::start_tuning(std::uint64_t now) noexcept
-{
-    if (pending_termination_ || tuning_started_) { finish(now); return; }
-    tuning_started_ = true;
-    if ((status_.completed_stages & Status::STAGE_RTK) == 0U || !read_tuning_config()) {
-        fail_tuning(Status::FAILURE_MOTION_UNAVAILABLE, now);
-        return;
-    }
-    // 正常 MIN/EXPO/ASYM 可能使旧线性 FF 不可观；RTK 成功后仍能独立采集
-    // 真实响应，不能以“FF 已保存”为后置整形/运行参数辨识的循环依赖。
-    if (begin_imu_bias(now)) return;
-    if (transaction_.active()) { terminate(Status::FAILURE_PARAMETER, false, now); return; }
-    status_.unavailable_stages |= Status::STAGE_IMU_BIAS;
-    start_response_profile(now);
-}
-
-void AutoCalibrationMode::begin_identification(std::uint64_t now) noexcept
-{
-    if (!rtk_yaw_fused(now) || !std::isfinite(rtk_sub_.get().speed_accuracy_m_s) ||
-        rtk_sub_.get().speed_accuracy_m_s <= 0.0F) {
-        fail_tuning(Status::FAILURE_SENSOR_STALE, now);
-        return;
-    }
-    const auto &c = tuning_config_;
-    const bool limits_valid = std::isfinite(c.speed_limit) && c.speed_limit > 0.0F && c.speed_limit <= fence_.speed_limit_m_s &&
-        std::isfinite(c.rate_limit) && c.rate_limit > 0.0F && c.rate_limit <= 0.6F &&
-        std::isfinite(c.speed_threshold) && c.speed_threshold >= 0.0F && c.speed_threshold < 0.4F * c.speed_limit &&
-        std::isfinite(c.rate_threshold) && c.rate_threshold >= 0.0F && c.rate_threshold < 0.4F * c.rate_limit &&
-        std::isfinite(c.acceleration) && c.acceleration > 0.0F && std::isfinite(c.deceleration) && c.deceleration > 0.0F &&
-        std::isfinite(c.rate_acceleration) && c.rate_acceleration > 0.0F && std::isfinite(c.rate_deceleration) && c.rate_deceleration > 0.0F;
-    // 待验证运行值来自本会话响应候选，不是入场冻结上限。前馈不能吃完
-    // PI 的调节余量；输出包络是安全边界，命令端点不能冒充 PI 调节余量。
-    const float speed_ff = c.speed_limit / status_.maximum_speed_m_s;
-    const float rate_ff = c.rate_limit * config_.track * status_.yaw_rate_correction / (2.0F * status_.maximum_speed_m_s);
-    const bool ff_feasible = std::isfinite(speed_ff) && std::isfinite(rate_ff) &&
-        speed_ff < std::min(0.35F, config_.motor_maximum) &&
-        rate_ff < std::min(0.30F, config_.motor_maximum);
-    if (!ff_feasible)
-        PX4_WARN("[autocal] PI formula infeasible: FF headroom speed=%.3f rate=%.3f envelope=%.3f; no fallback",
-            static_cast<double>(speed_ff), static_cast<double>(rate_ff), static_cast<double>(config_.motor_maximum));
-    if (!limits_valid || !ff_feasible ||
-        !prepare_straight(now) || now - session_started_ > 450000000ULL) {
-        fail_tuning(Status::FAILURE_MOTION_UNAVAILABLE, now);
-        return;
-    }
-    status_.closed_loop = false;
-    status_.gain_group = Status::GAIN_INNER;
-    const auto &imu_status = imu_status_sub_.get();
-    float gyro_variance = 0.0F;
-    for (float variance : imu_status.var_gyro) {
-        if (!std::isfinite(variance) || variance < 0.0F) { fail_tuning(Status::FAILURE_SENSOR_STALE, now); return; }
-        gyro_variance = std::max(gyro_variance, variance);
-    }
-    if (!fresh(imu_status.timestamp, now, 1500000ULL) || imu_status.gyro_device_id != imu_sub_.get().gyro_device_id) {
-        fail_tuning(Status::FAILURE_SENSOR_STALE, now); return;
-    }
-    tuning_noise_[0] = std::max(response_noise_[0], rtk_sub_.get().speed_accuracy_m_s);
-    tuning_noise_[1] = std::max(response_noise_[1], std::sqrt(gyro_variance));
-    if (!reset_identification()) { fail_tuning(Status::FAILURE_IDENTIFICATION, now); return; }
-    exercise_ = 0U;
-    transition(Status::STATE_WAIT_ARM_IDENTIFICATION, now);
-}
-
-bool AutoCalibrationMode::reset_identification() noexcept
-{
-    math::IdentificationConfig configuration{};
-    configuration.maximum_absolute_input = config_.motor_maximum;
-    configuration.maximum_absolute_output = fence_.speed_limit_m_s;
-    configuration.maximum_normalized_rms_residual = 0.20F;
-    configuration.sample_period_tolerance_s = 0.04F;
-    const float velocity_input = tuning_config_.speed_limit / status_.maximum_speed_m_s;
-    configuration.minimum_input_variance = std::max(1.0e-8F, 0.0004F * velocity_input * velocity_input);
-    configuration.output_noise_variance = tuning_noise_[0] * tuning_noise_[0];
-    for (unsigned i = 0U; i < 2U; ++i) if (!identifiers_[i].configure(configuration)) return false;
-    configuration.sample_period_s = 0.02F;
-    configuration.sample_period_tolerance_s = 0.012F;
-    configuration.maximum_absolute_output = 0.6F;
-    configuration.minimum_samples = 150U;
-    const float rate_input = tuning_config_.rate_limit * config_.track * status_.yaw_rate_correction / (2.0F * status_.maximum_speed_m_s);
-    configuration.minimum_input_variance = std::max(1.0e-8F, 0.0004F * rate_input * rate_input);
-    configuration.output_noise_variance = tuning_noise_[1] * tuning_noise_[1];
-    for (unsigned i = 2U; i < 4U; ++i) if (!identifiers_[i].configure(configuration)) return false;
-    for (unsigned i = 0U; i < 4U; ++i) shaping_uu_[i] = shaping_up_[i] = shaping_pp_[i] = 0.0;
-    tuning_sample_ = exercise_started_ = 0U;
-    exercise_running_ = false;
-    return true;
 }
 
 bool AutoCalibrationMode::tuning_estimator_valid(std::uint64_t now) const noexcept
@@ -178,86 +98,6 @@ bool AutoCalibrationMode::take_tuning_sample(std::uint64_t now, bool rate) noexc
     // 标称 100 ms 的速度模型稳定地采成 80 ms，导致时间常数与 PI 单位错误。
     if (timestamp <= tuning_sample_ || (tuning_sample_ != 0U && timestamp - tuning_sample_ < interval)) return false;
     tuning_sample_ = timestamp;
-    return true;
-}
-
-void AutoCalibrationMode::fail_tuning(std::uint8_t reason, std::uint64_t now) noexcept
-{
-    const auto missing = (Status::STAGE_INNER_GAINS | Status::STAGE_HEADING_GAIN | Status::STAGE_PATH_GAIN |
-        Status::STAGE_RUNTIME | Status::STAGE_NAV_STRATEGY) & ~status_.completed_stages;
-    status_.unavailable_stages |= missing;
-    if (status_.failure_reason == Status::FAILURE_NONE) status_.failure_reason = reason;
-    // 所有失败都先撤销正向许可；Disarmed 的回滚/保存交接窗口也不能继承
-    // WAIT_ARM 标志。统一退出请求使 Commander 清 session grant，再集中回滚。
-    status_.awaiting_arm = status_.motion_allowed = status_.session_authorized = false;
-    if (!armed_.armed() && transaction_.active()) transition(Status::STATE_RESTORE_GAINS, now);
-    terminate(reason, false, now);
-}
-
-bool AutoCalibrationMode::step_tuning(std::uint64_t now) noexcept
-{
-    if (step_imu_bias(now)) return true;
-    if (step_response_profile(now)) return true;
-    switch (status_.state) {
-    case Status::STATE_WAIT_ARM_IDENTIFICATION:
-    case Status::STATE_WAIT_ARM_VALIDATION: {
-        physical_speed_ = physical_rate_ = longitudinal_ = steering_ = 0.0F;
-        // Arm 等待不得吃掉接下来完整运动段及停车/保存的预算；尤其不能在
-        // 会话只剩几十秒时启动一个最长 75 s 的路径试验。
-        const std::uint64_t reserve = status_.state == Status::STATE_WAIT_ARM_IDENTIFICATION && exercise_ < 2U
-            ? 200000000ULL : 110000000ULL;
-        if (now - state_started_ > 120000000ULL || now - session_started_ + reserve > 600000000ULL) {
-            fail_tuning(Status::FAILURE_TIMEOUT, now); break;
-        }
-        status_.awaiting_arm = rtk_yaw_fused(now) && imu_quality(now) && stopped() && fence_result(now).can_stop &&
-            tuning_estimator_valid(now) && (status_.state != Status::STATE_WAIT_ARM_VALIDATION || gain_frontend_confirmed());
-        if (!armed_.armed()) break;
-        if (!status_.awaiting_arm) { terminate(Status::FAILURE_PREFLIGHT, false, now); break; }
-        status_.awaiting_arm = false;
-        arm_started_ = motion_started_ = now;
-        exercise_started_ = tuning_sample_ = 0U;
-        exercise_running_ = false;
-        leg_lat_ = gps_sub_.get().latitude_deg;
-        leg_lon_ = gps_sub_.get().longitude_deg;
-        leg_heading_ = rtk_sub_.get().array_heading_rad;
-        exercise_heading_ = body_yaw();
-        if (status_.state == Status::STATE_WAIT_ARM_IDENTIFICATION)
-            transition(exercise_ < 2U ? Status::STATE_IDENTIFY_SPEED : Status::STATE_IDENTIFY_RATE, now);
-        else start_validation(now);
-        break;
-    }
-    case Status::STATE_IDENTIFY_SPEED: identify_speed(now); break;
-    case Status::STATE_IDENTIFY_RATE: identify_rate(now); break;
-    case Status::STATE_STOP_IDENTIFICATION:
-        longitudinal_ = steering_ = 0.0F;
-        if (now - state_started_ > 15000000ULL) { terminate(Status::FAILURE_TIMEOUT, false, now); break; }
-        if (armed_.armed()) { if (stopped()) request(auto_calibration_request_s::REQUEST_STAGE_DISARM, now); break; }
-        if (exercise_ == 2U) transition(Status::STATE_WAIT_ARM_IDENTIFICATION, now);
-        else if (!calculate_inner_gains() || !begin_gain_transaction(now, Status::GAIN_INNER)) fail_tuning(Status::FAILURE_IDENTIFICATION, now);
-        break;
-    case Status::STATE_APPLY_GAINS: case Status::STATE_SAVE_GAINS: case Status::STATE_RESTORE_GAINS:
-        poll_gain_transaction(now); break;
-    case Status::STATE_VALIDATE_SPEED: validate_inner(now, false); break;
-    case Status::STATE_VALIDATE_RATE: validate_inner(now, true); break;
-    case Status::STATE_VALIDATE_HEADING: validate_heading(now); break;
-    case Status::STATE_VALIDATE_DRIVING: validate_driving(now); break;
-    case Status::STATE_VALIDATE_PATH: validate_path(now); break;
-    case Status::STATE_STOP_VALIDATION:
-        physical_speed_ = physical_rate_ = 0.0F;
-        if (now - state_started_ > 15000000ULL) { terminate(Status::FAILURE_TIMEOUT, false, now); break; }
-        if (armed_.armed()) { if (stopped()) request(auto_calibration_request_s::REQUEST_STAGE_DISARM, now); break; }
-        // 第 3 段后才需要重新 Arm 进入角速度组；第 9 段已完成两轴验证，
-        // 必须进入 Heading，不能带着越界计数再次启动 CCW 验证。
-        if (status_.gain_group == Status::GAIN_INNER && exercise_ == 3U) {
-            transition(Status::STATE_WAIT_ARM_VALIDATION, now);
-        } else if (status_.gain_group == Status::GAIN_PATH) {
-            // 多候选选择在参数文件处理，始终保留同组最初快照。
-            advance_path_trial(now);
-        } else if (validation_passed_) advance_cohort_validation(now);
-        else fail_tuning(Status::FAILURE_GAIN_VALIDATION, now);
-        break;
-    default: return false;
-    }
     return true;
 }
 

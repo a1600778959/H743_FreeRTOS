@@ -1,7 +1,5 @@
 #define MODULE_NAME "auto_cal"
 #include "AutoCalibrationMode.hpp"
-#include "logging/logging.hpp"
-#include <uORB/topics/auto_calibration_status_labels.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -9,16 +7,23 @@
 
 namespace dima::rover::modes {
 
+// —— Fence helper（围栏与停车距离，去状态化）——————————————————————————
+// 围栏几何只依赖阶段语义：直线族（STRAIGHT 的 straight_active 域）使用走廊
+// 界，其余运动面使用圆形界；制动观测的轮次界由 Braking 子状态表达，不再
+// 读顶层 status_.state。停车距离随实测制动候选更新。
+
 bool AutoCalibrationMode::motion_configuration_valid() const noexcept
 {
     // 包络=入场冻结的 MOT_THR_MAX（0.05–1.0，与 session_limits 同域校验）；
     // 纵/转向均无静态输出上限，其余申报项维持原有范围。
     return config_valid_ && std::isfinite(config_.track) && config_.track > 0.0F && config_.track <= 5.0F &&
         std::isfinite(config_.radius) && config_.radius >= 1.0F && config_.radius <= 100.0F &&
-        std::isfinite(config_.stop_distance) && config_.stop_distance > 0.0F && config_.stop_distance <= 100.0F &&
-        std::isfinite(config_.motor_maximum) && config_.motor_maximum >= 0.05F && config_.motor_maximum <= 1.0F &&
-        std::isfinite(fence_.speed_limit_m_s) && fence_.speed_limit_m_s > 0.0F &&
-        std::isfinite(status_.session_motor_limit) && status_.session_motor_limit >= 0.05F && status_.session_motor_limit <= 1.0F &&
+        std::isfinite(config_.straight_distance) && config_.straight_distance >= 1.0F && config_.straight_distance <= 100.0F &&
+        std::isfinite(config_.deceleration) && config_.deceleration >= -1.0F && config_.deceleration <= 100.0F &&
+        std::isfinite(config_.motor_reversal_delay_s) && config_.motor_reversal_delay_s >= 0.0F && config_.motor_reversal_delay_s <= 1.0F &&
+        std::isfinite(config_.motor_slew_rate) && config_.motor_slew_rate >= 0.0F && config_.motor_slew_rate <= 10.0F &&
+        dima::lib::rover::calibration::session_limits(fence_.speed_limit_m_s, config_.motor_maximum).valid &&
+        dima::lib::rover::calibration::session_limits(fence_.speed_limit_m_s, status_.session_motor_limit).valid &&
         config_.gps_control >= 0 && config_.gps_control <= 15;
 }
 
@@ -27,18 +32,21 @@ void AutoCalibrationMode::capture_fence(std::uint64_t now) noexcept
     const auto &gps = gps_sub_.get();
     const auto limits = dima::lib::rover::calibration::session_limits(
         config_.entry_cruise, config_.motor_maximum);
-    fence_ = {gps.latitude_deg, gps.longitude_deg, gps.eph, config_.radius, config_.stop_distance, limits.speed_m_s};
+    fence_ = {gps.latitude_deg, gps.longitude_deg, gps.eph, config_.radius, config_.deceleration, limits.speed_m_s};
     status_.session_speed_limit_m_s = limits.speed_m_s;
     status_.session_motor_limit = limits.motor_output;
     status_.entry_cruise_speed_m_s = config_.entry_cruise;
     status_.fence_radius_m = config_.radius;
-    status_.fence_stop_distance_m = config_.stop_distance;
+    status_.straight_distance_m = config_.straight_distance;
+    status_.entry_deceleration_m_s2 = config_.deceleration;
+    status_.straight_active = true;
+    status_.fence_stop_distance_m = NAN; // 新会话尚无停车观测，旧配置不是实测距离。
     status_.fence_center_valid = fresh(gps.timestamp_sample, now, 300000ULL) && gps.device_id != 0U &&
         gps.fix_type == sensor_gps_s::FIX_TYPE_RTK_FIXED && std::isfinite(gps.latitude_deg) &&
         std::fabs(gps.latitude_deg) < 85.0 && std::isfinite(gps.longitude_deg) && std::fabs(gps.longitude_deg) <= 180.0 &&
         std::isfinite(gps.eph) && gps.eph > 0.0F && gps.eph <= 0.15F;
     if (!status_.fence_center_valid) return;
-    gps_device_id_ = status_.fence_device_id = gps.device_id;
+    status_.fence_device_id = gps.device_id;
     status_.fence_center_timestamp = gps.timestamp_sample;
     status_.fence_latitude_deg = gps.latitude_deg;
     status_.fence_longitude_deg = gps.longitude_deg;
@@ -51,111 +59,84 @@ dima::lib::rover::calibration::CircleFenceResult AutoCalibrationMode::fence_resu
     const auto &gps = gps_sub_.get();
     if (!status_.fence_center_valid || !fresh(gps.timestamp_sample, now, 300000ULL) ||
         gps.device_id != status_.fence_device_id || gps.fix_type != sensor_gps_s::FIX_TYPE_RTK_FIXED) return {};
-    return dima::lib::rover::calibration::evaluate_circle(fence_, gps.latitude_deg, gps.longitude_deg,
-        gps.eph, 1.0e-6F * static_cast<float>(now - gps.timestamp_sample));
+    auto reference = fence_;
+    const float age = 1.0e-6F * static_cast<float>(now - gps.timestamp_sample);
+    const bool probe = status_.braking_model_generation == 0U || status_.braking_full_output ||
+        session_.substate == PhaseSubstate::Braking;
+    const bool rotating = status_.state == Status::STATE_TURN ||
+        session_.substate == PhaseSubstate::TurnAround ||
+        (session_.substate == PhaseSubstate::Return && return_motion_ == ReturnMotion::Align) ||
+        (status_.state == Status::STATE_PROFILE && profile_motion_ != 0U);
+    // 全输出试验只受原有几何边界约束，不把未知制动能力写成某个假设值。
+    // 获得模型后按实测减速度估算停车距离，不以旧制动初速限制本次速度。
+    // 转动时不把天线杆臂地速当平移速度。
+    reference.speed_limit_m_s = rotating ? fence_.speed_limit_m_s
+        : std::max(fence_.speed_limit_m_s, ground_speed());
+    const float stop = braking_distance(reference.speed_limit_m_s);
+    auto result = probe
+        ? dima::lib::rover::calibration::evaluate_braking_probe(reference, config_.straight_distance,
+            gps.latitude_deg, gps.longitude_deg, gps.eph, age)
+        : status_.straight_active
+        ? dima::lib::rover::calibration::evaluate_straight(reference, config_.straight_distance,
+            gps.latitude_deg, gps.longitude_deg, gps.eph, age, stop)
+        : dima::lib::rover::calibration::evaluate_circle(reference, gps.latitude_deg, gps.longitude_deg, gps.eph, age, stop);
+    const bool returning = session_.substate == PhaseSubstate::Return ||
+        (status_.state == Status::STATE_STRAIGHT && !session_.straight_outward);
+    if (returning && result.position_valid) {
+        // s=p·e：e在return_prepare冻结为起点→返程出发点。s<0才表示越过起点，
+        // 径向距离无法区分前后；此边界同时覆盖返程中的正式制动与事务等待。
+        const float along = result.north_m * std::cos(return_axis_rad_) +
+            result.east_m * std::sin(return_axis_rad_);
+        const float tolerance = fence_.origin_error_m + gps.eph;
+        if (!std::isfinite(along) ||
+            (along < -tolerance && result.distance_m > 0.5F + tolerance)) {
+            result.inside = result.can_stop = false;
+        }
+    }
+    return result;
 }
 
 void AutoCalibrationMode::update_fence(std::uint64_t now) noexcept
 {
     const auto result = fence_result(now);
+    // 显示巡航/当前速度对应的名义停车距离；实测距离仍在 braking_stop_distance_m。
+    status_.fence_stop_distance_m = braking_distance(std::max(fence_.speed_limit_m_s, ground_speed()));
     const float unavailable = std::numeric_limits<float>::quiet_NaN();
     status_.fence_distance_m = result.position_valid ? result.distance_m : unavailable;
     status_.fence_margin_m = result.position_valid ? result.margin_m : unavailable;
     status_.fence_working_radius_m = result.position_valid ? result.working_radius_m : unavailable;
+    // 去状态化：FENCE_BRAKING_PROBE 语义 = 尚无停车模型，或正处于内联制动
+    // 观测子状态（仅有界探测范围，不代表已有停车模型）。
     status_.fence_state = !status_.fence_center_valid ? Status::FENCE_UNAVAILABLE
         : !result.position_valid ? Status::FENCE_POSITION_LOST
         : !result.inside ? Status::FENCE_OUTSIDE
-        : !(fence_.stop_distance_m > 0.0F) ? Status::FENCE_STOP_UNKNOWN
+        : status_.braking_model_generation == 0U || status_.braking_full_output || session_.substate == PhaseSubstate::Braking ? Status::FENCE_BRAKING_PROBE
+        : !std::isfinite(status_.fence_stop_distance_m) ? Status::FENCE_DECELERATION_INVALID
         : result.can_stop ? Status::FENCE_SAFE : Status::FENCE_STOP_MARGIN;
 }
 
 bool AutoCalibrationMode::prepare_straight(std::uint64_t now) noexcept
 {
+    status_.straight_active = true;
     const auto result = fence_result(now);
-    // 初始 yaw 安装偏置未知，按任意方向最坏长度分配空间，不拿阵列 heading
-    // 冒充车头方向做射线预测。整段再留 0.5 m 跟踪/掉头余量；不足五米拒绝。
-    leg_distance_ = std::min(kPreferredStraightDistanceM, result.working_radius_m - result.distance_m - 0.5F);
-    return result.can_stop && std::isfinite(leg_distance_) && leg_distance_ >= 5.0F;
+    // 独立参数决定直线目标长度；不扣圆形围栏和停车距离，也不设固定五米
+    // 门槛。航向/速度拟合仍各自验证有效样本，空间短不等于校准成功。
+    leg_distance_ = config_.straight_distance;
+    return result.can_stop && std::isfinite(leg_distance_) && leg_distance_ >= 1.0F;
 }
 
-bool AutoCalibrationMode::prepare_profile_turn(std::uint64_t now) const noexcept
+float AutoCalibrationMode::sensor_lever_arm() const noexcept
 {
-    // 原地转向不需要五米直线。GNSS 定位点绕旋转中心最多移动两倍杆臂，
-    // 以配置 GPS/IMU 杆臂长度之和保守约束整个转动；全球圆心及停车余量不变。
-    const auto fence = fence_result(now);
+    // 路径布置与原地旋转共用六项杆臂读取；调用者按各自几何使用同一长度定义。
     float gx{}, gy{}, gz{}, ix{}, iy{}, iz{};
     px4::AtomicTransaction atomic;
-    if (!fence.can_stop ||
-        param_get(param_handle(dima::params::EKF2_GPS_POS_X), &gx) != 0 ||
+    if (param_get(param_handle(dima::params::EKF2_GPS_POS_X), &gx) != 0 ||
         param_get(param_handle(dima::params::EKF2_GPS_POS_Y), &gy) != 0 ||
         param_get(param_handle(dima::params::EKF2_GPS_POS_Z), &gz) != 0 ||
         param_get(param_handle(dima::params::EKF2_IMU_POS_X), &ix) != 0 ||
         param_get(param_handle(dima::params::EKF2_IMU_POS_Y), &iy) != 0 ||
-        param_get(param_handle(dima::params::EKF2_IMU_POS_Z), &iz) != 0) return false;
-    const float lever = std::hypot(std::hypot(gx, gy), gz) + std::hypot(std::hypot(ix, iy), iz);
-    return std::isfinite(lever) && fence.working_radius_m - fence.distance_m > 0.5F + 2.0F * lever;
-}
-
-void AutoCalibrationMode::report_status(std::uint64_t now) noexcept
-{
-    if (status_.session_id == 0U || (last_report_ != 0U && now >= last_report_ && now - last_report_ < 5000000ULL)) return;
-    last_report_ = now;
-    using namespace dima::generated::uorb_labels;
-    // 周期快照走非实时 RAW 路径，不受普通日志级别过滤。USB/QGC 重连不依赖
-    // 过期的一次性提示；不使用 [cal] 假装 Sensors 拥有整个组合会话。
-    PX4_INFO_RAW("[autocal] session=%lu state=%s progress=%u%%\n",
-        static_cast<unsigned long>(status_.session_id), auto_calibration_status_state_name(status_.state),
-        static_cast<unsigned>(status_.progress));
-    PX4_INFO_RAW("[autocal] stages saved=0x%lx unavailable=0x%lx skipped=0x%lx\n",
-        static_cast<unsigned long>(status_.completed_stages), static_cast<unsigned long>(status_.unavailable_stages),
-        static_cast<unsigned long>(status_.skipped_stages));
-    PX4_INFO_RAW("[autocal] fence %s %.2f/%.2fm margin %.2fm stop bound %.2fm\n",
-        auto_calibration_status_fence_name(status_.fence_state), static_cast<double>(status_.fence_distance_m),
-        static_cast<double>(status_.fence_radius_m), static_cast<double>(status_.fence_margin_m),
-        static_cast<double>(status_.fence_stop_distance_m));
-    PX4_INFO_RAW("[autocal] speed cap %.2fm/s motor cap %.2f\n",
-        static_cast<double>(status_.session_speed_limit_m_s), static_cast<double>(status_.session_motor_limit));
-    if (status_.active && !pending_termination_ && status_.excitation_phase != Status::EXCITATION_NONE)
-        PX4_INFO_RAW("[autocal] excitation=%s level=%u target=%.3f samples=%lu remaining=%.1fs\n",
-            auto_calibration_status_excitation_name(status_.excitation_phase), static_cast<unsigned>(status_.excitation_level),
-            static_cast<double>(status_.excitation_target), static_cast<unsigned long>(status_.excitation_samples),
-            static_cast<double>(status_.excitation_remaining_s));
-    // 周期快照可补齐重连后缺失的一次性证据；不重复发 endpoint reached 事件。
-    PX4_INFO_RAW("[autocal] evidence endpoint=%u mag_pct=%.1f mag_comp=%u mag_present=%u\n",
-        endpoint_reported_ ? 1U : 0U, static_cast<double>(status_.mag_interference_pct),
-        (status_.completed_stages & Status::STAGE_MAG_MOT) != 0U ? 1U : 0U, status_.magnetometer_present ? 1U : 0U);
-    if (status_.awaiting_arm) {
-        PX4_INFO_RAW(status_.session_authorized
-            ? "[autocal] automatic continuation; Manual/Disarm cancels\n"
-            : "[autocal] Arm ONCE for session; Manual/Disarm cancels\n");
-        if (!armed_sub_.get().ready_to_arm) PX4_INFO_RAW("[autocal] motion interlock not ready: check RC/outputs\n");
-    }
-    if (status_.mag_bootstrap_active || status_.gains_provisional)
-        px4_log_raw(_PX4_LOG_LEVEL_WARN, "[autocal] provisional RAM values; NOT saved\n");
-    if (status_.provisional_validated_stages != 0U)
-        PX4_INFO_RAW("[autocal] validated RAM=0x%lx; awaiting related checks\n",
-            static_cast<unsigned long>(status_.provisional_validated_stages));
-    if (!status_.active || pending_termination_ || status_.result != Status::RESULT_RUNNING) {
-        PX4_INFO_RAW("[autocal] session=%lu %s: %s\n", static_cast<unsigned long>(status_.session_id),
-            auto_calibration_status_result_name(status_.result),
-            auto_calibration_status_failure_name(status_.failure_reason));
-        if (status_.active) px4_log_raw(_PX4_LOG_LEVEL_WARN, "[autocal] Arm inhibited; stop/rollback pending\n");
-        if (transaction_.phase() == CalibrationParameters::Phase::Fault)
-            px4_log_raw(_PX4_LOG_LEVEL_ERROR, "[autocal] rollback unconfirmed; interlock latched; reset required\n");
-    }
-}
-
-void AutoCalibrationMode::service_motion_authorization(std::uint64_t now) noexcept
-{
-    if (!status_.active || pending_termination_ || !selected_) return;
-    // 只镜像真实 Commander Armed 边沿，不把选择模式或等待状态当作首次授权。
-    // Commander 内部仍独立持有 session grant，并可随时否决后续请求。
-    if (armed_.armed() && safety_fresh(now)) status_.session_authorized = true;
-    if (status_.session_authorized && status_.awaiting_arm && !armed_.armed() &&
-        (last_resume_request_ == 0U || now - last_resume_request_ >= 200000ULL)) {
-        last_resume_request_ = now;
-        request(auto_calibration_request_s::REQUEST_STAGE_ARM, now);
-    }
+        param_get(param_handle(dima::params::EKF2_IMU_POS_Z), &iz) != 0) return NAN;
+    return std::hypot(std::hypot(gx, gy), gz) + std::hypot(std::hypot(ix, iy), iz);
 }
 
 } // namespace dima::rover::modes

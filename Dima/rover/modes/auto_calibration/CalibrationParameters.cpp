@@ -8,17 +8,15 @@
 
 namespace dima::rover::modes {
 
-float CalibrationParameters::original_float(dima::params parameter) const noexcept
-{
-    const auto handle = param_handle(parameter);
-    for (std::size_t i = 0U; i < count_; ++i)
-        if (entries_[i].handle == handle && entries_[i].type == PARAM_TYPE_FLOAT) return entries_[i].old.f;
-    return std::numeric_limits<float>::quiet_NaN();
-}
-
 bool CalibrationParameters::active() const noexcept
 {
-    return held_ || phase_ == Phase::Applying || phase_ == Phase::Provisional || phase_ == Phase::Rollback || phase_ == Phase::Saving || phase_ == Phase::Fault;
+    return held_ || phase_ == Phase::Applying || phase_ == Phase::Provisional || phase_ == Phase::Rollback || phase_ == Phase::Fault;
+}
+
+void CalibrationParameters::fault() noexcept
+{
+    // 故障终态只锁存所有权，不释放未确认的存储/运动保护。
+    phase_ = Phase::Fault;
 }
 
 bool CalibrationParameters::prepare() noexcept
@@ -30,6 +28,35 @@ bool CalibrationParameters::prepare() noexcept
     cancel_pending_ = false;
     provisional_ = false;
     generation_valid_ = false;
+    return true;
+}
+
+bool CalibrationParameters::begin_session() noexcept
+{
+    // 从 Level 之前到最终保存持续持有同一把存储暂停锁；组间只释放运动维护锁。
+    if (session_active_ || active() || !param_storage_pause(this)) return false;
+    session_count_ = 0U;
+    session_active_ = true;
+    session_committed_ = false;
+    return true;
+}
+
+bool CalibrationParameters::capture(dima::params parameter) noexcept
+{
+    if (!session_active_) return false;
+    const auto handle = param_handle(parameter);
+    for (std::size_t i = 0U; i < session_count_; ++i)
+        if (session_entries_[i].handle == handle) return true;
+    if (session_count_ >= sizeof(session_entries_) / sizeof(session_entries_[0])) return false;
+    Snapshot entry{};
+    entry.handle = handle;
+    entry.type = param_type(handle);
+    if (param_get(handle, &entry.old) != 0) return false;
+    session_entries_[session_count_++] = entry;
+    // Level 等外部 worker 会使关联观测身份失效；依赖快照仍取正式生成合同。
+    if (dima::generated::parameters::invalidates_observations(parameter))
+        for (const auto observation : dima::generated::parameters::kFirmwareObservationParameters)
+            if (!capture(observation)) return false;
     return true;
 }
 
@@ -45,6 +72,15 @@ bool CalibrationParameters::add(dima::params parameter, param_value_u value,
     candidate.next = value;
     if (param_get(handle, &candidate.old) != 0) return false;
     entries_[count_++] = candidate;
+    if (session_active_) {
+        bool already = false;
+        for (std::size_t i = 0U; i < session_count_; ++i)
+            already = already || session_entries_[i].handle == handle;
+        if (!already) {
+            if (session_count_ >= sizeof(session_entries_) / sizeof(session_entries_[0])) return false;
+            session_entries_[session_count_++] = candidate;
+        }
+    }
     if (dima::generated::parameters::invalidates_observations(parameter)) {
         // 源校正改变会原子失效观测 ID；连同 K/GEN 捕获最初快照，避免磁
         // bootstrap/refine/回滚丢失原代。列表与容量来自正式生成合同。
@@ -133,50 +169,72 @@ bool CalibrationParameters::apply_candidate(std::uint64_t now, bool provisional)
     return !rollback_;
 }
 
+bool CalibrationParameters::session_save(std::uint32_t &expected_set_count, bool commit) noexcept
+{
+    if (!session_active_ || active() || param_set_count() != expected_set_count) {
+        phase_ = Phase::Fault;
+        return false;
+    }
+    // 全会话唯一一次保存。失败只恢复 RAM 并锁住存储/运动，不重复保存或冒充成功。
+    const int result = param_storage_save(this);
+    if (result == -EAGAIN) return false; // 未开始写入；由 FINALIZE 继续等待资源交接。
+    if (result != 0) {
+        (void)session_rollback(expected_set_count);
+        phase_ = Phase::Fault;
+        return false;
+    }
+    if (!param_storage_resume(this)) { phase_ = Phase::Fault; return false; }
+    session_committed_ = commit;
+    session_active_ = false;
+    return true;
+}
+
+bool CalibrationParameters::session_rollback(std::uint32_t &expected_set_count) noexcept
+{
+    if (!session_active_ || session_committed_ || active()) return false;
+    px4::AtomicTransaction transaction;
+    if (param_set_count() != expected_set_count) { phase_ = Phase::Fault; return false; }
+    if (session_count_ == 0U) return true; // 恢复完成后仅等待保存，不重复写回同一快照。
+    const auto before = expected_set_count;
+    // 只恢复 RAM：先恢复源校正，再恢复观测身份；最终保存仍只有 session_save 一处。
+    for (unsigned pass = 0U; pass < 2U; ++pass) {
+        for (std::size_t i = 0U; i < session_count_; ++i) {
+            const auto &entry = session_entries_[i];
+            if (dima::generated::parameters::firmware_observation(static_cast<dima::params>(entry.handle)) != (pass == 1U)) continue;
+            if (param_set_no_notification(entry.handle, &entry.old) != 0) { phase_ = Phase::Fault; return false; }
+        }
+    }
+    // 全部原值恢复成功才消耗日志；部分失败仍保留原日志并锁存Fault。
+    session_count_ = 0U;
+    expected_set_count = set_count_ = param_set_count();
+    if (expected_set_count != before) param_notify_changes();
+    return true;
+}
+
+bool CalibrationParameters::session_active() const noexcept
+{ return session_active_; }
+
+bool CalibrationParameters::session_committed() const noexcept
+{ return session_committed_; }
+
 bool CalibrationParameters::apply(std::uint64_t now, std::uint32_t expected_set_count, bool provisional) noexcept
 {
-    if (phase_ != Phase::Idle || count_ == 0U || !armed_.begin_maintenance()) return false;
+    if (!session_active_ || phase_ != Phase::Idle || count_ == 0U || !armed_.begin_maintenance(true)) return false;
     held_ = true;
-    if (!param_storage_pause(this)) { release(); return false; }
-    storage_paused_ = true;
     px4::AtomicTransaction transaction;
     // 开始采样后用户可能改过这组参数；只有原值仍一致才覆盖，避免吞掉并发编辑。
     if (param_set_count() != expected_set_count || !matches(true)) { release(); return false; }
     return apply_candidate(now, provisional);
 }
 
-bool CalibrationParameters::refine(std::uint64_t now, std::uint32_t expected_set_count,
-                                    const float (&offsets)[3]) noexcept
-{
-    // 磁事务包含 ID/offset 及生成依赖的观测快照；按参数身份查找 offset，
-    // 不依赖扩展前的四槽布局，最初 old snapshot 始终不变。
-    if (phase_ != Phase::Provisional) return false;
-    for (unsigned i = 0U; i < 3U; ++i)
-        if (!std::isfinite(offsets[i])) return false;
-    if (!armed_.begin_maintenance()) return false;
-    held_ = true;
-    px4::AtomicTransaction atomic;
-    if (param_set_count() != expected_set_count || !matches(false)) { phase_ = Phase::Fault; return false; }
-    unsigned found = 0U;
-    for (std::size_t i = 0U; i < count_; ++i) {
-        auto &entry = entries_[i];
-        if (entry.handle == param_handle(dima::params::CAL_MAG0_XOFF)) { entry.next.f = offsets[0]; ++found; }
-        if (entry.handle == param_handle(dima::params::CAL_MAG0_YOFF)) { entry.next.f = offsets[1]; ++found; }
-        if (entry.handle == param_handle(dima::params::CAL_MAG0_ZOFF)) { entry.next.f = offsets[2]; ++found; }
-    }
-    if (found != 3U) { phase_ = Phase::Fault; return false; }
-    provisional_ = false;
-    return apply_candidate(now, provisional_);
-}
-
 bool CalibrationParameters::finalize_provisional(std::uint64_t now, std::uint32_t expected_set_count) noexcept
 {
-    // 闭环验证只授权当前候选代。最终保存仍须停车/Disarm、参数值/代次匹配，
-    // 再经 poll 重新确认消费者；不能因为统计通过就在 Armed 中恢复 autosave。
-    if (phase_ != Phase::Provisional || !generation_valid_ || !armed_.begin_maintenance()) return false;
+    // 闭环验证只授权当前候选代。最终保存须确认物理停波、参数值/代次匹配，
+    // 再经 poll 确认消费者；保持 Armed 不代表可以带着有效电机输出写 Flash。
+    if (phase_ != Phase::Provisional || !generation_valid_ || !armed_.begin_maintenance(true)) return false;
     held_ = true;
     px4::AtomicTransaction atomic;
-    if (!storage_paused_ || param_set_count() != expected_set_count || !matches(false)) {
+    if (!session_active_ || param_set_count() != expected_set_count || !matches(false)) {
         phase_ = Phase::Fault;
         return false;
     }
@@ -200,12 +258,12 @@ bool CalibrationParameters::revise_float(dima::params parameter, float value) no
     return false; // 不能在运动中扩展事务成员或覆盖组外参数。
 }
 
-bool CalibrationParameters::apply_revisions(std::uint64_t now, std::uint32_t expected_set_count) noexcept
+bool CalibrationParameters::apply_revisions(std::uint64_t now, std::uint32_t expected_set_count, bool provisional) noexcept
 {
-    if (phase_ != Phase::Provisional || rollback_ || !armed_.begin_maintenance()) return false;
+    if (phase_ != Phase::Provisional || rollback_ || !armed_.begin_maintenance(true)) return false;
     held_ = true;
     px4::AtomicTransaction atomic;
-    if (!storage_paused_ || param_set_count() != expected_set_count || !matches(false)) {
+    if (!session_active_ || param_set_count() != expected_set_count || !matches(false)) {
         phase_ = Phase::Fault; return false;
     }
     for (std::size_t i = 0U; i < count_; ++i) {
@@ -214,15 +272,12 @@ bool CalibrationParameters::apply_revisions(std::uint64_t now, std::uint32_t exp
     }
     // 所有关联字段共享一次写入/代次，原始 old 始终不变；不按数组序号手工
     // 拼一份第二参数列表，调用方只用生成标识指定本次候选的变化。
-    return apply_candidate(now, true);
+    // 磁refine确认后直接Done，关联增益仍Provisional；写入/确认/回滚只有这一条链。
+    return apply_candidate(now, provisional);
 }
 
 void CalibrationParameters::release() noexcept
 {
-    if (storage_paused_) {
-        if (!param_storage_resume(this)) { phase_ = Phase::Fault; return; }
-        storage_paused_ = false;
-    }
     if (held_) { armed_.end_maintenance(); held_ = false; }
 }
 
@@ -231,12 +286,8 @@ void CalibrationParameters::cancel(std::uint64_t now) noexcept
     if (rollback_ || phase_ == Phase::Fault || phase_ == Phase::Idle || phase_ == Phase::Failed) return;
     cancel_pending_ = true;
     if (!held_) {
-        if (!armed_.begin_maintenance()) return;
+        if (!armed_.begin_maintenance(true)) return;
         held_ = true;
-    }
-    if (!storage_paused_) {
-        if (!param_storage_pause(this)) { phase_ = Phase::Fault; return; }
-        storage_paused_ = true;
     }
     px4::AtomicTransaction transaction;
     // 不覆盖事务外改写的值；发生所有权冲突时保持禁 Arm，由操作者处理明确故障。
@@ -252,7 +303,7 @@ void CalibrationParameters::poll(bool frontend_confirmed, bool validated,
 {
     if (phase_ == Phase::Fault || !active()) return;
     if (cancel_pending_ && !rollback_ && !held_) cancel(now);
-    if (!held_ && phase_ != Phase::Saving) return;
+    if (!held_) return;
     if (update_.update() && update_.get().timestamp >= applied_at_) {
         // 本轮 frontend_confirmed 来自调用前的代次；收到新代次后至少等下一轮
         // 重新核对，避免用旧确认批准新参数事件。
@@ -273,42 +324,16 @@ void CalibrationParameters::poll(bool frontend_confirmed, bool validated,
                 phase_ = Phase::Provisional;
                 return;
             }
-            if (!param_storage_resume(this)) { phase_ = Phase::Fault; return; }
-            storage_paused_ = false;
-            // ParameterService 保存本身需要非重入 maintenance。此处把 lease
-            // 转交给它；Commander 仍由 active 且非 awaiting_arm 禁止 Arm。
-            armed_.end_maintenance();
-            held_ = false;
-            phase_ = Phase::Saving;
-            deadline_ = now + 20000000ULL;
+            // 阶段收尾仅释放维护锁；会话的存储暂停锁持续到 FINALIZE。
+            // 回滚确认是候选失败，不能按 Done 让调用方登记新候选成功。
+            phase_ = rollback_ ? Phase::Failed : Phase::Done;
+            release();
+            return;
         } else if (now > deadline_) {
             if (rollback_) phase_ = Phase::Fault;
             else cancel(now);
         }
         return;
-    }
-    if (phase_ != Phase::Saving) return;
-    if (!rollback_ && param_set_count() != set_count_) {
-        cancel(now);
-        // 异步保存尚持有 maintenance 时先继续推进它，取得释放后的 lease
-        // 再回滚；不能依赖另一个 autosave worker 替本事务解除等待。
-        if (phase_ != Phase::Saving) return;
-    }
-    // 复用现有异步存储推进，不在控制循环执行 Flash/SD 等待；尚未保存的
-    // 阶段不开放下一次 Arm，防止“已应用”被误当成“掉电后仍可恢复”。
-    const int result = param_save_default(false);
-    if (result == 0 && matches(rollback_)) {
-        if (cancel_pending_ && !rollback_) {
-            phase_ = Phase::Applying;
-            cancel(now);
-            return;
-        }
-        phase_ = rollback_ ? Phase::Failed : Phase::Done;
-        release();
-    } else if (now > deadline_ ||
-               (result != -EAGAIN && result != -EBUSY && result != -ESTALE && result != -EPERM)) {
-        if (rollback_) phase_ = Phase::Fault;
-        else cancel(now);
     }
 }
 

@@ -1,159 +1,64 @@
 #define MODULE_NAME "auto_cal"
 #include "AutoCalibrationMode.hpp"
-
-#include "magnetometer/VehicleMagnetometer.hpp"
-#include "control/RoverDifferential.hpp"
-#include "api/Time.hpp"
 #include "logging/logging.hpp"
 
-#include <cmath>
+#include <climits>
 
 namespace dima::rover::modes {
 
+// —— 参数事务操作 ——————————————————————————————————————————————————
+// 本文件只提供事务候选的建立（prepare/add/apply）：事务身份（kind/stages）
+// 由apply_transaction()在写入前登记，前端确认与推进由
+// transaction_frontend_confirmed()/poll_transaction() 按 TransactionKind
+// 路由。这里不再有 commit/apply/restore 状态分支，也不读写 status_.state。
+
 bool AutoCalibrationMode::begin_rtk_transaction(std::uint64_t now) noexcept
 {
-    transaction_stage_ = Status::STATE_COMMIT_RTK;
+    // 事务操作：基线/偏置/GPS 控制候选一次性应用。
     return transaction_.prepare() &&
         transaction_.add_float(dima::params::GPS_YAW_BASELINE, status_.rtk_baseline_m) &&
         transaction_.add_float(dima::params::GPS_YAW_OFFSET, status_.rtk_yaw_offset_deg) &&
-        transaction_.add_int(dima::params::EKF2_GPS_CTRL, config_.gps_control | (1 << 3)) && transaction_.apply(now, expected_set_count_);
+        transaction_.add_int(dima::params::EKF2_GPS_CTRL, config_.gps_control | (1 << 3)) &&
+        apply_transaction(TransactionKind::Rtk, now);
 }
 
 bool AutoCalibrationMode::begin_dynamics_transaction(std::uint64_t now) noexcept
 {
-    transaction_stage_ = Status::STATE_COMMIT_DYNAMICS;
-    // 最大速度出现在 yaw 前馈分母，两参数必须作为同一事务应用/回滚。
+    // 事务操作：最大速度/角速度修正。最大速度出现在 yaw 前馈分母，
+    // 两参数必须作为同一事务应用/回滚。
     return transaction_.prepare() &&
         transaction_.add_float(dima::params::RO_MAX_THR_SPEED, status_.maximum_speed_m_s) &&
-        transaction_.add_float(dima::params::RO_YAW_RATE_CORR, status_.yaw_rate_correction) && transaction_.apply(now, expected_set_count_);
+        transaction_.add_float(dima::params::RO_YAW_RATE_CORR, status_.yaw_rate_correction) &&
+        apply_transaction(TransactionKind::Dynamics, now, false, Status::STAGE_SPEED | Status::STAGE_YAW);
 }
 
 bool AutoCalibrationMode::begin_mag_transaction(std::uint64_t now, bool restore) noexcept
 {
+    // 事务操作：磁提交 / refine / 恢复。restore 撤销 bootstrap 的 provisional
+    // 候选并确认回到旧值；false=撤销未成立（调用方保持互锁重试）。
     px4::AtomicTransaction atomic;
     if (restore) {
-        transaction_stage_ = Status::STATE_RESTORE_MAG;
         transaction_.cancel(now);
-        return transaction_.phase() != CalibrationParameters::Phase::Fault;
+        // cancel() 失败时可能仍停在 Provisional；不能把这种状态当成已进入
+        // 回滚，否则事务机不会再推进恢复而会一直占用互锁。
+        return transaction_.phase() == CalibrationParameters::Phase::Rollback;
     }
     if (transaction_.phase() == CalibrationParameters::Phase::Provisional) {
-        transaction_stage_ = Status::STATE_COMMIT_MAG;
-        return transaction_.refine(now, expected_set_count_, candidate_mag_);
+        // 磁偏置修订复用参数事务的候选槽与统一写入；确认后直接完成本组。
+        return transaction_.revise_float(dima::params::CAL_MAG0_XOFF, candidate_mag_[0]) &&
+            transaction_.revise_float(dima::params::CAL_MAG0_YOFF, candidate_mag_[1]) &&
+            transaction_.revise_float(dima::params::CAL_MAG0_ZOFF, candidate_mag_[2]) &&
+            apply_transaction(TransactionKind::Magnetic, now);
     }
-    transaction_stage_ = Status::STATE_COMMIT_MAG;
-    const float *offset = candidate_mag_;
-    const auto id = static_cast<std::int32_t>(mag_device_id_);
     if (mag_device_id_ == 0U || mag_device_id_ > static_cast<std::uint32_t>(INT32_MAX)) return false;
-    return transaction_.prepare() && transaction_.add_int(dima::params::CAL_MAG0_ID, id) &&
-        transaction_.add_float(dima::params::CAL_MAG0_XOFF, offset[0]) &&
-        transaction_.add_float(dima::params::CAL_MAG0_YOFF, offset[1]) &&
-        transaction_.add_float(dima::params::CAL_MAG0_ZOFF, offset[2]) && transaction_.apply(now, expected_set_count_, !mag_ready_);
-}
-
-bool AutoCalibrationMode::transaction_frontend_confirmed(std::uint64_t now) const noexcept
-{
-    if (!transaction_.generation_valid()) return false;
-    if (transaction_stage_ == Status::STATE_COMMIT_IMU) return imu_bias_confirmed(now);
-    if (transaction_stage_ == Status::STATE_APPLY_RUNTIME) return runtime_frontend_confirmed();
-    if (transaction_stage_ == Status::STATE_APPLY_GAINS) return gain_frontend_confirmed();
-    if (transaction_stage_ == Status::STATE_COMMIT_RTK) {
-        const auto &rtk = rtk_sub_.get();
-        const float offset = dima::lib::rover::calibration::wrap_pi(
-            transaction_.expected_float(dima::params::GPS_YAW_OFFSET) * kRadians);
-        return rtk.parameter_update_instance == transaction_.generation() &&
-            fresh(rtk.timestamp_sample, now, 300000ULL) && rtk.timestamp_sample > transaction_.applied_at() &&
-            rtk.configured_baseline_m == transaction_.expected_float(dima::params::GPS_YAW_BASELINE) &&
-            std::fabs(dima::lib::rover::calibration::wrap_pi(rtk.configured_yaw_offset_rad - offset)) < 1.0e-6F;
-    }
-    if (transaction_stage_ == Status::STATE_COMMIT_DYNAMICS) {
-        return drive_.calibration_parameters_applied(transaction_.generation(),
-            transaction_.expected_float(dima::params::RO_MAX_THR_SPEED),
-            transaction_.expected_float(dima::params::RO_YAW_RATE_CORR));
-    }
-    const float coefficient[3]{transaction_.expected_float(dima::params::CAL_MAG_MOT_KX),
-        transaction_.expected_float(dima::params::CAL_MAG_MOT_KY),
-        transaction_.expected_float(dima::params::CAL_MAG_MOT_KZ)};
-    // 磁基础校正与其补偿失效/回滚同代确认；不能只匹配 offset 就释放保存锁。
-    const bool compensation_applied = mag_frontend_.throttle_compensation_matches(transaction_.generation(),
-        transaction_.expected_int(dima::params::CAL_MAG_MOT_ID),
-        transaction_.expected_int(dima::params::CAL_MAG_MOT_GEN), coefficient) &&
-        fresh(mag_sub_.get().timestamp_sample, now, 300000ULL) &&
-        mag_sub_.get().timestamp_sample > transaction_.applied_at();
-    if (transaction_stage_ == Status::STATE_COMMIT_MAG_MOT) return compensation_applied;
-    const float expected[6]{transaction_.expected_float(dima::params::CAL_MAG0_XOFF),
-        transaction_.expected_float(dima::params::CAL_MAG0_YOFF),
-        transaction_.expected_float(dima::params::CAL_MAG0_ZOFF),
-        config_.mag_scale[0], config_.mag_scale[1], config_.mag_scale[2]};
-    return compensation_applied &&
-        mag_frontend_.mag_calibration_matches(transaction_.generation(), transaction_.expected_int(dima::params::CAL_MAG0_ID), expected) &&
-        fresh(mag_sub_.get().timestamp_sample, now, 300000ULL) &&
-        mag_sub_.get().timestamp_sample > transaction_.applied_at();
-}
-
-void AutoCalibrationMode::poll_transaction(std::uint64_t now) noexcept
-{
-    const bool applied = transaction_frontend_confirmed(now);
-    bool valid = applied;
-    if (!transaction_.rolling_back()) {
-        if (transaction_stage_ == Status::STATE_COMMIT_RTK)
-            valid = valid && rtk_yaw_fused(now) && yaw_aid_sub_.get().time_last_fuse > transaction_.applied_at();
-        else if (transaction_stage_ == Status::STATE_COMMIT_MAG) valid = valid && mag_residual(now) < 0.08F;
-    }
-    if (valid) { if (stable_since_ == 0U) stable_since_ = now; }
-    else stable_since_ = 0U;
-    transaction_.poll(applied, stable_since_ != 0U && now - stable_since_ >= 2000000ULL, now);
-    // Done 与 Failed（已确认恢复旧值并保存）都结束一代事务。先同步自有
-    // 写入计数，再选择下一状态；否则磁 bootstrap 回滚会被误判成外部改参。
-    if (transaction_.phase() == CalibrationParameters::Phase::Done ||
-        transaction_.phase() == CalibrationParameters::Phase::Failed)
-        expected_set_count_ = transaction_.set_count_snapshot();
-    if (status_.state == Status::STATE_COMMIT_MAG_MOT &&
-        transaction_.phase() == CalibrationParameters::Phase::Failed) {
-        // 补偿组已确认回滚，基础磁校准仍有效；记录未完成并继续其他整定。
-        status_.unavailable_stages |= Status::STAGE_MAG_MOT;
-        PX4_WARN("[autocal] mag throttle commit rolled back; compensation incomplete");
-        start_tuning(now);
-        return;
-    }
-    if (status_.state == Status::STATE_APPLY_MAG_BOOTSTRAP && transaction_.phase() == CalibrationParameters::Phase::Provisional) {
-        expected_set_count_ = transaction_.set_count_snapshot();
-        bootstrap_applied_ = true;
-        for (unsigned axis = 0U; axis < 3U; ++axis) bootstrap_offset_[axis] = candidate_mag_[axis];
-        transition(Status::STATE_WAIT_RTK_RELOCK, now);
-        return;
-    }
-    if (transaction_.phase() == CalibrationParameters::Phase::Failed && bootstrap_applied_) {
-        bootstrap_applied_ = false;
-        if (status_.state == Status::STATE_RESTORE_MAG) { start_tuning(now); return; }
-    }
-    if (transaction_.phase() == CalibrationParameters::Phase::Failed || transaction_.phase() == CalibrationParameters::Phase::Fault) {
-        terminate(Status::FAILURE_FRONTEND_CONFIRMATION, false, now);
-        return;
-    }
-    if (transaction_.phase() != CalibrationParameters::Phase::Done) return;
-    if (status_.state == Status::STATE_COMMIT_RTK) {
-        status_.completed_stages |= Status::STAGE_RTK;
-        status_.progress = 55U;
-        transition(Status::STATE_WAIT_RTK_RELOCK, now);
-    } else if (status_.state == Status::STATE_COMMIT_DYNAMICS) {
-        if (status_.failure_reason == Status::FAILURE_MECHANICAL_ASYMMETRY) status_.failure_reason = Status::FAILURE_NONE;
-        status_.completed_stages |= Status::STAGE_SPEED | Status::STAGE_YAW;
-        status_.progress = 80U;
-        finish_movement(now);
-    } else if (status_.state == Status::STATE_RESTORE_MAG) {
-        bootstrap_applied_ = false;
-        start_tuning(now);
-    } else if (status_.state == Status::STATE_COMMIT_MAG_MOT) {
-        status_.completed_stages |= Status::STAGE_MAG_MOT;
-        status_.unavailable_stages &= ~Status::STAGE_MAG_MOT;
-        PX4_INFO("[autocal] mag throttle compensation saved and applied");
-        start_tuning(now);
-    } else {
-        bootstrap_applied_ = false;
-        status_.completed_stages |= Status::STAGE_MAG;
-        // 基础磁校准保存完成后才启动独立补偿事务；不可观测明确保留未完成位。
-        if (!commit_mag_throttle(now)) start_tuning(now);
-    }
+    // WMM/EKF 参考法只观测硬铁 offset；磁设备 ID、scale 和 rotation 继续
+    // 使用已有硬件配置，自动流程不借一次 yaw 圆锥激励改写不可观测量。
+    // bootstrap 应用（!mag_ready_）保持 provisional，最终保存统一进 FINALIZE。
+    return transaction_.prepare() &&
+        transaction_.add_float(dima::params::CAL_MAG0_XOFF, candidate_mag_[0]) &&
+        transaction_.add_float(dima::params::CAL_MAG0_YOFF, candidate_mag_[1]) &&
+        transaction_.add_float(dima::params::CAL_MAG0_ZOFF, candidate_mag_[2]) &&
+        apply_transaction(TransactionKind::Magnetic, now, !mag_ready_);
 }
 
 } // namespace dima::rover::modes
