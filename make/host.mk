@@ -18,10 +18,15 @@ HOST_TOOLS_CACHE_ROOT := $(shell $(PYTHON) -c "import pathlib; print((pathlib.Pa
 endif
 # project.mk 的生成规则在解析时就展开前置条件，必须提前定义 stamp，
 # 否则首次 Linux 构建会在安装 Cerberus 等正式依赖之前启动生成器。
+# 外层调度 Make 已求值并导出时直接复用，避免每个嵌套 Make 重复启动
+# Python 做同一份内容哈希。
+ifeq ($(origin HOST_TOOLS_ID),undefined)
 HOST_TOOLS_ID := $(shell $(PYTHON) tools/build_progress.py host-key)
+endif
 ifeq ($(strip $(HOST_TOOLS_ID)),)
 $(error unable to identify host tool requirements and Python ABI)
 endif
+export HOST_TOOLS_ID
 # 与旧版可整体替换的 host-python 并列，避免另一个旧会话重装时移走新环境。
 HOST_PYTHON_DIR = $(HOST_TOOLS_CACHE_ROOT)/host-python-envs/$(HOST_TOOLS_ID)
 HOST_TOOLS_STAMP = $(HOST_PYTHON_DIR)/.installed

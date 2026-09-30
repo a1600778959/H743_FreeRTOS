@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import struct
 
 from .reader import (
@@ -109,10 +110,16 @@ def verify_memory_layout(elf: Elf32) -> None:
                                dtcm_bss.address, dtcm_bss.size)):
         raise ElfVerificationError("DTCM CPU storage must follow the task pool")
     # 组合根的三份原始存储必须实际落入此段，防止只建立空段或遗漏一个对象。
+    # LTO 会把函数局部静态符号私有化为 <name>.lto_priv.<N>，剥去该后缀后再按
+    # 源码名匹配；"唯一对象、正确段、地址在段内"的合同本身不变。
+    def storage_symbol_name(name: str) -> str:
+        return re.sub(r"\.lto_priv\.\d+$", "", name)
+
     for owner in ("ekf2_instance", "rover_differential_instance",
                   "vehicle_imu_instance"):
         storage = [symbol for symbol in elf.symbols
-                   if owner in symbol.name and symbol.name.endswith("storage")
+                   if owner in symbol.name
+                   and storage_symbol_name(symbol.name).endswith("storage")
                    and symbol.symbol_type == STT_OBJECT and symbol.defined]
         if (len(storage) != 1 or storage[0].section_index != dtcm_bss.index or
                 not range_contains(dtcm_bss.address, dtcm_bss.size,

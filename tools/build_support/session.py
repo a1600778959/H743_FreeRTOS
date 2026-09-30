@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -59,35 +60,40 @@ def host_key(_: argparse.Namespace) -> int:
 
 
 def start(arguments: argparse.Namespace) -> int:
-    from bootstrap_ccache import ensure_ccache
+    from bootstrap_ccache import ccache_version, ensure_ccache
 
     directory = pathlib.Path(tempfile.mkdtemp(prefix="dima-build-session."))
     (directory / "events").mkdir()
     data = {
         "started": time.monotonic(), "build_dir": str(pathlib.Path(arguments.build_dir).resolve()),
-        "jobs": arguments.jobs, "available_mb": available_memory_mb(), "ccache": "",
+        "jobs": arguments.jobs, "available_mb": available_memory_mb(), "ccache": "", "ccache_version": "",
     }
     if arguments.ccache != "off":
         try:
             executable = ensure_ccache(pathlib.Path(arguments.cache_root))
-            if executable:
-                cache = pathlib.Path(arguments.cache_root) / "compiler-cache"
-                cache.mkdir(parents=True, exist_ok=True)
-                # 安装成功不等于缓存目录可写；前置检查失败即回退 GCC。
-                with tempfile.TemporaryFile(dir=cache):
-                    pass
-                version = subprocess.run([str(executable), "--version"], capture_output=True,
-                                         check=False, timeout=5)
-                if version.returncode != 0:
-                    raise RuntimeError("ccache cannot execute on this host")
-            data["ccache"] = executable.as_posix() if executable else ""
+            if executable is None:
+                raise RuntimeError("no compatible ccache found for this host")
+            cache = pathlib.Path(arguments.cache_root) / "compiler-cache"
+            cache.mkdir(parents=True, exist_ok=True)
+            # 二进制可运行且缓存目录可写才算启用；on 失败立即终止，只有
+            # 显式 auto 才允许回退，避免用户以为已缓存却一直直接编译。
+            with tempfile.TemporaryFile(dir=cache):
+                pass
+            data["ccache_version"] = ccache_version(executable)
+            data["ccache"] = executable.as_posix()
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            if arguments.ccache == "on":
+                print(f"[CACHE] required but unavailable: {error}; install ccache or explicitly set DIMA_CCACHE=auto/off",
+                      file=sys.stderr)
+                shutil.rmtree(directory)
+                return 1
             print(f"[CACHE] unavailable; using GCC directly: {error}", file=sys.stderr)
     (directory / "session.json").write_text(json.dumps(data), encoding="utf-8")
     (directory / "ccache-path").write_text(str(data["ccache"]) + "\n", encoding="utf-8")
+    cache_description = f"ccache {data['ccache_version']}" if data["ccache"] else "off"
     print(
         f"[BUILD] jobs={arguments.jobs or 'explicit -j/jobserver'} "
-        f"available={data['available_mb']} MiB cache={'ccache 4.11.3' if data['ccache'] else 'off'}",
+        f"available={data['available_mb']} MiB cache={cache_description}",
         file=sys.stderr, flush=True,
     )
     print(directory.as_posix())
@@ -125,13 +131,17 @@ def finish(arguments: argparse.Namespace) -> int:
         ), flush=True)
     for event in sorted((item for item in events if item["label"] in {"CC", "CXX"}), key=lambda item: item["seconds"], reverse=True)[:8]:
         print(f"[SLOW] {event['seconds']:.2f}s {event['display']}", flush=True)
-    if data["ccache"]:
+    if data["ccache"] and (directory / "ccache.log").is_file():
         # ccache 的会话 stats log 不清零全局计数，避免干扰其他工作树的统计。
         environment = dict(os.environ, CCACHE_STATSLOG=(directory / "ccache.log").as_posix())
         try:
             subprocess.run([data["ccache"], "--show-log-stats"], env=environment, check=False, timeout=5)
         except (OSError, subprocess.TimeoutExpired) as error:
             print(f"[CACHE] statistics unavailable: {error}", file=sys.stderr)
+    elif data["ccache"]:
+        # Make 已跳过全部编译时不会生成统计日志；这属于正常增量构建，
+        # 不应让 ccache 对不存在的文件报错，也不能宣称本轮发生缓存命中。
+        print("[CACHE] no compile calls; Make reused existing objects", flush=True)
     report = directory / "summary.json"
     report.write_text(json.dumps(data, indent=2), encoding="utf-8")
     print(f"[TIMING] report={report.as_posix()}", flush=True)

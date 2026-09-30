@@ -35,6 +35,9 @@ ARCHITECTURE_VERIFY_STAMP = $(BUILD_DIR)/.architecture-verified
 # 同时请求 verify 和 upload 时仍完整检查，不再由 upload 隐式放宽验证范围。
 DIMA_ARCHITECTURE_FORCE_GOALS := $(filter check-architecture app-check verify,$(MAKECMDGOALS))
 DIMA_ARCHITECTURE_CACHE_GOALS := architecture-ready
+# 编译门禁（app-check/verify 的强制前置）只跑关键检查（fast）；显式
+# check-architecture 才是全量扩展审计入口（full）。
+ARCHITECTURE_CHECK_PROFILE := $(if $(filter check-architecture,$(MAKECMDGOALS)),full,fast)
 # Avoid hashing the architecture surface in generated-output preparation,
 # summaries, preflight, and full goals that will force the checker anyway.
 ARCHITECTURE_IDENTITY_STATUS := $(if $(DIMA_ARCHITECTURE_FORCE_GOALS),stale,\
@@ -51,7 +54,7 @@ MCUMGR ?= mcumgr
 MCUMGR_PORT ?=
 MCUMGR_BAUD ?= 921600
 MCUMGR_MTU ?= 512
-MCUMGR_MAX_WINDOW ?= 1
+MCUMGR_MAX_WINDOW ?= 3
 UPLOAD_WAIT_SECONDS ?= 60
 UPLOAD_FORCE ?= 0
 UPLOAD_IMAGE ?= $(SIGNED_BIN)
@@ -92,10 +95,11 @@ $(ARCHITECTURE_VERIFY_STAMP): $(ARCHITECTURE_FORCE_PREREQUISITE) \
 		$(ARCHITECTURE_CHECK_TOOL) $(ARCHITECTURE_CACHE_TOOL) | \
 		parameter-metadata-verify logger-generated-verify $(BUILD_DIR)
 	$(DIMA_PROGRESS_RUN) --label ARCH --target "$@" \
-		--display "check-architecture" -- \
+		--display "check-architecture($(ARCHITECTURE_CHECK_PROFILE))" -- \
 		env PYTHONDONTWRITEBYTECODE=1 PYTHONUTF8=1 \
 			PYTHONPATH="$(HOST_PYTHON_DIR)" \
-			$(PYTHON) $(ARCHITECTURE_CHECK_TOOL) --stamp "$@"
+			$(PYTHON) $(ARCHITECTURE_CHECK_TOOL) --stamp "$@" \
+			--profile $(ARCHITECTURE_CHECK_PROFILE)
 
 architecture-ready: $(ARCHITECTURE_VERIFY_STAMP)
 	@:
@@ -258,6 +262,14 @@ upload: $(filter verify app-check check-architecture architecture-ready %-verify
 		--max-window "$(MCUMGR_MAX_WINDOW)" \
 		--wait-seconds "$(UPLOAD_WAIT_SECONDS)" \
 		$(UPLOAD_FORCE_FLAG)
+
+# 汇总并入主构建 Make 时（调度层对这些目标附加 __dima_summary 目标），
+# 以发布产物作前置条件保证汇总在镜像落盘之后执行；mcuboot-only 等局部
+# 目标仍由调度层在构建后单独请求汇总。
+ifneq ($(filter firmware dima_rover verify,$(DIMA_SUMMARY_GOALS)),)
+__dima_summary: $(BUILD_DIR)/$(TARGET).elf $(MCUBOOT_BUILD_DIR)/mcuboot.hex \
+		$(SIGNED_BIN) $(FACTORY_HEX)
+endif
 
 __dima_summary:
 	$(PYTHON) $(BUILD_PROGRESS_TOOL) summary \

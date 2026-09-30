@@ -10,7 +10,8 @@ from typing import TextIO
 
 DEFAULT_USB_CDC_BAUD = 921600
 DEFAULT_SERIAL_MTU = 512
-DEFAULT_MAX_WINDOW = 1
+# 2048 字节接收环允许的窗口上限；与 make/release.mk 的 MCUMGR_MAX_WINDOW 保持一致。
+DEFAULT_MAX_WINDOW = 3
 
 _STAGE_STARTED = time.monotonic()
 _STAGE_PREVIOUS = _STAGE_STARTED

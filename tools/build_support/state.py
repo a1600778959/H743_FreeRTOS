@@ -86,6 +86,7 @@ def prepare(arguments: argparse.Namespace) -> int:
             "descriptions": descriptions,
         }
         write_state(state_path, state)
+        print(f"[BUILD] {len(steps)} actions planned", flush=True)
     except (OSError, ProgressError) as error:
         report_progress_error(str(error), no_color=arguments.no_color)
         return 2

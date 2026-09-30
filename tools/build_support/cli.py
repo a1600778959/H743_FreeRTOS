@@ -21,7 +21,7 @@ def parser() -> argparse.ArgumentParser:
     start_parser = subparsers.add_parser("session-start")
     start_parser.add_argument("--build-dir", required=True)
     start_parser.add_argument("--cache-root", required=True)
-    start_parser.add_argument("--ccache", choices=("auto", "off"), default="auto")
+    start_parser.add_argument("--ccache", choices=("on", "auto", "off"), default="on")
     start_parser.add_argument("--jobs", default="")
     start_parser.set_defaults(handler=start)
     end_parser = subparsers.add_parser("session-finish")

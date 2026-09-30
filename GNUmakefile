@@ -14,7 +14,10 @@ endif
 export BUILD_DIR
 DIMA_ARM_GCC_BOOTSTRAP := tools/bootstrap_arm_gcc.py
 DIMA_DEFAULT_JOBS ?= $(shell $(PYTHON) tools/build_progress.py jobs)
-DIMA_CCACHE ?= auto
+# 导出给嵌套 Make 复用；环境来源使内层 ?= 跳过重复的内存查询 Python。
+export DIMA_DEFAULT_JOBS
+# 默认要求缓存真正可用；auto 允许明确的降级，off 才完全关闭。
+DIMA_CCACHE ?= on
 DIMA_BUILD_TRACE ?= 0
 export DIMA_BUILD_TRACE
 ifeq ($(strip $(DIMA_DEFAULT_JOBS)),)
@@ -40,10 +43,15 @@ include make/project.mk
 
 else
 
-# 日常编译和上传直接执行依赖图，不为进度计数额外预演整次构建；
-# 显式检查目标仍可使用下方的计划进度，检查只由用户请求的目标触发。
+# 所有目标默认走计划进度：干跑一次依赖图得到动作总数，随后真实构建按
+# [当前/总数 文件名] 逐文件显示；显式检查目标与日常编译/上传行为一致。
+# DIMA_PROGRESS=off 恢复无预演的静默直通执行。
+DIMA_PROGRESS ?= on
 DIMA_REQUESTED_GOALS := $(if $(strip $(MAKECMDGOALS)),$(MAKECMDGOALS),firmware)
 DIMA_SUMMARY_GOALS := $(if $(filter upload,$(DIMA_REQUESTED_GOALS)),,$(filter firmware mcuboot verify dima_rover,$(DIMA_REQUESTED_GOALS)))
+# 这些目标必然产出完整镜像，汇总可作为额外目标并入同一次内层 Make，
+# 省掉一次完整的重新求值；mcuboot-only 等局部目标仍单独请求汇总。
+DIMA_MERGED_SUMMARY := $(if $(filter firmware dima_rover verify,$(DIMA_SUMMARY_GOALS)),1,)
 DIMA_SHORT_MAKEFLAGS := $(filter-out --% %=%,$(firstword $(MAKEFLAGS)))
 DIMA_DRY_RUN := $(findstring n,$(DIMA_SHORT_MAKEFLAGS))
 DIMA_NO_COLOR_FLAG := $(if $(strip $(NO_COLOR)),--no-color,)
@@ -55,8 +63,8 @@ DIMA_PARALLEL_FLAG = $(if $(filter -j% --jobs%,$(MAKEFLAGS)),,-j$(DIMA_DEFAULT_J
 DIMA_STABILIZE_GENERATED_GOALS := $(filter app-check firmware verify \
 	dima_rover upload upload-ready upload-verify intellisense check-architecture \
 	parameter-metadata-verify,$(DIMA_REQUESTED_GOALS))
-DIMA_DIRECT_BUILD_GOALS := firmware mcuboot dima_rover upload upload-ready upload-preflight
-DIMA_DIRECT_BUILD_DISPATCH := $(if $(filter-out $(DIMA_DIRECT_BUILD_GOALS),$(DIMA_REQUESTED_GOALS)),,1)
+# DIMA_PROGRESS=off 时的静默直通分支：不做干跑预演，编译无逐文件显示。
+DIMA_DIRECT_BUILD_DISPATCH := $(if $(filter off,$(DIMA_PROGRESS)),1,)
 
 # 同一会话计时覆盖主机准备到上传结束；不通过 Python 包装递归 Make，保留
 # GNU Make jobserver。逐对象计时仅在 TRACE=1 时启用，日常 OTA 不增加编译包装进程。
@@ -114,7 +122,7 @@ __dima_dispatch:
 			toolchain_path=$$($(PYTHON) $(DIMA_ARM_GCC_BOOTSTRAP) \
 				--cache-root "$(HOST_TOOLS_CACHE_ROOT)" --quiet-cache); \
 		fi; \
-		printf '[BUILD] Direct execution (validation is explicit)\n\n'; \
+		printf '[BUILD] Direct execution (DIMA_PROGRESS=off, no per-file display)\n\n'; \
 		if test -n "$$toolchain_path"; then \
 			printf '[TOOLCHAIN] Build\n  Arm GCC    : %s\n\n' "$$toolchain_path"; \
 		fi; \
@@ -155,6 +163,9 @@ __dima_dispatch:
 		if test -n "$(DIMA_STABILIZE_GENERATED_GOALS)"; then \
 			generated_prepare_goal=__dima_prepare_generated; \
 		fi; \
+		extra_goals=; \
+		if test -n "$(DIMA_MERGED_SUMMARY)"; then extra_goals=__dima_summary; fi; \
+		printf '[BUILD] Converging generated build inputs...\n'; \
 		$(MAKE) $(DIMA_PARALLEL_FLAG) --no-print-directory -s -f GNUmakefile \
 			DIMA_BUILD_INTERNAL=1 DIMA_PROGRESS_STATE= \
 			DIMA_BUILD_PROFILE="$(DIMA_BUILD_PROFILE)" \
@@ -162,11 +173,12 @@ __dima_dispatch:
 			"$$generated_prepare_goal"; \
 		plan="$$progress_dir/plan.txt"; \
 		state="$$progress_dir/state.json"; \
+		printf '[BUILD] Counting build actions (dry run)...\n'; \
 		$(MAKE) $(DIMA_PARALLEL_FLAG) --no-print-directory -f GNUmakefile -n $(DIMA_OUTPUT_SYNC_FLAG) \
 			DIMA_BUILD_INTERNAL=1 DIMA_PROGRESS_STATE="$$state" \
 			DIMA_BUILD_PROFILE="$(DIMA_BUILD_PROFILE)" \
 			GCC_PATH="$$toolchain_path" \
-			$(DIMA_REQUESTED_GOALS) >"$$plan"; \
+			$(DIMA_REQUESTED_GOALS) $$extra_goals >"$$plan"; \
 		$(PYTHON) tools/build_progress.py prepare \
 			--plan "$$plan" --state "$$state" \
 			--goals "$(DIMA_REQUESTED_GOALS)" $(DIMA_NO_COLOR_FLAG); \
@@ -174,10 +186,11 @@ __dima_dispatch:
 			DIMA_BUILD_INTERNAL=1 DIMA_PROGRESS_STATE="$$state" \
 			DIMA_BUILD_PROFILE="$(DIMA_BUILD_PROFILE)" \
 			GCC_PATH="$$toolchain_path" \
-			$(DIMA_REQUESTED_GOALS); \
+			$(if $(DIMA_MERGED_SUMMARY),DIMA_SUMMARY_GOALS="$(DIMA_REQUESTED_GOALS)") \
+			$(DIMA_REQUESTED_GOALS) $$extra_goals; \
 		$(PYTHON) tools/build_progress.py finish \
 			--state "$$state" $(DIMA_NO_COLOR_FLAG); \
-		if test -n "$(strip $(DIMA_SUMMARY_GOALS))"; then \
+		if test -z "$(DIMA_MERGED_SUMMARY)" && test -n "$(strip $(DIMA_SUMMARY_GOALS))"; then \
 			$(MAKE) --no-print-directory -s -f GNUmakefile \
 				DIMA_BUILD_INTERNAL=1 \
 				DIMA_BUILD_PROFILE="$(DIMA_BUILD_PROFILE)" \

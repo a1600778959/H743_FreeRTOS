@@ -34,8 +34,12 @@ DIMA_REAL_AS := $(AS)
 DIMA_REAL_CP := $(CP)
 DIMA_REAL_SZ := $(SZ)
 
+# 官方入口继承应用同一缓存会话；仅 C 对象经过 ccache，链接和汇编
+# 继续调用真实工具，缓存键包含 MCUboot 自己的编译选项和头文件。
+DIMA_CCACHE_PREFIX = $(if $(and $(strip $(DIMA_CCACHE_EXECUTABLE)),$(filter %.o,$@)),"$(DIMA_CCACHE_EXECUTABLE)" ,)
+override CC = $(DIMA_CCACHE_PREFIX)$(DIMA_REAL_CC)
 ifneq ($(strip $(DIMA_PROGRESS_STATE)),)
-override CC = $(DIMA_PROGRESS_RUN) --kind cc --target "$@" --source "$<" -- $(DIMA_REAL_CC)
+override CC = $(DIMA_PROGRESS_RUN) --kind cc --target "$@" --source "$<" -- $(DIMA_CCACHE_PREFIX)$(DIMA_REAL_CC)
 override AS = $(DIMA_PROGRESS_RUN) --kind as --target "$@" --source "$<" -- $(DIMA_REAL_AS)
 override CP = $(DIMA_PROGRESS_RUN) --kind objcopy --target "$@" --source "$<" -- $(DIMA_REAL_CP)
 override SZ = $(DIMA_PROGRESS_RUN) --kind size --target "$@" --source "$<" -- $(DIMA_REAL_SZ)

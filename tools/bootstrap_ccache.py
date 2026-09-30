@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""为 Windows 原生编译准备固定 ccache；不可用时保持普通 GCC 路径。"""
+"""Windows 使用固定 ccache，Linux/WSL 使用兼容的系统 ccache。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import io
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,17 +23,26 @@ ARCHIVE_SHA256 = "bfd031cad091b7db7e68c3303be542b0f7fee7a3e716d76ec6f7e6c7ef4b35
 EXECUTABLE_SHA256 = "e67407fc24a1ef04bb0368a2d63004879cbd46ae157ca75eec94ae5bddc5fb91"
 
 
+def ccache_version(executable: pathlib.Path) -> str:
+    """核对所需 4.x 能力下限，不能把 Windows 固定版本当成系统工具唯一版本。"""
+    result = subprocess.run(
+        [str(executable), "--version"], capture_output=True, text=True,
+        check=False, timeout=5,
+    )
+    match = re.match(r"ccache version ((\d+)\.(\d+)(?:\.\d+)?)(?:\s|$)", result.stdout)
+    if result.returncode != 0 or not match or (int(match[2]), int(match[3])) < (4, 5):
+        raise RuntimeError(f"{executable}: ccache >= 4.5 is required")
+    return match[1]
+
+
 def ensure_ccache(cache_root: pathlib.Path) -> pathlib.Path | None:
-    """只安装已核对的上游二进制；不改系统 PATH，不放宽缓存正确性选项。"""
+    """只安装已核对的 Windows 二进制；系统工具沿用 PATH，不放宽缓存正确性。"""
     if os.name != "nt":
         executable = shutil.which("ccache")
         if executable:
-            result = subprocess.run(
-                [executable, "--version"], capture_output=True, text=True,
-                check=False, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.splitlines()[:1] == [f"ccache version {VERSION}"]:
-                return pathlib.Path(executable)
+            path = pathlib.Path(executable)
+            ccache_version(path)
+            return path
         return None
     if platform.machine().lower() not in {"amd64", "x86_64"}:
         return None

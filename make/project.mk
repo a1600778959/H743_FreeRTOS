@@ -1136,6 +1136,14 @@ DIMA_PROJECT_CFLAGS = $(MCU) $(DIMA_PRIVATE_DEFS) $(DIMA_PRIVATE_INCLUDES) \
 DIMA_PROJECT_CXXFLAGS = $(DIMA_PROJECT_CFLAGS) \
 	-std=gnu++17 -fno-exceptions -fno-rtti \
 	-fno-threadsafe-statics -fno-use-cxa-atexit
+# 链接时优化：跨编译单元折叠重复内联与常量，缩小固件体积；最终符号、ISR
+# 强弱绑定与初始化数组合同仍由 verify_application_elf.py 在链接产物上把关。
+# DIMA_LTO=off 可整体退回逐翻译单元编译。
+DIMA_LTO ?= on
+ifeq ($(DIMA_LTO),on)
+DIMA_PROJECT_CFLAGS += -flto
+override LDFLAGS += -flto -Os
+endif
 # PX4 EKF2 的协方差与观测公式依赖既定浮点求值顺序；生成的 StateSample::vector
 # 也沿用 PX4 全局 -fno-strict-aliasing 合同。两项只施加给 EKF 闭包一次，项目
 # 原有 -fno-exceptions/-fno-rtti 仍由上方统一继承。

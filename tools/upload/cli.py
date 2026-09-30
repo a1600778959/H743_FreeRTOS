@@ -59,8 +59,9 @@ def main() -> int:
     if arguments.max_window < 1 or arguments.max_window > 3:
         parser.error("--max-window must be between 1 and 3 for the 2048-byte RX ring")
     tools_cache = arguments.tools_cache.expanduser()
-    stage("HOST", "resolving pinned upload tools and MAVLink codec")
+    stage("HOST", "resolving pinned mcumgr runtime")
     runtime = resolve_mcumgr(arguments.mcumgr, arguments.port, tools_cache)
+    stage("HOST_TOOLS", "resolving pinned MAVLink codec")
     codec = resolve_mavlink_codec(
         tools_cache, arguments.identity_contract.resolve()
     )
@@ -122,7 +123,8 @@ def main() -> int:
 
     upload_image = mcumgr_image_path(runtime, image)
 
-    # Bootloader 用 2048 字节环接收串口帧；更大窗口完成持续板测前，生产默认保持停等窗口 1。
+    # Bootloader 用 2048 字节环接收串口帧；窗口上限 3。默认 3 自 2026-09-21 起
+    # 生效（用户决策），持续板测尚未完成，异常时可回退 MCUMGR_MAX_WINDOW=1。
     stage(
         "UPLOAD_SECONDARY",
         f"uploading {image.stat().st_size} bytes with mtu={arguments.mtu} "
