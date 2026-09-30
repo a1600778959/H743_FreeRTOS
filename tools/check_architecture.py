@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Dima 模块化架构门禁的稳定 CLI；集中汇总全部规则后一次性决定 PASS/FAIL。"""
+"""Dima 模块化架构门禁的稳定 CLI；集中汇总全部规则后一次性决定 PASS/FAIL。
+
+两级 profile：fast 只执行编译门禁的关键检查（依赖方向、include 所有权、
+硬件操作边界，即 AGENTS.md 声明的门禁职责）；full 追加全部扩展审计
+（构建隔离、布局/合同、命名空间等）。Make 对以架构为前置的构建目标
+（app-check/verify）请求 fast，只有显式 check-architecture 目标请求 full。
+"""
 
 from __future__ import annotations
 
@@ -12,7 +18,6 @@ from architecture_cache import (
     invalidate_stamp,
     update_stamp,
 )
-from architecture.actuator import scan_active_actuator_contract
 from architecture.common import (
     COMMON_INCLUDE_ROOTS,
     ROOT,
@@ -29,20 +34,6 @@ from architecture.dependency import (
     scan_namespace_convention,
     scan_usb_console_owner,
 )
-from architecture.dronecan import scan_dronecan_contract
-from architecture.layout import (
-    scan_phase5_message_contracts,
-    scan_repository_layout,
-    scan_rover_root_contract,
-)
-from architecture.parameter_mavlink import scan_mavlink_contract
-from architecture.runtime_safety import (
-    scan_clock_contract,
-    scan_fault_ownership,
-    scan_linker_contract,
-)
-from architecture.timer import scan_timer_contract
-from architecture.uorb import scan_uorb_generation_contract
 
 
 INCLUDE_WITH_DELIMITER_RE = re.compile(
@@ -185,25 +176,36 @@ def scan_first_party_include_depth(violations: list[Violation]) -> None:
             ))
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--stamp",
-        type=pathlib.Path,
-        help="atomically record the checked architecture-input identity",
-    )
-    arguments = parser.parse_args()
-    checked_identity = None
-    if arguments.stamp is not None:
-        # 强制检查开始前先删除旧成功 stamp；失败或中断绝不能留下可复用的历史通过证据。
-        checked_identity = architecture_identity(ROOT)
-        invalidate_stamp(arguments.stamp)
-
-    violations: list[Violation] = []
+def run_fast_scans(violations: list[Violation]) -> None:
+    """编译门禁的关键检查：依赖方向、include 所有权、硬件操作边界。"""
     scan_include_directions(violations)
     scan_layer_dependencies(violations)
     scan_hardware_ownership(violations)
     scan_device_policy_boundaries(violations)
+
+
+def run_extended_scans(violations: list[Violation]) -> None:
+    """扩展审计：构建隔离、目录/合同边界、命名空间与生成物一致性。
+
+    导入放在函数体内，让 fast 档完全避开扩展模块及其第三方依赖
+    （yaml/lxml）与 Make 闭包求值，缩短每次编译门禁的固定开销。
+    """
+    from architecture.actuator import scan_active_actuator_contract
+    from architecture.dronecan import scan_dronecan_contract
+    from architecture.layout import (
+        scan_phase5_message_contracts,
+        scan_repository_layout,
+        scan_rover_root_contract,
+    )
+    from architecture.parameter_mavlink import scan_mavlink_contract
+    from architecture.runtime_safety import (
+        scan_clock_contract,
+        scan_fault_ownership,
+        scan_linker_contract,
+    )
+    from architecture.timer import scan_timer_contract
+    from architecture.uorb import scan_uorb_generation_contract
+
     scan_build_isolation(violations)
     scan_repository_layout(violations)
     scan_rover_root_contract(violations)
@@ -219,6 +221,33 @@ def main() -> int:
     scan_namespace_convention(violations)
     scan_usb_console_owner(violations)
     scan_mavlink_contract(violations)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stamp",
+        type=pathlib.Path,
+        help="atomically record the checked architecture-input identity",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("fast", "full"),
+        default="full",
+        help="fast runs only the compile-gate key checks; full adds every "
+             "extended audit (default)",
+    )
+    arguments = parser.parse_args()
+    checked_identity = None
+    if arguments.stamp is not None:
+        # 强制检查开始前先删除旧成功 stamp；失败或中断绝不能留下可复用的历史通过证据。
+        checked_identity = architecture_identity(ROOT)
+        invalidate_stamp(arguments.stamp)
+
+    violations: list[Violation] = []
+    run_fast_scans(violations)
+    if arguments.profile == "full":
+        run_extended_scans(violations)
     if violations:
         for violation in sorted(
                 violations,
@@ -236,7 +265,10 @@ def main() -> int:
                 "(inputs changed while the check was running)"
             )
             return 2
-    print(f"architecture check: PASS ({source_count} first-party source files)")
+    print(
+        f"architecture check: PASS "
+        f"({arguments.profile}, {source_count} first-party source files)"
+    )
     if arguments.stamp is not None:
         update_stamp(arguments.stamp, ROOT, checked_identity)
     return 0

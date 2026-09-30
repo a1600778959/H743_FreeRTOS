@@ -382,6 +382,9 @@ def scan_namespace_convention(violations: list[Violation]) -> None:
         "Dima/platform/freertos/Backend.cpp",
         "Dima/platform/freertos/BackendTimeout.hpp",
         "Dima/platform/freertos/HeapOperators.cpp",
+        # FatFs 卷驱动要求 get_fattime 位于全局 C ABI；文件其余实现仍在
+        # dima::platform::freertos 命名空间内。
+        "Dima/platform/freertos/storage/FatFsAtomicFileStore.cpp",
         "Dima/platform/stm32h7/system/Clock.cpp",
         "Dima/platform/stm32h7/memory/DmaMemory.cpp",
         "Dima/platform/stm32h7/flash/FlashDevice.cpp",
