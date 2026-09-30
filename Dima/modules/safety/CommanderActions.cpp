@@ -23,11 +23,15 @@ bool Commander::execute_action(const action_request_s &request,
 {
     const std::uint8_t reason = reason_from_source(request.source);
 
-    // 校准期间禁止来自 RC 的正向状态动作，但 Disarm/Kill/Termination 等负向安全动作
-    // 永远保留，避免校准会话反而阻断紧急停机。
+    // Manual 的 RC Arm/Toggle-Arm 与 MAVLink Arm 共用“仅左右电机分配”预检，
+    // 不能在动作入口额外用校准标志提前拦住。其他校准期正向动作仍受原限制，
+    // Disarm/Kill/Termination 始终保留；失鲜请求仍不能重放成新的 Arm。
+    const bool manual_arming = vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_MANUAL &&
+        (request.action == action_request_s::ACTION_ARM || request.action == action_request_s::ACTION_TOGGLE_ARMING);
     if ((vehicle_status_.rc_calibration_in_progress ||
-         vehicle_status_.calibration_enabled) &&
-        rc_action_source(request.source) &&
+         (vehicle_status_.calibration_enabled &&
+          !(auto_level_request_timestamp_ != 0U && auto_calibration_control_inhibit_expected(now)))) &&
+        rc_action_source(request.source) && !manual_arming &&
         request.action != action_request_s::ACTION_DISARM &&
         request.action != action_request_s::ACTION_KILL &&
         request.action != action_request_s::ACTION_TERMINATION) {
@@ -76,7 +80,7 @@ bool Commander::execute_action(const action_request_s &request,
             actuator_armed_.kill = true;
             changed = true;
         }
-        if (actuator_armed_.armed || authorized_calibration_session_ != 0U ||
+        if (actuator_armed_.armed ||
             vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1) {
             changed = disarm(reason, now) == TransitionResult::Changed ||
                       changed;

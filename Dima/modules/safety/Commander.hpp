@@ -83,9 +83,6 @@ public:
     void stop() override;
     dima::middleware::lifecycle::ModuleState state() const override;
 
-    /** 供非 Commander WorkQueue 的存储门控读取。 */
-    bool armed() const noexcept;
-
 private:
     static constexpr std::uint32_t kCheckIntervalUs = 20000U;
     static constexpr std::uint64_t kPublishIntervalUs = 500000ULL;
@@ -115,8 +112,8 @@ private:
     void Run() override;
     bool initialize_parameter_handles() noexcept;
     bool refresh_parameters() noexcept;
-    bool refresh_manual_control() noexcept;
-    bool refresh_actuator_output_status() noexcept;
+    void refresh_manual_control() noexcept;
+    void refresh_actuator_output_status() noexcept;
     bool refresh_sensor_calibration_status() noexcept;
     bool refresh_navigation_status() noexcept;
     bool evaluate_safety(std::uint64_t now) noexcept;
@@ -124,16 +121,15 @@ private:
     bool process_auto_calibration(std::uint64_t now) noexcept;
     bool evaluate_auto_calibration(std::uint64_t now) noexcept;
     bool auto_calibration_fresh(std::uint64_t now) const noexcept;
+    bool auto_calibration_control_inhibit_expected(std::uint64_t now) const noexcept;
+    bool auto_calibration_output_stopped(std::uint64_t now) const noexcept;
     bool start_auto_calibration(std::uint64_t now) noexcept;
-    bool resume_auto_calibration(std::uint64_t now) noexcept;
-    void revoke_auto_calibration() noexcept;
     bool update_public_projection(std::uint64_t now) noexcept;
     bool execute_action(const action_request_s &request,
                         std::uint64_t now) noexcept;
-    TransitionResult arm(std::uint8_t reason, std::uint64_t now,
-                         bool calibration_resume = false) noexcept;
+    TransitionResult arm(std::uint8_t reason, std::uint64_t now) noexcept;
     TransitionResult disarm(std::uint8_t reason,
-                            std::uint64_t now, bool preserve_calibration = false) noexcept;
+                            std::uint64_t now) noexcept;
     bool change_navigation_state(std::uint8_t nav_state,
                                  std::uint64_t now) noexcept;
     bool mission_start_ready(std::uint64_t now) noexcept;
@@ -208,26 +204,29 @@ private:
     rover_navigation_status_s navigation_status_{};
     auto_calibration_status_s auto_calibration_status_{};
     std::uint64_t auto_level_request_timestamp_{};
-    std::uint32_t authorized_calibration_session_{};
-    auto_calibration_request_s pending_calibration_arm_{};
     param_t rc_loss_timeout_handle_{PARAM_INVALID};
     param_t arm_stick_deadzone_handle_{PARAM_INVALID};
     param_t rc_loss_action_handle_{PARAM_INVALID};
     param_t data_link_loss_action_handle_{PARAM_INVALID};
     float rc_loss_timeout_s_{0.5F};
     float arm_stick_deadzone_{0.1F};
-    std::int32_t rc_loss_action_{6};
-    std::int32_t data_link_loss_action_{0};
     std::uint64_t last_publish_time_{0U};
     std::uint64_t sensor_calibration_dispatch_time_{0U};
     std::uint32_t active_mission_generation_{0U};
     std::uint16_t active_mission_count_{0U};
     std::uint32_t last_actuator_output_sequence_{0U};
     std::uint8_t recoverable_failsafe_causes_{FailsafeNone};
+    // 强制解锁的持续确认起点：RC/执行器判定在 20~50 ms 粒度上存在单帧瞬态
+    // （如电机堵转 EMI 让 SBUS 坏一帧、控制链单帧无效），一帧即杀会话与
+    // 实车复现不符；真实故障持续存在，300 ms 内仍会触发。
+    std::uint64_t safety_fault_since_us_{0U};
     dima::middleware::lifecycle::ModuleState state_{
         dima::middleware::lifecycle::ModuleState::Stopped};
     bool parameter_handles_ready_{false};
     bool parameters_valid_{false};
+    // Manual 解锁预检的左右电机映射缓存：refresh_parameters 在
+    // parameter_update 事件中扫描 PWM_Sx_FUNC 生成合同维护。
+    bool manual_motor_mapping_valid_{false};
     bool have_manual_control_{false};
     bool actuator_output_status_valid_{false};
     bool navigation_status_valid_{false};

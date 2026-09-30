@@ -5,6 +5,8 @@
 #include "Commander.hpp"
 
 #include "api/ActuatorPwm.hpp"
+#include "parameters/atomic_transaction.h"
+#include "parameters/parameter_contract.hpp"
 
 #include "logging/logging.hpp"
 #include "rover/RoverModeContract.hpp"
@@ -47,8 +49,9 @@ bool Commander::refresh_parameters() noexcept
     // 保留最后一代数值但把 parameters_valid_ 置假，由安全评估强制解除 Armed。
     float loss_timeout = rc_loss_timeout_s_;
     float stick_deadzone = arm_stick_deadzone_;
-    std::int32_t rc_loss_action = rc_loss_action_;
-    std::int32_t data_link_loss_action = data_link_loss_action_;
+    // 这两个策略在本产品中固定；只校验读回值，不缓存永远不变的运行分支。
+    std::int32_t rc_loss_action = kRcLossActionDisarm;
+    std::int32_t data_link_loss_action = kDataLinkLossActionDisabled;
     const bool core_ready = param_is_ready();
     const bool loaded = core_ready && parameter_handles_ready_ &&
                         param_get(rc_loss_timeout_handle_, &loss_timeout) == 0 &&
@@ -64,37 +67,54 @@ bool Commander::refresh_parameters() noexcept
                        data_link_loss_action == kDataLinkLossActionDisabled;
     const bool changed = valid != parameters_valid_ ||
                          (valid && (loss_timeout != rc_loss_timeout_s_ ||
-                                    stick_deadzone != arm_stick_deadzone_ ||
-                                    rc_loss_action != rc_loss_action_ ||
-                                    data_link_loss_action !=
-                                        data_link_loss_action_));
+                                    stick_deadzone != arm_stick_deadzone_));
 
     parameters_valid_ = valid;
     if (valid) {
         rc_loss_timeout_s_ = loss_timeout;
         arm_stick_deadzone_ = stick_deadzone;
-        rc_loss_action_ = rc_loss_action;
-        data_link_loss_action_ = data_link_loss_action;
+    }
+
+    /* Manual 解锁预检的电机映射缓存：只在 parameter_update 事件里扫描六路
+     * PWM_Sx_FUNC（同一参数事务内读完整映射，避免把两次配置的左、右各拼
+     * 出一半）。此前该扫描发生在 preflight_checks_pass 的每周期调用中，
+     * 投影路径每个安全周期都要创建 AtomicTransaction 重复读参数——参数
+     * 只在写入时变化，缓存化后锁开销与重复扫描一并消除。 */
+    if (core_ready) {
+        px4::AtomicTransaction transaction;
+        using Field = dima::generated::parameters::PwmOutputField;
+        using Function = dima::generated::parameters::PwmOutputFunction;
+        bool have_right = false;
+        bool have_left = false;
+        for (const auto &channel : dima::generated::parameters::kPwmOutputParameters) {
+            std::int32_t function{};
+            if (param_get(static_cast<param_t>(
+                    channel[static_cast<std::size_t>(Field::Func)]),
+                    &function) != 0) {
+                have_right = have_left = false;
+                break;
+            }
+            have_right = have_right || function == static_cast<std::int32_t>(Function::MotorRight);
+            have_left = have_left || function == static_cast<std::int32_t>(Function::MotorLeft);
+        }
+        manual_motor_mapping_valid_ = have_right && have_left;
     }
     return changed;
 }
 
-bool Commander::refresh_manual_control() noexcept
+void Commander::refresh_manual_control() noexcept
 {
     manual_control_setpoint_s setpoint{};
-    bool copied = false;
     while (manual_control_subscription_.copy(&setpoint)) {
-        copied = true;
         manual_control_setpoint_ = setpoint;
         have_manual_control_ = true;
     }
-    return copied;
 }
 
-bool Commander::refresh_actuator_output_status() noexcept
+void Commander::refresh_actuator_output_status() noexcept
 {
     if (!actuator_output_status_subscription_.update()) {
-        return false;
+        return;
     }
     const actuator_output_status_s &candidate =
         actuator_output_status_subscription_.get();
@@ -107,12 +127,11 @@ bool Commander::refresh_actuator_output_status() noexcept
          (sequence_delta != 0U && sequence_delta < 0x80000000U));
     if (!sequence_valid || candidate.timestamp == 0U) {
         actuator_output_status_valid_ = false;
-        return true;
+        return;
     }
     actuator_output_status_ = candidate;
     last_actuator_output_sequence_ = candidate.sequence;
     actuator_output_status_valid_ = true;
-    return true;
 }
 
 bool Commander::evaluate_safety(std::uint64_t now) noexcept
@@ -135,33 +154,35 @@ bool Commander::evaluate_safety(std::uint64_t now) noexcept
     }
 
     bool state_changed = false;
-    if (authorized_calibration_session_ != 0U && !actuator_armed_.armed &&
-        (!rc_valid || !parameters_valid_ || actuator_armed_.kill || termination_latched_ ||
-         !actuator_output_status_fresh(now) || actuator_output_status_.state == actuator_output_status_s::STATE_RETRY ||
-         actuator_output_status_.state == actuator_output_status_s::STATE_FAULT)) {
-        // 阶段 Disarm 不暂停失联监控：不能等 RC 恢复后沿用旧会话授权。
-        state_changed = disarm(vehicle_status_s::ARM_DISARM_REASON_FAILURE_DETECTOR, now) == TransitionResult::Changed;
-    }
     if (actuator_armed_.armed) {
-        if (!rc_valid) {
-            causes |= FailsafeRcLoss;
-        }
-        if (!parameters_valid_) {
-            causes |= FailsafeParameters;
-        }
-        const bool actuator_failed = actuator_output_fault_while_armed(now);
-        if (actuator_failed) {
-            causes |= FailsafeActuatorOutput;
-        }
-        const bool rc_loss_requires_disarm =
-            !rc_valid && rc_loss_action_ == kRcLossActionDisarm;
-        if (rc_loss_requires_disarm || !parameters_valid_ ||
-            actuator_failed) {
-            state_changed = disarm(
-                vehicle_status_s::ARM_DISARM_REASON_FAILURE_DETECTOR,
-                now) ==
-                TransitionResult::Changed || state_changed;
-            PX4_WARN("Commander forced disarm: RC, parameter or actuator failure");
+        // RC loss 的唯一有效策略就是 Disarm；非法策略读回已令参数无效，
+        // 同样在这里解除 Armed，不保留不可能生效的其他策略分支。
+        // 触发与 failsafe 位锁存都须持续满 300 ms：判定输入是 20~50 ms 粒度
+        // 的单帧信号，电机堵转 EMI 等瞬态可让单帧为假而链路实际健康；若只
+        // 延迟解锁而即时投影 failsafe，单帧瞬态仍会经 safety_fresh 杀掉
+        // 自动校准会话。真实故障持续存在，延迟不超过一个确认窗。
+        const bool rc_fault = !rc_valid;
+        const bool parameter_fault = !parameters_valid_;
+        const bool actuator_fault = actuator_output_fault_while_armed(now);
+        const bool fault = rc_fault || parameter_fault || actuator_fault;
+        if (fault) {
+            if (safety_fault_since_us_ == 0U) {
+                safety_fault_since_us_ = now;
+            }
+            if (now >= safety_fault_since_us_ &&
+                now - safety_fault_since_us_ >= 300000ULL) {
+                if (rc_fault) causes |= FailsafeRcLoss;
+                if (parameter_fault) causes |= FailsafeParameters;
+                if (actuator_fault) causes |= FailsafeActuatorOutput;
+                state_changed = disarm(
+                    vehicle_status_s::ARM_DISARM_REASON_FAILURE_DETECTOR,
+                    now) ==
+                    TransitionResult::Changed;
+                PX4_WARN("Commander forced disarm: rc_invalid=%u parameters_invalid=%u actuator_output_fault=%u",
+                    rc_fault ? 1U : 0U, parameter_fault ? 1U : 0U, actuator_fault ? 1U : 0U);
+            }
+        } else {
+            safety_fault_since_us_ = 0U;
         }
     }
 
@@ -253,7 +274,6 @@ bool Commander::change_navigation_state(std::uint8_t nav_state,
         return false;
     }
 
-    if (nav_state != vehicle_status_s::NAVIGATION_STATE_EXTERNAL1) revoke_auto_calibration();
     if (vehicle_status_.nav_state == nav_state) {
         if (nav_state != vehicle_status_s::NAVIGATION_STATE_AUTO_MISSION) {
             suspend_active_mission();
@@ -417,15 +437,20 @@ bool Commander::update_public_projection(std::uint64_t now) noexcept
 }
 
 Commander::TransitionResult Commander::arm(
-    std::uint8_t reason, std::uint64_t now, bool calibration_resume) noexcept
+    std::uint8_t reason, std::uint64_t now) noexcept
 {
     const bool calibration = vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1;
-    if (calibration_resume && (!calibration || authorized_calibration_session_ == 0U ||
-        authorized_calibration_session_ != auto_calibration_status_.session_id)) return TransitionResult::Denied;
     if (actuator_armed_.armed) {
         return TransitionResult::NotChanged;
     }
     if (!preflight_checks_pass(now)) {
+        // 拒绝原因必须可区分：Manual 分支唯一预检是左右电机映射缓存，
+        // 缺失时给出指向 PWM_Sx_FUNC 的具体提示，不再只报笼统的安全检查失败。
+        if (vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_MANUAL &&
+            !manual_motor_mapping_valid_) {
+            PX4_WARN("Arming denied: motor mapping incomplete; assign MotorRight/MotorLeft via PWM_Sx_FUNC");
+            return TransitionResult::Denied;
+        }
         PX4_WARN("Arming denied: safety checks failed");
         return TransitionResult::Denied;
     }
@@ -438,7 +463,7 @@ Commander::TransitionResult Commander::arm(
                  static_cast<unsigned>(maintenance.failure));
         return TransitionResult::Denied;
     }
-    if (!armed_flash_.try_arm()) {
+    if (!armed_flash_.try_arm(calibration)) {
         PX4_WARN("Arming denied: Flash operation in progress");
         return TransitionResult::Denied;
     }
@@ -447,21 +472,16 @@ Commander::TransitionResult Commander::arm(
     vehicle_status_.arming_state = vehicle_status_s::ARMING_STATE_ARMED;
     vehicle_status_.latest_arming_reason = reason;
     vehicle_status_.armed_time = now;
-    if (calibration && !calibration_resume) {
-        // 只有经正常输入路径接受的首次 Arm 建立授权，协调器的诊断标志不参与授予。
-        authorized_calibration_session_ = auto_calibration_status_.session_id;
-        pending_calibration_arm_ = {};
-    }
     PX4_INFO("Rover armed");
     return TransitionResult::Changed;
 }
 
 Commander::TransitionResult Commander::disarm(std::uint8_t reason,
-                                              std::uint64_t now, bool preserve_calibration) noexcept
+                                              std::uint64_t now) noexcept
 {
-    const bool keep = preserve_calibration && vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1;
-    if (!keep) revoke_auto_calibration();
-    const bool mode_changed = !keep && change_navigation_state(vehicle_status_s::NAVIGATION_STATE_MANUAL, now);
+    // 校准阶段保持真实 Armed；Disarm 回到 Manual，使协调器取消当前会话，
+    // 后续运动不能依赖一份独立缓存的旧授权恢复。
+    const bool mode_changed = change_navigation_state(vehicle_status_s::NAVIGATION_STATE_MANUAL, now);
     if (!actuator_armed_.armed) {
         return mode_changed ? TransitionResult::Changed
                             : TransitionResult::NotChanged;
@@ -537,7 +557,9 @@ bool Commander::actuator_output_mapping_valid() const noexcept
 bool Commander::actuator_output_ready_for_arming(
     std::uint64_t now) const noexcept
 {
-    // 运动校准 Arm 和执行器故障恢复要求完整 Disarmed Neutral 帧；
+    // 自动校准的主动停波是可解锁状态，前提是实际六路全零且后端正常。
+    if (auto_calibration_output_stopped(now)) return true;
+    // 普通执行器故障恢复要求完整 Disarmed Neutral 帧；
     // 手动 Arm 只使用左右电机分配证据，不以当前波形状态作为预检条件。
     if (!actuator_output_status_fresh(now) ||
         !actuator_output_mapping_valid() ||
@@ -648,9 +670,16 @@ bool Commander::actuator_output_fault_while_armed(
     if (!actuator_armed_.armed) {
         return false;
     }
-    const bool in_transition = vehicle_status_.armed_time != 0U &&
+    // 原子停波锁先于低优先级状态发布变化；用真实锁边沿限定交接窗口，
+    // 避免新停波反馈遇到上一拍 motion_allowed 时被误判为执行器故障。
+    const auto calibration_transition_at = armed_flash_.calibration_output_transition();
+    const bool calibration_transition = vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 &&
+        auto_calibration_fresh(now) && auto_calibration_status_.active &&
+        calibration_transition_at != 0U && now >= calibration_transition_at &&
+        now - calibration_transition_at <= kActuatorArmTransitionUs;
+    const bool in_transition = calibration_transition || (vehicle_status_.armed_time != 0U &&
         vehicle_status_.armed_time <= now &&
-        now - vehicle_status_.armed_time <= kActuatorArmTransitionUs;
+        now - vehicle_status_.armed_time <= kActuatorArmTransitionUs);
     const bool mode_transition = vehicle_status_.nav_state_timestamp != 0U &&
         vehicle_status_.nav_state_timestamp <= now &&
         now - vehicle_status_.nav_state_timestamp <=
@@ -690,7 +719,7 @@ bool Commander::actuator_output_fault_while_armed(
         // 该例外只接受 AutoMode 故障流、RoverDifferential 新鲜全 NaN 帧与
         // MotorOutput 已确认物理停波三层同时成立。普通 Hard Safe Off、生产者
         // 超时、Retry/Fault、非零 PWM 或错误映射都不会落入这里。
-        if (!navigation_control_inhibit_expected(now) ||
+        if (!(navigation_control_inhibit_expected(now) || auto_calibration_output_stopped(now)) ||
             !actuator_output_status_.safe_off ||
             actuator_output_status_.command_valid ||
             actuator_output_status_.active_output_mask != 0U) {
@@ -714,35 +743,27 @@ bool Commander::actuator_output_fault_while_armed(
 
 bool Commander::preflight_checks_pass(std::uint64_t now) const noexcept
 {
-    // 急停、不可恢复终止和正在运行的校准事务属于互锁，任何模式都不能通过
-    // 简化预检绕过；维护/Flash 的最终原子互锁仍由 arm() 统一执行。
+    if (vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_MANUAL) {
+        // Manual 入场条件只看当前配置是否分配了左右电机（refresh_parameters
+        // 在 parameter_update 事件中按生成通道合同缓存本标志）。PWM 范围/
+        // 方向有效性、真实后端状态及 RC loss 仍由运行期安全链处理；预检
+        // 通过不等于已经允许硬件输出，也不绕过 arm() 的 Flash 原子互斥。
+        return manual_motor_mapping_valid_;
+    }
+
+    // 非手动模式保留急停、不可恢复终止和校准事务的原有预检；维护/Flash
+    // 的最终原子互锁仍由 arm() 统一执行。
     if (actuator_armed_.kill || termination_latched_ ||
         vehicle_status_.rc_calibration_in_progress ||
-        vehicle_status_.calibration_enabled) {
+        (vehicle_status_.calibration_enabled &&
+         !(auto_level_request_timestamp_ != 0U && auto_calibration_control_inhibit_expected(now)))) {
         return false;
     }
 
-    if (vehicle_status_.nav_state ==
-        vehicle_status_s::NAVIGATION_STATE_MANUAL) {
-        // 手动解锁只检查 MotorOutput 已应用的有效分配：左右各至少一路。
-        // 状态须新鲜且无待应用映射，避免用旧配置放行；不要求 RC/摇杆居中、
-        // Commander 参数有效或 PWM 已输出 Neutral。解锁后的失联、参数和
-        // 执行器故障仍由 evaluate_safety() 与 MotorOutput 处理。
-        return !auto_calibration_status_.active &&
-               actuator_output_status_fresh(now) &&
-               !actuator_output_status_.parameter_update_pending &&
-               actuator_output_mapping_valid();
-    }
-
-    // 运动校准仍要求明确的等待解锁阶段、有效参数、新鲜且居中的 RC 和
-    // 已可接管的 Neutral 输出，手动模式的简化不能扩大自动续行授权。
+    // Arm 授予整个会话，不以 RTK/运动阶段就绪作门槛。静态/写入时 PWM 锁
+    // 独立生效；取消、失败和回滚不得重新取得授权。RC/映射等真实安全检查保留。
     const bool calibration = vehicle_status_.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 &&
-        auto_calibration_fresh(now) && auto_calibration_status_.active && auto_calibration_status_.awaiting_arm &&
-        (auto_calibration_status_.state == auto_calibration_status_s::STATE_WAIT_ARM_FIRST ||
-         auto_calibration_status_.state == auto_calibration_status_s::STATE_WAIT_ARM_SECOND ||
-         auto_calibration_status_.state == auto_calibration_status_s::STATE_WAIT_ARM_IDENTIFICATION ||
-         auto_calibration_status_.state == auto_calibration_status_s::STATE_WAIT_ARM_VALIDATION ||
-         auto_calibration_status_.state == auto_calibration_status_s::STATE_WAIT_ARM_PROFILE) &&
+        auto_calibration_fresh(now) && auto_calibration_status_.active && auto_calibration_status_.arming_allowed &&
         auto_calibration_status_.result == auto_calibration_status_s::RESULT_RUNNING;
     return parameters_valid_ && calibration &&
            rc_input_valid(now) && sticks_centered() &&
@@ -788,7 +809,6 @@ void Commander::reset_runtime_state() noexcept
     sensor_calibration_status_ = sensor_calibration_status_s{};
     navigation_status_ = rover_navigation_status_s{};
     auto_calibration_status_ = {};
-    revoke_auto_calibration();
     auto_level_request_timestamp_ = 0U;
     sensor_calibration_dispatch_time_ = 0U;
     active_mission_generation_ = 0U;
@@ -799,13 +819,12 @@ void Commander::reset_runtime_state() noexcept
     data_link_loss_action_handle_ = PARAM_INVALID;
     rc_loss_timeout_s_ = 0.5F;
     arm_stick_deadzone_ = 0.1F;
-    rc_loss_action_ = kRcLossActionDisarm;
-    data_link_loss_action_ = kDataLinkLossActionDisabled;
     last_publish_time_ = 0U;
     last_actuator_output_sequence_ = 0U;
     recoverable_failsafe_causes_ = FailsafeNone;
     parameter_handles_ready_ = false;
     parameters_valid_ = false;
+    safety_fault_since_us_ = 0U;
     have_manual_control_ = false;
     actuator_output_status_valid_ = false;
     navigation_status_valid_ = false;
@@ -835,7 +854,7 @@ void Commander::initialize_public_state(std::uint64_t now) noexcept
         dima::middleware::rover::mode_contract::kImplementedMask;
     // AUTO_MISSION 只能经过完整 Mission Start readiness 事务进入；
     // QGC SET_MODE(AUTO_MISSION) 也只是该事务的兼容别名。AUTO_LOITER
-    // 只由 Commander 安全降级进入，所以可直接设置的通用模式仍仅为 Manual。
+    // 只由 Commander 安全降级进入；可选择模式由生成的模式合同统一定义。
     vehicle_status_.can_set_nav_states_mask = dima::middleware::rover::mode_contract::kUserSettableMask;
     vehicle_status_.failure_detector_status = vehicle_status_s::FAILURE_NONE;
     vehicle_status_.hil_state = vehicle_status_s::HIL_STATE_OFF;
@@ -852,7 +871,6 @@ void Commander::initialize_public_state(std::uint64_t now) noexcept
 
 void Commander::initialize_disarmed_snapshot(std::uint64_t now) noexcept
 {
-    revoke_auto_calibration();
     // 发布/调度失败的保底快照保留 Kill 锁存，但清除 Armed 和 ready_to_arm；
     // 这样恢复通信不会隐式解除操作员已经触发的紧急停机。
     const bool kill_latched = actuator_armed_.kill;

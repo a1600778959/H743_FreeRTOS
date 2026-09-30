@@ -154,8 +154,8 @@ void Commander::Run()
     // 固定处理顺序：先收敛参数/输入/执行器证据，再评估安全投影，之后逐条执行动作。
     // 这样任何正向 Arm 请求看到的都是本轮最新的否定安全证据。
     bool state_changed = refresh_parameters();
-    (void)refresh_manual_control();
-    (void)refresh_actuator_output_status();
+    refresh_manual_control();
+    refresh_actuator_output_status();
     state_changed = refresh_sensor_calibration_status() || state_changed;
     state_changed = refresh_navigation_status() || state_changed;
 
@@ -199,7 +199,6 @@ void Commander::Run()
     now = hrt_absolute_time();
     state_changed = evaluate_safety(now);
     state_changed = evaluate_navigation(now) || state_changed;
-    state_changed = resume_auto_calibration(now) || state_changed;
     state_changed = update_public_projection(now) || state_changed;
     const bool heartbeat_due = now - last_publish_time_ >= kPublishIntervalUs;
     if ((state_changed || heartbeat_due) && !publish_state(now)) {
@@ -207,7 +206,7 @@ void Commander::Run()
         return;
     }
 
-    // uORB 回调的 ScheduleNow 会替换周期调度，每次运行后恢复 20 ms 检查。
+    // 每轮确认 20 ms 后续检查仍已安排；ScheduleNow 自身保留周期配置。
     if (!ScheduleOnInterval(kCheckIntervalUs)) {
         handle_scheduling_failure(now);
     }
@@ -240,7 +239,6 @@ void Commander::handle_scheduling_failure(std::uint64_t now) noexcept
 
 void Commander::enter_error(const char *reason) noexcept
 {
-    revoke_auto_calibration();
     state_ = dima::middleware::lifecycle::ModuleState::Error;
     armed_flash_.disarm();
     cancel_callbacks_and_drain();
@@ -305,15 +303,5 @@ bool Commander::refresh_navigation_status() noexcept
     }
     return changed;
 }
-
-} // namespace dima::modules::safety
-
-
-// 普通运行期实现从对应头文件移出；保持原状态、错误分支和计算顺序。
-
-namespace dima::modules::safety {
-
-bool Commander::armed() const noexcept
-{ return armed_flash_.armed(); }
 
 } // namespace dima::modules::safety
