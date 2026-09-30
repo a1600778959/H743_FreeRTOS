@@ -30,24 +30,19 @@ struct ResponseEstimate {
     bool valid() const noexcept;
 };
 
-// 单变量 Welford；保留真实零方差，不人为补噪声。调用方负责保证停车/稳态、
-// 传感器设备和参数代次一致，重复或回退时间会锁存失败直到显式 reset。
+// 时间窗实测均值；调用方负责输入保持、传感器设备和参数代次一致。
+// 重复或回退时间锁存失败。已删除无消费者的方差、峰值以及轮端重复统计。
 class ResponseStatistics final {
 public:
     bool add(std::uint64_t timestamp_us, float value) noexcept;
     void reset() noexcept;
     std::uint32_t count() const noexcept;
     double mean() const noexcept;
-    double variance() const noexcept;
-    float standard_deviation() const noexcept;
-    float maximum() const noexcept;
     float duration_s() const noexcept;
     ResponseFailure failure() const noexcept;
 
 private:
     double mean_{};
-    double m2_{};
-    float maximum_{};
     std::uint64_t first_timestamp_us_{};
     std::uint64_t last_timestamp_us_{};
     std::uint32_t count_{};
@@ -63,13 +58,13 @@ public:
     std::uint32_t count() const noexcept;
     ResponseFailure failure() const noexcept;
     float signed_rate() const noexcept;
-    ResponseEstimate lower_confidence_rate(float measurement_noise) const noexcept;
+    ResponseEstimate measured_rate() const noexcept;
+    float duration_s() const noexcept;
 
 private:
     double mean_time_{};
     double mean_response_{};
     double time_m2_{};
-    double response_m2_{};
     double time_response_m2_{};
     float minimum_{};
     float maximum_{};
@@ -80,10 +75,9 @@ private:
 };
 
 struct ResponsePlateau {
-    // 三项都按 direction 归一化：reverse 的负命令/负车速乘 -1；raw_speed
+    // 输入/速度按direction归一化；轮端执行值只在采样入口校验。raw_speed
     // 不取绝对值，真实反向响应和零速噪声仍保留符号，不伪装成正响应。
     ResponseStatistics pre_input{};
-    ResponseStatistics applied_input{};
     ResponseStatistics raw_speed{};
     std::uint32_t count() const noexcept;
 };
@@ -101,19 +95,11 @@ public:
     void reset() noexcept;
     const ResponsePlateau *plateau(std::size_t direction,
                                    std::size_t level) const noexcept;
-    bool replace_direction(std::size_t direction, const MotorResponseProfile &source,
-                           std::size_t source_direction) noexcept;
     bool reset_plateau(std::size_t direction, std::size_t level) noexcept;
     ResponseFailure failure() const noexcept;
 
-    // 速度取已测平台的最大保守响应；增益取至少三档有效平台比值的最小下界。
-    // 增益下界不是“整条曲线线性”的证明，不能单独授权 RO_MAX_THR_SPEED 保存。
-    ResponseEstimate speed_lower_bound(std::size_t direction,
-                                       float measurement_noise) const noexcept;
-    ResponseEstimate gain_lower_bound(std::size_t direction,
-                                      float measurement_noise) const noexcept;
-    ResponseFailure global_coverage(float motor_max,
-                                    float measurement_noise) const noexcept;
+    // 速度取已测稳态平台的最大均值，不从测量值扣除噪声。
+    ResponseEstimate measured_speed(std::size_t direction) const noexcept;
 
 private:
     ResponsePlateau plateaus_[kDirections][kLevels]{};
@@ -121,38 +107,23 @@ private:
     ResponseFailure failure_{ResponseFailure::None};
 };
 
-struct MotorResponseDesign {
-    float motor_max{};
-    float measurement_noise{};
-    float current_min_output{};
-    float current_expo{};
-    float current_asymmetry{1.0F};
+// 固定容量单参数搜索；分割比例只属于数值求解，不是控制增益折扣。
+struct TrialScore {
+    float primary{std::numeric_limits<float>::infinity()};
+    float secondary{std::numeric_limits<float>::infinity()};
+    bool valid{false};
 };
-
-struct MotorResponseCandidate {
-    static constexpr std::uint8_t kMinimum{1U};
-    static constexpr std::uint8_t kExpo{2U};
-    static constexpr std::uint8_t kAsymmetry{4U};
-    static constexpr std::uint8_t kAll{kMinimum | kExpo | kAsymmetry};
-
-    float min_output{std::numeric_limits<float>::quiet_NaN()};
-    float minimum_lower_bound{std::numeric_limits<float>::quiet_NaN()};
-    float minimum_upper_bound{std::numeric_limits<float>::quiet_NaN()};
-    float expo{std::numeric_limits<float>::quiet_NaN()};
-    float asymmetry{std::numeric_limits<float>::quiet_NaN()};
-    std::uint8_t identifiable_mask{};
-    bool global_coverage{};
-    ResponseFailure failure{ResponseFailure::InsufficientSamples};
-    ResponseFailure minimum_failure{ResponseFailure::InsufficientSamples};
-    ResponseFailure expo_failure{ResponseFailure::InsufficientSamples};
-    ResponseFailure asymmetry_failure{ResponseFailure::InsufficientSamples};
-    bool complete() const noexcept;
+bool better_trial(const TrialScore &a, const TrialScore &b) noexcept;
+class BoundedParameterSearch final {
+public:
+    bool reset(float lower, float upper, float resolution, bool binary = false) noexcept;
+    float candidate() const noexcept;
+    bool observe(const TrialScore &score) noexcept;
+private:
+    float lower_{}, upper_{}, resolution_{}, points_[2]{};
+    TrialScore scores_[2]{};
+    unsigned remaining_{}, slot_{};
+    bool binary_{}, paired_{};
 };
-
-// 仅设计 MIN/EXPO/ASYM 候选，不触碰参数、输出、MOT_MAX、Arm ramp、换向延时。
-// 满覆盖也是必要而非充分条件；调用方仍须实际验证关联 FF/PI 和全部运行范围。
-// MOT_SLEW_RATE 没有静态曲线候选，必须由真实限制器激活证据另行比较。
-MotorResponseCandidate design_motor_response(const MotorResponseProfile &profile,
-                                              const MotorResponseDesign &design) noexcept;
 
 } // namespace dima::lib::rover::calibration
