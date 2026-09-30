@@ -188,7 +188,11 @@ public:
                     drain_completion();
                     return fail(EPIPE);
                 }
-                return fail(ETIMEDOUT);
+                // 只有本次 transmit 已接受才返回 kWriteInProgress。即使完成 IRQ
+                // 紧接着到达，该结果仍证明本批已提交，不能按未提交重新发送；
+                // 抢锁、等待上一笔和 Busy 超时仍为 ETIMEDOUT，不混淆批次归属。
+                errno = EINPROGRESS;
+                return kWriteInProgress;
             }
 
             in_flight_ = false;
@@ -506,7 +510,9 @@ extern "C" int _write(int file, char *data, int length)
         errno = EAGAIN;
         return -1;
     }
-    return services->console.write(
+    const int result = services->console.write(
         reinterpret_cast<const std::uint8_t *>(data),
         static_cast<std::size_t>(length), 100U);
+    // newlib syscall 仍只接收字节数或 -1；Console 的在途状态留在内部接口。
+    return result < 0 ? -1 : result;
 }
