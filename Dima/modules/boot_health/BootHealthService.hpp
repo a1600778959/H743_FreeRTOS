@@ -1,6 +1,7 @@
 #pragma once
 
 #include "actuator_armed.hpp"
+#include "auto_calibration_status.hpp"
 #include "actuator_output_status.hpp"
 #include "lifecycle/module_base.hpp"
 #include "maintenance/RuntimeMaintenanceCoordinator.hpp"
@@ -59,6 +60,7 @@ private:
         ORB_ID(vehicle_status)};
     uORB::SubscriptionData<actuator_output_status_s>
         actuator_output_status_subscription_{ORB_ID(actuator_output_status)};
+    uORB::SubscriptionData<auto_calibration_status_s> calibration_subscription_{ORB_ID(auto_calibration_status)};
     std::uint64_t stable_window_start_ms_{0U};
     std::uint64_t last_safety_timestamp_us_{0U};
     std::uint32_t last_output_sequence_{0U};

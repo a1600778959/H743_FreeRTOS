@@ -2,6 +2,8 @@
 #include "rover/RoverModeContract.hpp"
 
 #include "api/ActuatorPwm.hpp"
+#include "api/Flash.hpp"
+#include "api/Services.hpp"
 
 #include "parameters/param.h"
 
@@ -82,6 +84,7 @@ void BootHealthService::Run()
     // 先复制消息，再取统一判定时间。MotorOutput 优先级高于本队列，可能在
     // 复制期间发布新状态；用复制前的 now 会把合法新帧误判为“未来”，进而
     // 撤销维护、停止健康代次并触发 IWDG。仍严格拒绝真正晚于判定时刻的帧。
+    (void)calibration_subscription_.update();
     const bool armed_updated = actuator_armed_subscription_.update();
     const bool control_updated = vehicle_control_mode_subscription_.update();
     const bool status_updated = vehicle_status_subscription_.update();
@@ -390,6 +393,29 @@ bool BootHealthService::output_status_runtime_healthy(
         return hard_safe;
     }
 
+    const auto &calibration = calibration_subscription_.get();
+    const std::uint64_t calibration_timeout = dima::platform::services().armed_flash.calibration_maintenance_recent(now_us)
+        ? 20000000ULL : 200000ULL;
+    const bool calibration_stopped = status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 &&
+        calibration.timestamp != 0U && calibration.timestamp <= now_us && now_us - calibration.timestamp <= calibration_timeout &&
+        calibration.active && calibration.result == auto_calibration_status_s::RESULT_RUNNING &&
+        calibration.motion_inhibited && !calibration.motion_allowed &&
+        dima::platform::services().armed_flash.calibration_output_stopped();
+    // 校准静态/维护时真实 Armed 可保持，仍要求新鲜控制失效流及六路物理停波。
+    if (calibration_stopped && control_inhibited) return true;
+
+    // Commander 的故障 Disarm 会把 External1 切回 Manual，但自动校准仍需
+    // 完成参数回滚/保存。只要停波锁仍有效、后端已确认 Hard Safe Off 且会话
+    // 仍在收尾，允许继续发行 Runtime 健康代次喂 IWDG；该例外绝不允许
+    // Disarmed Neutral 或任何 PWM 恢复，事务结束后立即失效。
+    const bool calibration_rollback_safe = !armed.armed &&
+        status.nav_state == vehicle_status_s::NAVIGATION_STATE_MANUAL &&
+        calibration.active && calibration.motion_inhibited && calibration.timestamp != 0U &&
+        calibration.timestamp <= now_us && now_us - calibration.timestamp <= 30000000ULL &&
+        dima::platform::services().armed_flash.calibration_output_stopped() &&
+        hard_safe && !armed.kill && !armed.termination && !armed.lockdown;
+    if (calibration_rollback_safe) return true;
+
     if (armed.armed) {
         // 解锁沿或控制模式换代的短窗口允许 PWM 尚处停波态；窗口结束后通常
         // 必须进入 Active。
@@ -403,7 +429,13 @@ bool BootHealthService::output_status_runtime_healthy(
             status.nav_state_timestamp <= now_us &&
             now_us - status.nav_state_timestamp <=
                 kActuatorArmTransitionUs;
-        if ((in_transition || mode_transition) && stopped_frame) {
+        const auto calibration_transition_at = dima::platform::services().armed_flash.calibration_output_transition();
+        const bool calibration_transition = status.nav_state == vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 &&
+            calibration.timestamp != 0U && calibration.timestamp <= now_us && now_us - calibration.timestamp <= 200000ULL &&
+            calibration.active && calibration.result == auto_calibration_status_s::RESULT_RUNNING && control_inhibited &&
+            calibration_transition_at != 0U && calibration_transition_at <= now_us &&
+            now_us - calibration_transition_at <= kActuatorArmTransitionUs;
+        if ((in_transition || mode_transition || calibration_transition) && stopped_frame) {
             return true;
         }
         if (control_inhibited) {
