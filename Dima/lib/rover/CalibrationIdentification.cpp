@@ -10,7 +10,6 @@ namespace {
 constexpr float kMicrosecondsToSeconds = 1.0e-6F;
 constexpr float kMaximumOvershootRatio = 0.20F;
 constexpr float kSteadyErrorRatio = 0.10F;
-constexpr float kNoiseMultiplier = 3.0F;
 constexpr float kMinimumDivisor = 1.0e-9F;
 
 bool finite(float value) noexcept
@@ -27,33 +26,13 @@ bool identification_config_valid(const IdentificationConfig &config) noexcept
         finite(config.forgetting_time_constant_s) &&
         config.forgetting_time_constant_s > config.sample_period_s &&
         config.minimum_samples >= 16U && finite(config.maximum_absolute_input) &&
-        config.maximum_absolute_input > 0.0F && finite(config.maximum_absolute_output) &&
-        config.maximum_absolute_output > 0.0F && finite(config.minimum_input_variance) &&
-        config.minimum_input_variance > 0.0F && finite(config.minimum_output_variance) &&
-        config.minimum_output_variance > 0.0F && finite(config.output_noise_variance) &&
-        config.output_noise_variance >= 0.0F &&
-        finite(config.maximum_normalized_rms_residual) &&
-        config.maximum_normalized_rms_residual > 0.0F &&
-        finite(config.maximum_relative_coefficient_stddev) &&
-        config.maximum_relative_coefficient_stddev > 0.0F &&
-        finite(config.coefficient_scale_floor) && config.coefficient_scale_floor > 0.0F &&
-        finite(config.minimum_pole) && finite(config.maximum_pole) &&
-        config.minimum_pole > 0.0F && config.maximum_pole < 1.0F &&
-        config.minimum_pole < config.maximum_pole && finite(config.minimum_dc_gain) &&
-        finite(config.maximum_dc_gain) && config.minimum_dc_gain > 0.0F &&
-        config.minimum_dc_gain < config.maximum_dc_gain &&
-        finite(config.minimum_time_constant_s) && finite(config.maximum_time_constant_s) &&
-        config.minimum_time_constant_s > 0.0F &&
-        config.minimum_time_constant_s < config.maximum_time_constant_s;
+        config.maximum_absolute_input > 0.0F;
 }
 
 bool pi_limits_valid(const PiDesignLimits &limits) noexcept
 {
     return finite(limits.requested_closed_loop_time_s) &&
-        limits.requested_closed_loop_time_s > 0.0F && finite(limits.output_headroom) &&
-        limits.output_headroom > 0.0F && limits.output_headroom <= 1.0F &&
-        finite(limits.maximum_error) && limits.maximum_error > 0.0F &&
-        finite(limits.integration_horizon_s) && limits.integration_horizon_s > 0.0F &&
+        limits.requested_closed_loop_time_s > 0.0F &&
         finite(limits.maximum_proportional_gain) &&
         limits.maximum_proportional_gain > 0.0F && finite(limits.maximum_integral_gain) &&
         limits.maximum_integral_gain > 0.0F;
@@ -108,7 +87,7 @@ bool update_bank(ArxRls<1U, 0U, Delay> &bank, std::size_t index,
         !finite(variances(0)) || !finite(variances(1)) ||
         !finite(bank.getInnovation())) return false;
 
-    // RLS 初始大协方差会产生很大的暂态 innovation；残差门禁只累计后半段，
+    // RLS 初始大协方差会产生很大的暂态 innovation；残差统计只累计后半段，
     // 但系数与协方差仍从第一份唯一样本开始更新。
     const std::uint32_t warmup = std::max<std::uint32_t>(
         static_cast<std::uint32_t>(Delay + 3U), config.minimum_samples / 2U);
@@ -123,8 +102,7 @@ bool update_bank(ArxRls<1U, 0U, Delay> &bank, std::size_t index,
 bool evaluate_model(const matrix::Vector<float, 2U> &coefficients,
                     const matrix::Vector<float, 2U> &variances,
                     std::size_t delay, std::size_t index,
-                    const IdentificationConfig &config, std::uint32_t sample_count,
-                    float input_variance, float output_variance,
+                    const IdentificationConfig &config, float output_variance,
                     const double (&residual_squared)[FirstOrderDelayIdentifier::kDelayBankSize],
                     const std::uint32_t (&residual_count)[FirstOrderDelayIdentifier::kDelayBankSize],
                     FirstOrderModel &model) noexcept
@@ -134,86 +112,48 @@ bool evaluate_model(const matrix::Vector<float, 2U> &coefficients,
     const float a = coefficients(0);
     const float b = coefficients(1);
     const float pole = -a;
+    // 一阶稳定实极点只要求0<pole<1；不再通过固定0.995给不同采样周期
+    // 偷加不同响应时间上限。参数可保存范围在PI候选生成后独立检查。
     if (!finite(a) || !finite(b) || !finite(variances(0)) || !finite(variances(1)) ||
-        variances(0) < 0.0F || variances(1) < 0.0F || pole < config.minimum_pole ||
-        pole > config.maximum_pole) return false;
+        variances(0) < 0.0F || variances(1) < 0.0F || pole <= 0.0F || pole >= 1.0F) return false;
 
     const float denominator = 1.0F + a;
     if (std::fabs(denominator) <= kMinimumDivisor) return false;
     const float dc_gain = b / denominator;
     const float time_constant_s = -config.sample_period_s / std::log(pole);
-    if (!finite(dc_gain) || dc_gain < config.minimum_dc_gain ||
-        dc_gain > config.maximum_dc_gain || !finite(time_constant_s) ||
-        time_constant_s < config.minimum_time_constant_s ||
-        time_constant_s > config.maximum_time_constant_s) return false;
+    if (!finite(dc_gain) || dc_gain <= 0.0F ||
+        !finite(time_constant_s) || time_constant_s <= 0.0F) return false;
 
-    // ArxRls::getVariances() 返回的是 RLS 逆信息矩阵 P 的对角项，不是已经
-    // 带输出量纲的参数协方差。先以扣除两个模型自由度的 innovation 残差
-    // 方差估计输出噪声，再与调用方给出的测量噪声下界取大，最终 covariance=P*sigma^2。
-    const double residual_variance = residual_squared[index] /
-        static_cast<double>(residual_count[index] - 2U);
-    const double output_noise_variance = std::max(
-        residual_variance, static_cast<double>(config.output_noise_variance));
-    const double pole_variance = static_cast<double>(variances(0)) *
-        output_noise_variance;
-    const double input_coefficient_variance =
-        static_cast<double>(variances(1)) * output_noise_variance;
-    if (!std::isfinite(residual_variance) || residual_variance < 0.0 ||
-        !std::isfinite(pole_variance) || pole_variance < 0.0 ||
-        !std::isfinite(input_coefficient_variance) ||
-        input_coefficient_variance < 0.0) return false;
-
-    const float relative_a = static_cast<float>(std::sqrt(pole_variance)) /
-        std::max(std::fabs(a), config.coefficient_scale_floor);
-    const float relative_b = static_cast<float>(
-        std::sqrt(input_coefficient_variance)) /
-        std::max(std::fabs(b), config.coefficient_scale_floor);
-    const float maximum_relative = std::max(relative_a, relative_b);
-    if (!finite(maximum_relative) ||
-        maximum_relative > config.maximum_relative_coefficient_stddev) return false;
-
+    // 残差只用于六个延迟模型的择优；删除无消费者的测量噪声缩放协方差，
+    // RLS自身信息矩阵的有限/非负检查仍在上方保留。
     const float rms_residual = static_cast<float>(std::sqrt(
         residual_squared[index] / static_cast<double>(residual_count[index])));
-    const float normalized_residual = rms_residual /
-        std::max(std::sqrt(output_variance),
-                 std::sqrt(config.minimum_output_variance));
-    if (!finite(normalized_residual) ||
-        normalized_residual > config.maximum_normalized_rms_residual) return false;
+    // fit已确认响应方差为正；以本批实测尺度归一化，不设置固定响应幅值地板。
+    const float normalized_residual = rms_residual / std::sqrt(output_variance);
+    // 有限残差用于模型排序，不用固定百分比提前否决候选。
+    if (!finite(normalized_residual)) return false;
 
     model.valid = true;
-    model.delay_samples = static_cast<std::uint8_t>(delay);
-    model.sample_count = sample_count;
-    model.pole = pole;
-    model.input_coefficient = b;
     model.dc_gain = dc_gain;
     model.time_constant_s = time_constant_s;
     model.delay_s = static_cast<float>(delay) * config.sample_period_s;
-    model.pole_variance = static_cast<float>(pole_variance);
-    model.input_coefficient_variance = static_cast<float>(
-        input_coefficient_variance);
-    model.maximum_relative_coefficient_stddev = maximum_relative;
     model.normalized_rms_residual = normalized_residual;
-    model.input_variance = input_variance;
-    model.output_variance = output_variance;
     return true;
 }
 
 template<std::size_t Delay>
 bool evaluate_bank(const ArxRls<1U, 0U, Delay> &bank, std::size_t index,
-                   const IdentificationConfig &config, std::uint32_t sample_count,
-                   float input_variance, float output_variance,
+                   const IdentificationConfig &config, float output_variance,
                    const double (&residual_squared)[FirstOrderDelayIdentifier::kDelayBankSize],
                    const std::uint32_t (&residual_count)[FirstOrderDelayIdentifier::kDelayBankSize],
                    FirstOrderModel &model) noexcept
 {
-    // 一阶模型有 pole/input coefficient 两个自由参数；N<=2 时残差方差
-    // 没有正自由度，不能生成表面有限的系数置信度。保留先判定、再读模型的顺序。
+    // 保留完整残差观察样本后再比较延迟模型，不因删除未使用诊断而改动采样范围。
     if (residual_count[index] <= 2U ||
         residual_count[index] < config.minimum_samples / 4U) return false;
     const auto &coefficients = bank.getCoefficients();
     const auto variances = bank.getVariances();
-    return evaluate_model(coefficients, variances, Delay, index, config, sample_count,
-                          input_variance, output_variance, residual_squared,
+    return evaluate_model(coefficients, variances, Delay, index, config, output_variance, residual_squared,
                           residual_count, model);
 }
 
@@ -224,18 +164,14 @@ bool step_config_valid(const StepValidationConfig &config) noexcept
         config.sample_period_tolerance_s < 0.0F ||
         config.sample_period_tolerance_s >= config.sample_period_s ||
         !finite(config.initial_output) || !finite(config.target_output) ||
-        !finite(config.noise) || config.noise < 0.0F ||
         !finite(config.absolute_steady_tolerance) ||
         config.absolute_steady_tolerance < 0.0F ||
         config.minimum_samples < 2U || config.steady_window_samples < 2U ||
         config.steady_window_samples > StepResponseValidator::kMaximumSteadyWindowSamples ||
-        config.minimum_samples < config.steady_window_samples ||
-        !finite(config.maximum_continuous_saturation_s) ||
-        config.maximum_continuous_saturation_s < config.sample_period_s) return false;
+        config.minimum_samples < config.steady_window_samples) return false;
     const float step = std::fabs(config.target_output - config.initial_output);
     return finite(step) && config.absolute_steady_tolerance < step &&
-        step > std::max(kNoiseMultiplier * config.noise,
-                        std::numeric_limits<float>::epsilon());
+        step > std::numeric_limits<float>::epsilon();
 }
 
 } // namespace
@@ -272,9 +208,10 @@ bool FirstOrderDelayIdentifier::add_sample(std::uint64_t timestamp_us,
                                            float output_delta) noexcept
 {
     if (!configured_ || sample_failure_ != CalibrationAlgorithmFailure::None) return false;
+    // 开环输出是待辨识的实测响应，不能用期望车速/转速裁掉高增益样本。
+    // 输入仍受执行器包络约束；输出检查有限值与采样时序，残差用于延迟模型择优。
     if (!finite(input_delta) || !finite(output_delta) ||
-        std::fabs(input_delta) > config_.maximum_absolute_input ||
-        std::fabs(output_delta) > config_.maximum_absolute_output) {
+        std::fabs(input_delta) > config_.maximum_absolute_input) {
         sample_failure_ = CalibrationAlgorithmFailure::InvalidSample;
         return false;
     }
@@ -325,9 +262,9 @@ IdentificationResult FirstOrderDelayIdentifier::fit(
         input_m2_ / static_cast<double>(sample_count_ - 1U));
     const float output_variance = static_cast<float>(
         output_m2_ / static_cast<double>(sample_count_ - 1U));
+    // 输入/响应必须实际变化才能辨识；不以2%输入比例或固定1e-4方差拒绝低速响应。
     if (!finite(input_variance) || !finite(output_variance) ||
-        input_variance < config_.minimum_input_variance ||
-        output_variance < config_.minimum_output_variance) {
+        input_variance <= 0.0F || output_variance <= 0.0F) {
         result.failure = CalibrationAlgorithmFailure::InsufficientExcitation;
         return result;
     }
@@ -342,18 +279,12 @@ IdentificationResult FirstOrderDelayIdentifier::fit(
         }
         candidate = {};
     };
-    consider(evaluate_bank(delay_0_, 0U, config_, sample_count_, input_variance,
-                           output_variance, residual_squared_, residual_count_, candidate));
-    consider(evaluate_bank(delay_1_, 1U, config_, sample_count_, input_variance,
-                           output_variance, residual_squared_, residual_count_, candidate));
-    consider(evaluate_bank(delay_2_, 2U, config_, sample_count_, input_variance,
-                           output_variance, residual_squared_, residual_count_, candidate));
-    consider(evaluate_bank(delay_3_, 3U, config_, sample_count_, input_variance,
-                           output_variance, residual_squared_, residual_count_, candidate));
-    consider(evaluate_bank(delay_4_, 4U, config_, sample_count_, input_variance,
-                           output_variance, residual_squared_, residual_count_, candidate));
-    consider(evaluate_bank(delay_5_, 5U, config_, sample_count_, input_variance,
-                           output_variance, residual_squared_, residual_count_, candidate));
+    consider(evaluate_bank(delay_0_, 0U, config_, output_variance, residual_squared_, residual_count_, candidate));
+    consider(evaluate_bank(delay_1_, 1U, config_, output_variance, residual_squared_, residual_count_, candidate));
+    consider(evaluate_bank(delay_2_, 2U, config_, output_variance, residual_squared_, residual_count_, candidate));
+    consider(evaluate_bank(delay_3_, 3U, config_, output_variance, residual_squared_, residual_count_, candidate));
+    consider(evaluate_bank(delay_4_, 4U, config_, output_variance, residual_squared_, residual_count_, candidate));
+    consider(evaluate_bank(delay_5_, 5U, config_, output_variance, residual_squared_, residual_count_, candidate));
     if (!best.valid) {
         result.failure = CalibrationAlgorithmFailure::ModelRejected;
         return result;
@@ -364,16 +295,15 @@ IdentificationResult FirstOrderDelayIdentifier::fit(
         result.failure = CalibrationAlgorithmFailure::PiRejected;
         return result;
     }
-    // 一阶带延迟模型 G(s)=K*exp(-theta*s)/(tau*s+1) 的保守 IMC PI：
-    // Kp=tau/[K(lambda+theta)]，Ti=tau+theta/2，Ki=Kp/Ti。
-    // lambda 至少取 3*tau、5*theta 和 1 s，避免把 aircraft 的快环带宽套给 Rover。
-    const float lambda = std::max({limits.requested_closed_loop_time_s,
-                                   3.0F * best.time_constant_s,
-                                   5.0F * best.delay_s, 1.0F});
-    const float integral_time = best.time_constant_s + 0.5F * best.delay_s;
-    float proportional = best.time_constant_s /
+    // Skogestad, J. Process Control 13 (2003), 式(23)(24)：一阶带延迟
+    // G(s)=K*exp(-theta*s)/(tau*s+1)的SIMC PI：Kp=tau/[K(lambda+theta)]，
+    // Ti=min(tau,4*(lambda+theta))，Ki=Kp/Ti。lambda是显式设计输入，
+    // 不再偷偷提高到3*tau、5*theta或另一固定下限；4来自该规则的阻尼推导。
+    const float lambda = limits.requested_closed_loop_time_s;
+    const float integral_time = std::min(best.time_constant_s, 4.0F * (lambda + best.delay_s));
+    const float proportional = best.time_constant_s /
         (best.dc_gain * (lambda + best.delay_s));
-    float integral = proportional / integral_time;
+    const float integral = proportional / integral_time;
     if (!finite(lambda) || !finite(integral_time) || integral_time <= 0.0F ||
         !finite(proportional) || !finite(integral) || proportional <= 0.0F ||
         integral <= 0.0F) {
@@ -381,39 +311,19 @@ IdentificationResult FirstOrderDelayIdentifier::fit(
         return result;
     }
 
-    // 同比例缩放 P/I，保留 Ti；在 maximum_error 持续 integration_horizon
-    // 的保守情况下，反馈项仍不得吃完调用方预留的归一化输出余量。
-    const float raw_demand = limits.maximum_error *
-        (proportional + integral * limits.integration_horizon_s);
-    float scale = 1.0F;
-    if (raw_demand > limits.output_headroom)
-        scale = std::min(scale, limits.output_headroom / raw_demand);
-    if (proportional > limits.maximum_proportional_gain)
-        scale = std::min(scale, limits.maximum_proportional_gain / proportional);
-    if (integral > limits.maximum_integral_gain)
-        scale = std::min(scale, limits.maximum_integral_gain / integral);
-    if (!finite(scale) || scale <= 0.0F) {
-        result.failure = CalibrationAlgorithmFailure::PiRejected;
-        return result;
-    }
-    proportional *= scale;
-    integral *= scale;
-    const float bounded_demand = limits.maximum_error *
-        (proportional + integral * limits.integration_horizon_s);
-    if (!finite(proportional) || !finite(integral) ||
-        proportional <= 0.0F || integral <= 0.0F ||
-        bounded_demand > limits.output_headroom + 1.0e-6F) {
+    // 候选保持模型设计的P/I和lambda一致。删除“最大误差积分若干秒”的
+    // 二次缩放；真实限幅与抗积分饱和由现有控制器执行，数值超参数范围则
+    // 明确拒绝候选，不能悄悄缩小增益后继续声称原响应时间。
+    if (proportional > limits.maximum_proportional_gain || integral > limits.maximum_integral_gain) {
         result.failure = CalibrationAlgorithmFailure::PiRejected;
         return result;
     }
 
     result.pi.valid = true;
-    result.pi.headroom_limited = scale < 1.0F;
     result.pi.proportional_gain = proportional;
     result.pi.integral_gain = integral;
     result.pi.integral_time_s = integral_time;
     result.pi.closed_loop_time_s = lambda;
-    result.pi.worst_case_feedback_demand = bounded_demand;
     result.failure = CalibrationAlgorithmFailure::None;
     return result;
 }
@@ -427,7 +337,7 @@ bool StepResponseValidator::reset(const StepValidationConfig &config) noexcept
         steady_saturation_[index] = false;
     }
     steady_next_ = steady_count_ = steady_saturation_count_ = 0U;
-    last_timestamp_us_ = saturation_started_us_ = maximum_saturation_us_ = 0U;
+    last_timestamp_us_ = 0U;
     sample_count_ = 0U;
     error_crossings_ = 0U;
     last_error_sign_ = 0;
@@ -462,8 +372,9 @@ bool StepResponseValidator::add_sample(std::uint64_t timestamp_us,
         return false;
     }
 
-    const float allowed_error = std::max(kSteadyErrorRatio * step,
-                                         kNoiseMultiplier * config_.noise);
+    // 振荡与最终跟踪误差使用同一验证容差，不另乘接收机噪声造接受边界。
+    const float allowed_error = config_.absolute_steady_tolerance > 0.0F
+        ? config_.absolute_steady_tolerance : kSteadyErrorRatio * step;
     const float error = config_.target_output - measurement;
     if (std::fabs(error) > allowed_error) {
         const std::int8_t sign = error > 0.0F ? 1 : -1;
@@ -478,26 +389,18 @@ bool StepResponseValidator::add_sample(std::uint64_t timestamp_us,
         last_error_sign_ = sign;
     }
 
-    if (saturated) {
-        if (saturation_started_us_ == 0U) saturation_started_us_ = timestamp_us;
-        const std::uint64_t duration_us = timestamp_us - saturation_started_us_;
-        maximum_saturation_us_ = std::max(maximum_saturation_us_, duration_us);
-        const double limit_us = static_cast<double>(config_.maximum_continuous_saturation_s) *
-            1000000.0;
-        if (static_cast<double>(duration_us) >= limit_us) {
-            sample_failure_ = CalibrationAlgorithmFailure::SustainedSaturation;
-            return false;
-        }
-    } else {
-        saturation_started_us_ = 0U;
-    }
+    // 加速过程允许到顶，不再按固定1秒提前否决。最终观察窗仍检查
+    // 到顶且误差超标，跟踪误差/超调/振荡验证保持原要求。
+    const float tracking_tolerance = config_.absolute_steady_tolerance > 0.0F
+        ? config_.absolute_steady_tolerance : kSteadyErrorRatio * step;
+    const bool limited_error = saturated && std::fabs(error) > tracking_tolerance;
 
     const std::size_t window = config_.steady_window_samples;
     if (steady_count_ == window && steady_saturation_[steady_next_])
         --steady_saturation_count_;
     steady_measurements_[steady_next_] = measurement;
-    steady_saturation_[steady_next_] = saturated;
-    if (saturated) ++steady_saturation_count_;
+    steady_saturation_[steady_next_] = limited_error;
+    if (limited_error) ++steady_saturation_count_;
     steady_next_ = (steady_next_ + 1U) % window;
     if (steady_count_ < window) ++steady_count_;
     return true;
@@ -509,14 +412,11 @@ StepValidationResult StepResponseValidator::result() const noexcept
     output.sample_count = sample_count_;
     output.error_crossings = error_crossings_;
     output.maximum_overshoot_ratio = maximum_overshoot_ratio_;
-    output.maximum_continuous_saturation_s =
-        static_cast<float>(maximum_saturation_us_) * kMicrosecondsToSeconds;
     const float step = std::fabs(config_.target_output - config_.initial_output);
-    // 最终稳态允许误差取比例门槛、三倍测量噪声和调用方给出的物理死区三者最大值；
-    // 绝对死区只在最终窗口判定使用，不能伪装成 noise 去放宽逐样本振荡检测。
-    output.allowed_steady_state_error = std::max(
-        {kSteadyErrorRatio * step, kNoiseMultiplier * config_.noise,
-         config_.absolute_steady_tolerance});
+    // 稳态目标精度由调用方给定（缺省沿用比例精度），不把近零死区或
+    // 接收机单样本精度叠成另一套容差；振荡计数也使用该验证容差。
+    output.allowed_steady_state_error = config_.absolute_steady_tolerance > 0.0F
+        ? config_.absolute_steady_tolerance : kSteadyErrorRatio * step;
     if (!configured_) return output;
     if (sample_failure_ != CalibrationAlgorithmFailure::None) {
         output.failure = sample_failure_;
@@ -527,7 +427,7 @@ StepValidationResult StepResponseValidator::result() const noexcept
         output.failure = CalibrationAlgorithmFailure::InsufficientSamples;
         return output;
     }
-    // 整个最终窗口都顶在输出边界，即使均值碰巧接近目标也不算可信闭环。
+    // 整个最终窗口持续到顶且误差超标，不能把受限响应判成通过。
     if (steady_saturation_count_ == steady_count_) {
         output.failure = CalibrationAlgorithmFailure::SustainedSaturation;
         return output;
