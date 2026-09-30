@@ -1,5 +1,12 @@
 # 消息契约
 
+AutoCalibrationStatus MESSAGE_VERSION=2增加本会话braking_input_gain候选字段，沿现有制动观测代次/后端停波协议交接给执行层；不增加公开阶段、参数或MAVLink消息。braking_stop_time_s改为首次前向停止时刻，braking_deceleration_m_s2最终来自第二轮验证。全部派生头文件、布局和日志格式由正式Make生成。
+
+校准航向目标：RoverMotionRequest/RoverControlStatus版本均为1。MODE_HEADING_TARGET仅供SOURCE_CALIBRATION使用，heading_target_rad与RTK array_heading_rad同参考系；heading_request_timestamp在一次机动内固定，heading_direction指定初始方向。该模式的归一化轴与SI速度字段均为NaN，不把角度塞入角速度字段；其余模式的新增目标字段保持零。控制反馈回显同一标识及heading_error_rad/heading_result，模式只接受本会话、本次机动的结果。全部消息及Logger派生物经正式生成工具更新。
+
+2026-09-24 自动导航整定观测：auto_calibration_status新增当前整定项、候选值、独立测速标志、横向最大误差(m)、速度RMS(m/s)、jerk RMS(m/s³)。候选在独立测速阶段为m/s，系数确认阶段为对应参数单位；navigation_speed_probe明确区分，不改变validation_error原有路径误差单位。全部从权威.msg生成，不增加私有高频日志流。
+
+- 初探调速使用 auto_calibration_status 的 `BRAKING_SPEED_LIMIT` 子状态，制动轮次和观测计数不推进；rover_control_status 的 `braking_speed_limited` 是控制器接管到模式交还之间的握手证据，独立于尚未就绪的 EKF 速度反馈 valid。两者均从权威 .msg 生成，不增加参数或 MAVLink 消息。
 - **职责：** 维护模块间 Topic、命令、状态、时间戳、单位和有效性字段定义。
 - **禁止事项：** 不在消息定义中访问 HAL 或实现业务逻辑，不随意重命名已经采用的上游字段。
 - **上游 API 保留：** 保留上游消息名称、字段、单位和枚举语义；产品扩展使用明确的 Dima 前缀或独立消息。
@@ -13,7 +20,7 @@
 - `rover_navigation_status` 由 `AutoMode` 发布任务 generation/current/count、控制状态、故障原因、到点状态、路径误差与物理量 setpoint；其 schema、Topic ID、布局和注册表全部由同一 uORB 权威生成链产生。
 - `SOURCE_CALIBRATION` 通过 `rover_motion_request` 支持受限开环与 speed/yaw-rate 闭环，仍严格 one-of；`auto_calibration_request/status`、`rtk_heading_status` 和 `rover_control_status` 都是本地 uORB 合同，不是私有 MAVLink wire 消息。固定圆、事务/验证状态及真实控制反馈供内部安全消费者和 ULog 使用，QGC 不直接解码它们。
 - `sensor_calibration_request.feedback_owner` 的 NONE/QGC/AUTO 枚举从 schema 生成；内部 Level/Cancel 不接管 QGC Sensors 的 `[cal]` 终态。QGC 看到的是标准命令/ACK、STATUSTEXT、参数和 Standard Modes 服务，而不是本地 msg 布局。
-- 一次 Arm 扩展仍是本地合同：`auto_calibration_request` 增加阶段继续请求及参数计数，`auto_calibration_status` 记录授权诊断镜像、冻结速度/输出策略、RAM 已验证阶段和路径字段观测；`rover_control_status` 增加原始反馈与限制器原因。Level 请求/状态记录起始计数与自身写入增量，避免把外部并发改参吞成内部成功；这些字段均由权威 schema 生成，不扩展 MAVLink wire。
+- 一次 Arm 扩展仍是本地合同：`auto_calibration_request` 只承载 Level、Cancel Level、Exit 请求及参数计数，已退役的阶段 Arm/Disarm 常量从权威 schema 删除，现存请求编号与字段布局保持不变。`auto_calibration_status` 记录授权诊断镜像、冻结速度/输出策略、RAM 已验证阶段和路径字段观测；`rover_control_status` 增加原始反馈与限制器原因。Level 请求/状态记录起始计数与自身写入增量，避免把外部并发改参吞成内部成功；这些字段均由权威 schema 生成，不扩展 MAVLink wire。
 - `actuator_output_status` 记录六路 PWM 的 configured/right/left mask、应用脉宽以及 `HARD_SAFE_OFF / DISARMED_NEUTRAL / ACTIVE / RETRY / FAULT` 状态；Commander 只通过该内部 uORB 契约做输出就绪 pre-arm 与故障恢复，不直接依赖 MotorOutput 类，也不新增 MAVLink 线协议。
 - `estimator_gps_status` 固定采用 PX4 v1.17.0 字段合同，并由唯一 EKF2 实例发布完整 GnssChecks 结果；UM982 只发布 `sensor_gps`/`vehicle_gps_position`，不得再维护同 Topic 的简化发布者。
 - `vehicle_imu_status` 固定采用 PX4 v1.17.0 字段合同，承载单 IMU 的 identity、rate/error/clipping、振动、coning、均值/方差和温度；它不声称实现 `SensorsStatusImu` 多实例一致性投票。
