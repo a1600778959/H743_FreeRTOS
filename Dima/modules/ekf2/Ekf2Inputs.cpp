@@ -1,5 +1,7 @@
 #include "Ekf2.hpp"
 
+#include "api/Time.hpp"
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -118,10 +120,14 @@ void Ekf2::update_system_flags(std::uint64_t sample_time_us) noexcept
         return;
     }
 
+    // 状态新鲜度按当前单调时间判断。IMU timestamp_sample 是更早的采样时刻，
+    // 新收到的 vehicle_status 可以晚于它；二者直接比较会把正常 Disarmed
+    // 状态反复判成过期，导致静止约束和地面 GNSS 检查随任务调度抖动。
+    const std::uint64_t now_us = hrt_absolute_time();
     const bool status_fresh =
         have_vehicle_status_ && vehicle_status_.timestamp != 0U &&
-        sample_time_us >= vehicle_status_.timestamp &&
-        sample_time_us - vehicle_status_.timestamp <= 3000000ULL;
+        now_us >= vehicle_status_.timestamp &&
+        now_us - vehicle_status_.timestamp <= 3000000ULL;
     const bool disarmed =
         status_fresh &&
         vehicle_status_.arming_state ==

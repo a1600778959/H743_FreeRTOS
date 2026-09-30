@@ -14,6 +14,7 @@
 - IMU delta angle/delta velocity 保持 FRD/SI 单位，并把 clipping 逐轴传给 Core。
 - UM982 发布 `heading=wrap_pi(raw+pi-GPS_YAW_OFFSET)` 和同一安装 `heading_offset`；Wrapper 原样写入 `gnssSample.yaw/yaw_offset`，不再次扣偏置。
 - Rover 永远发送 `in_air=false`、`is_fixed_wing=false`。只有新鲜且 Disarmed 的 `vehicle_status` 才发送 `at_rest/constant_pos=true`；已武装或状态陈旧时保守视为运动未知，不使用 wheel 或虚构 land detector。
+- `vehicle_status` 的新鲜度使用处理时的单调时钟，Core 标志的时间仍使用 IMU 采样时刻。新状态的发布时间可以晚于当前 IMU 样本，不能因此撤掉静止约束；未来时间戳或超过 3 s 的状态仍按未知运动处理。
 
 ## 融合与生成闭包
 
