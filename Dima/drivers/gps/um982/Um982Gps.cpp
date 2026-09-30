@@ -527,6 +527,9 @@ void Um982Gps::handle_frame(
         last_valid_data_arrival_us_ = arrival_us;
         agrica_new_ = true;
         receiver_measurement = true;
+        // 速度可能晚于同历元航向到达；更新缓存后重新配对，不能把先前
+        // velocity_aligned=false 的快照一直保留到下一条航向帧。
+        publish_heading_status(arrival_us);
         break;
     case Kind::Heading:
         heading_ = frame.heading;
@@ -549,6 +552,11 @@ void Um982Gps::handle_frame(
 
 void Um982Gps::publish_heading_status(std::uint64_t now_us) noexcept
 {
+    // 只重配仍在校准 300 ms 新鲜度窗口内的真实航向；仅收到速度不能生成
+    // 航向观测，也不能复活已超龄或来自上一 UART 会话的航向缓存。
+    if (!sample_is_fresh(now_us, last_heading_arrival_us_, 300000ULL)) {
+        return;
+    }
     const float unavailable = std::numeric_limits<float>::quiet_NaN();
     const bool solution = heading_.solution_computed &&
         std::isfinite(heading_.baseline_m) && heading_.baseline_m > 0.0F &&
@@ -556,9 +564,19 @@ void Um982Gps::publish_heading_status(std::uint64_t now_us) noexcept
         std::isfinite(heading_.heading_stddev_deg) &&
         heading_.heading_stddev_deg > 0.0F;
 
+    // 恢复相邻100ms历元的配对范围；航向发布不再等待两条消息完全同历元。
+    // 无速度配对时照常报告航向，速度字段明确无效，不复用旧有效标志。
+    const auto epoch_difference = static_cast<std::int64_t>(heading_.gps_milliseconds) -
+        static_cast<std::int64_t>(agrica_.gps_milliseconds);
+    const bool paired = heading_.gps_week == agrica_.gps_week &&
+        std::abs(epoch_difference) <= 100 &&
+        sample_is_fresh(now_us, last_agrica_arrival_us_, 200000ULL);
+
     rtk_heading_status_s status{};
     status.timestamp = now_us;
-    status.timestamp_sample = now_us;
+    // timestamp_sample仍是航向的真实到达时间；重配速度不刷新航向年龄。
+    // 两份GPS历元各自保留，消费者不得把它们的差直接当成接收延迟。
+    status.timestamp_sample = last_heading_arrival_us_;
     status.device_id = kGpsDeviceBase |
         static_cast<std::uint32_t>(active_port_ & 0xFF);
     status.parameter_update_instance = parameter_update_instance_;
@@ -577,11 +595,7 @@ void Um982Gps::publish_heading_status(std::uint64_t now_us) noexcept
     status.baseline_m = solution ? heading_.baseline_m : unavailable;
     status.configured_baseline_m = yaw_baseline_m_;
     status.configured_yaw_offset_rad = yaw_offset_rad_;
-    const auto epoch_difference = static_cast<std::int64_t>(heading_.gps_milliseconds) -
-        static_cast<std::int64_t>(agrica_.gps_milliseconds);
-    status.velocity_aligned = heading_.gps_week == agrica_.gps_week &&
-        std::abs(epoch_difference) <= 100 &&
-        sample_is_fresh(now_us, last_agrica_arrival_us_, 200000ULL);
+    status.velocity_aligned = paired;
     status.velocity_north_m_s = status.velocity_aligned ? agrica_.velocity_north_m_s : unavailable;
     status.velocity_east_m_s = status.velocity_aligned ? agrica_.velocity_east_m_s : unavailable;
     status.speed_accuracy_m_s = status.velocity_aligned ? std::hypot(
@@ -728,7 +742,12 @@ void Um982Gps::publish_if_ready(std::uint64_t now_us) noexcept
         ? dima::protocols::um982::Um982Protocol::utc_usec(
               rmc_.date_ddmmyy, rmc_.utc_hhmmss_ms)
         : 0U;
-    output.timestamp_time_relative = 0;
+    // RMC 的 UTC 对应其接收时刻，而非稍后的 GGA 合成发布时间：
+    // timestamp + relative = last_rmc_arrival_us。freshness 已保证差值非负
+    // 且小于辅助帧时限，转换到 int32 安全；无有效 UTC 时不提供相对时间。
+    output.timestamp_time_relative = output.time_utc_usec != 0U
+        ? -static_cast<std::int32_t>(now_us - last_rmc_arrival_us_)
+        : 0;
     output.jamming_state = sensor_gps_s::JAMMING_STATE_UNKNOWN;
     output.spoofing_state = sensor_gps_s::SPOOFING_STATE_UNKNOWN;
     output.authentication_state =
@@ -906,12 +925,15 @@ void Um982Gps::Run()
     if (parameter_subscription_.update()) {
         heading_parameters_pending_ = true;
     }
-    // Armed 期间冻结安装几何；更新事件保留为 pending，Disarmed 后整组应用。
-    // 只有应用成功才推进确认代次；确认不能因收到一次事件而提前成立。
-    if (heading_parameters_pending_ && !armed_.armed() &&
-        refresh_heading_parameters()) {
-        parameter_update_instance_ = parameter_subscription_.get().instance;
-        heading_parameters_pending_ = false;
+    // 普通 Armed 行驶冻结安装几何；组合校准保持 Armed，但已锁存且由后端
+    // 确认停波时允许整组应用。租约阻止应用途中重新启波，不能仅检查一次
+    // Armed/停波标志后失去互斥。应用成功后才推进消费者确认代次。
+    if (heading_parameters_pending_) {
+        dima::platform::ConfigurationUpdateLease lease{armed_};
+        if (lease && refresh_heading_parameters()) {
+            parameter_update_instance_ = parameter_subscription_.get().instance;
+            heading_parameters_pending_ = false;
+        }
     }
     const std::uint64_t now_us = clock_.now_us();
     // 串口分配是运行期可变资源合同；变化时必须先释放 maintenance/UART，清除

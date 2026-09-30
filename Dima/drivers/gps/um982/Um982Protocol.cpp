@@ -285,24 +285,26 @@ bool parse_unicore_header(char *header, std::uint16_t &week,
 bool parse_agrica(char *header, char *data,
                   Um982Protocol::Frame &frame) noexcept
 {
-    // AGRICA 字段位置是 UM982 协议合同：位置/航向状态在 8/9，速度 N/E/U
-    // 在 22..24（索引 21..23），其 1-sigma 在随后三项；单位均为 m/s。
+    // 分号后首字段为 fields[0]。锁定 PX4 unicore.cpp 的 extractAgrica()
+    // 先跳过首字段才令循环 i=0，因此其 i=21..27 对应这里的 fields[22..28]：
+    // 速度大小、N/E/U 分量及各轴 1-sigma，单位均为 m/s。不能直接照搬循环
+    // 下标，否则会把可为负的 U 速度当成标准差并误丢整帧。
     if (!parse_unicore_header(header, frame.agrica.gps_week,
                               frame.agrica.gps_milliseconds)) return false;
     char *fields[72]{};
     const std::size_t count = split(data, ',', fields, 72U);
     std::uint32_t position_type = 0U;
     std::uint32_t heading_status = 0U;
-    if (count <= 27U || !parse_unsigned(fields[8], position_type) ||
+    if (count <= 28U || !parse_unsigned(fields[8], position_type) ||
         !parse_unsigned(fields[9], heading_status) ||
         position_type > UINT8_MAX || heading_status > UINT8_MAX ||
-        !parse_float(fields[21], frame.agrica.speed_m_s) ||
-        !parse_float(fields[22], frame.agrica.velocity_north_m_s) ||
-        !parse_float(fields[23], frame.agrica.velocity_east_m_s) ||
-        !parse_float(fields[24], frame.agrica.velocity_up_m_s) ||
-        !parse_float(fields[25], frame.agrica.velocity_north_stddev_m_s) ||
-        !parse_float(fields[26], frame.agrica.velocity_east_stddev_m_s) ||
-        !parse_float(fields[27], frame.agrica.velocity_up_stddev_m_s) ||
+        !parse_float(fields[22], frame.agrica.speed_m_s) ||
+        !parse_float(fields[23], frame.agrica.velocity_north_m_s) ||
+        !parse_float(fields[24], frame.agrica.velocity_east_m_s) ||
+        !parse_float(fields[25], frame.agrica.velocity_up_m_s) ||
+        !parse_float(fields[26], frame.agrica.velocity_north_stddev_m_s) ||
+        !parse_float(fields[27], frame.agrica.velocity_east_stddev_m_s) ||
+        !parse_float(fields[28], frame.agrica.velocity_up_stddev_m_s) ||
         frame.agrica.speed_m_s < 0.0F ||
         frame.agrica.velocity_north_stddev_m_s < 0.0F ||
         frame.agrica.velocity_east_stddev_m_s < 0.0F ||

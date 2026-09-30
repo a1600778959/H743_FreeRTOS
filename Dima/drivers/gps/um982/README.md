@@ -14,9 +14,11 @@
 - GPS 协议固定为 NMEA/UM982；NMEA frontend 同时解析 UM982 的 CRC32 `AGRICA/UNIAGRICA/UNIHEADINGA` 扩展，不提供重复的协议选择参数。
 - GPS 占用端口时固定使用由 `um982_messages.json` 生成的 `460800 bit/s` 产品合同；`SERIALx_BAUD` 仍是该物理端口脱离 GPS 所有权后的通用配置。驱动保留 UM982 官方八档扫描能力只用于找回已有配置，检测成功后通过受控配置链把接收机和飞控 UART 统一回 460800。
 - `GPS_YAW_OFFSET`：采用 PX4 双天线定义，0..360 deg、顺时针增加；UM982 heading 按 `raw + 180° - offset` 转成车体 yaw。
+- 航向偏置与期望基线通过同一配置租约整组应用：普通 Armed 行驶继续冻结；组合校准保持 Armed 时，必须已锁存并由 PWM 后端确认停波才允许更新。租约阻止应用期间恢复输出，成功后才推进 `rtk_heading_status.parameter_update_instance`，供 RTK 提交和回滚确认。
 
 ## 探测与发布
 
+- RMC 的有效日期/时刻继续发布为 UTC 微秒，`timestamp_time_relative` 使用 RMC 接收时刻减合成消息发布时间，使日志授时不受缓存重用和后续 GGA 发布延迟影响。中国时区仅在日志文件日期及 ULog 时区说明中转换，原始 `sensor_gps.time_utc_usec` 保持 UTC。
 - VERSION 型号识别逐位置匹配固定五字节 `UM982`，复用已有 `strncmp`，不引入通用长子串搜索；保持任意前缀、大小写和 NUL/短输入语义，不收紧接收机响应格式。
 - 首次启动保持 PX4 的数据优先边界，不等待 Disarmed 或维护票据：先试参数目标 baud，再异步扫描 UM982 官方八档，以 CRC/XOR 有效的 GGA/RMC/AGRICA/UNIHEADINGA 锁定实际 baud，并立即发布可用数据。
 - 顶层状态固定为 `等待端口 → 检测 GPS → 读取配置 → 正常运行 / 下发配置 → 回读验证 → 保存配置`。TX-complete、查询 deadline、COM1/2/3 探测和逐条命令索引只是状态内部的非阻塞步骤，不扩张为产品状态。
@@ -24,7 +26,9 @@
 - 配置不合法时才申请 Disarmed、BootHealth 和 appMain-IWDG 共同批准的维护票据。实际 baud 与目标不同时发送 `CONFIG COMn 460800 8 N 1` 并等待 TX-complete 后切换飞控 UART；只对缺失、重复或周期错误的输出执行 `UNLOG COMn <message>`，再按照 `um982_messages.json` 经工具生成的本产品 10 Hz 合同，以 `<message> COMn 0.1` 明确恢复到已识别端口。R1.15 规定 AGRIC 的主动命令为 `AGRICA`，旧 `UNIAGRICA` 仅作为生成的接收兼容别名。修改完成后重新查询 `CONFIG`/`UNILOGLIST`，运行配置完全收敛才发送一次 `SAVECONFIG`；该命令只写 NVM，不会重启接收机，保存 TX 完成后直接沿用当前 UART 会话。
 - `CONFIG`、定向 COM 探测或 `UNILOGLIST` 失败只把配置降级并在 30 秒后重试，不会把已检测到的接收机重新判为 offline。完全收不到 `UNILOGLIST` 时属于“配置未知”，只允许重试只读查询，不能把未知误判成六项全部缺失后执行 `UNLOG/LOG/SAVECONFIG`。若 UM982 COM2/COM3 被持久化为 `RXTYPE=NONE/RTCM` 而不响应命令，固件保留 data-only 工作；必须从接收机 COM1 人工恢复命令输入。
 - 每次 WorkItem 最多处理 2048 字节；达到预算后屏蔽 UART 的即时重复唤醒并强制延迟 1 ms。错误 baud 造成的 UART framing/noise 恢复唤醒被限制为最高 10 Hz，避免 `wq:io` 压住 BootHealth、MAVLink/QGC 和其他低优先级任务。
-- 只发布原始 `sensor_gps` 和 alias `vehicle_gps_position`。GGA 是位置的最低输入，AGRICA 提供完整 NED 速度，缺少 AGRICA 时使用新鲜 RMC 提供水平速度；只有 GGA 时仍发布位置并明确 `vel_ned_valid=false`。标准 GGA `quality=0` 与 RMC `status=V` 即使坐标留空也作为“接收机在线但无定位”接受。没有新鲜 GGA、但仍收到有效 RMC/AGRICA/UNIHEADINGA 时，以最高 2 Hz 发布位置未知的 `NO_FIX` 在线状态，不伪造经纬度；声称有效 fix 却缺失坐标的帧仍被拒绝。
+- 发布原始 `sensor_gps` 和 alias `vehicle_gps_position`，另以 `rtk_heading_status` 提供校准使用的原始基线航向与配对速度。GGA 是位置的最低输入，AGRICA 提供完整 NED 速度，缺少 AGRICA 时使用新鲜 RMC 提供水平速度；只有 GGA 时仍发布位置并明确 `vel_ned_valid=false`。标准 GGA `quality=0` 与 RMC `status=V` 即使坐标留空也作为“接收机在线但无定位”接受。没有新鲜 GGA、但仍收到有效 RMC/AGRICA/UNIHEADINGA 时，以最高 2 Hz 发布位置未知的 `NO_FIX` 在线状态，不伪造经纬度；声称有效 fix 却缺失坐标的帧仍被拒绝。
+- AGRICA 以分号后的首字段为索引 0：速度大小为索引 22，N/E/U 速度为 23..25，各轴标准差为 26..28，至少需要 29 个数据字段。这与锁定上游 `unicore.cpp::extractAgrica()` 跳过首字段后开始计数的实际取值一致；速度分量允许负数，标准差必须非负。
+- 航向与 AGRICA 任一帧到达都会更新RTK状态；恢复同GPS周、历元差不超过100ms、速度到达年龄不超过200ms的配对条件，航向缓存仍须在300ms内。不再等待两帧完全同历元：无配对时照常发布航向，velocity_aligned=false且速度字段为NaN；明确无解/非固定航向也立即发布。timestamp_sample保留航向真实到达时间，速度重配不续航向年龄。制动消费者只保守计龄，不把领先速度外推为未来时间；GPS历元仍用于采样去重和积分。
 - 协议边界校验 N/S 与 E/W、经纬度范围、DOP/标准差、RMC 速度/航向/UTC、GPS 周内毫秒、移动基线长度/航向精度。严格跟随固定 PX4-GPSDrivers：NMEA/Unicore checksum、结构、未知消息和 overflow 静默丢弃，不逐帧打印、不更新测量缓存，也不进入 DataValidator 错误密度；持续收不到有效数据时由 1.3 s timeout 转为 offline。GPGST 空字段按 PX4 保留零初始化值。
 - `estimator_gps_status` 的唯一发布者是 EKF2。fix、卫星数、PDOP、EPH/EPV、速度精度、spoof、静止漂移和速度偏差统一进入 PX4 GnssChecks；UM982 不再维护第二套 simplified health/hysteresis。
 - MAVLink 以 5 Hz 发布原始 `GPS_RAW_INT`，`checks_passed=false` 不遮掉接收机真实 fix，合法 `NO_FIX` 仍保持可见，数据真正超时后才发送 `NO_GPS`。`SYS_STATUS` 的 GPS present/enabled 表示原始接收机曾可见，health 则同时要求原始流新鲜和 EKF checks 通过。
