@@ -235,6 +235,7 @@ bool SdLogWriter::start(const Configuration &configuration) noexcept
      * 会话的 generation=1 当成新文件已经写过 boot_time_utc_us。 */
     pending_boot_utc_us_ = 0U;
     confirmed_boot_utc_us_ = 0U;
+    last_gps_utc_us_ = 0U;
     last_utc_jump_warning_us_ = 0U;
     boot_time_written_generation_ = 0U;
     pending_utc_candidate_ = false;
@@ -350,6 +351,14 @@ void SdLogWriter::destroy_format_reader() noexcept
 
 void SdLogWriter::reset_format_reader() noexcept
 {
+    // Logger 与 uORB 两条正式生成链必须使用同一组长度上限；陈旧合同在编译期
+    // 暴露，不能等到板端写出只有头部的文件后才发现缓存不足。
+    static_assert(sizeof(format_read_buffer_) >
+                      uORB::orb_tokenized_fields_max_length,
+                  "Logger compressed format capacity is stale");
+    static_assert(generated::kFormatBodyCapacity >
+                      uORB::orb_untokenized_fields_max_length,
+                  "Logger expanded format capacity is stale");
     static_assert(sizeof(uORB::MessageFormatReader) <=
                       sizeof(format_reader_storage_),
                   "PX4 MessageFormatReader exceeds static Logger storage");
@@ -357,9 +366,9 @@ void SdLogWriter::reset_format_reader() noexcept
                       alignof(std::max_align_t),
                   "PX4 MessageFormatReader alignment exceeds static storage");
     destroy_format_reader();
-    format_message_ = ulog_message_format_s{};
+    std::memset(format_read_buffer_, 0, sizeof(format_read_buffer_));
     format_reader_ = new (format_reader_storage_) uORB::MessageFormatReader(
-        format_message_.format, sizeof(format_message_.format));
+        format_read_buffer_, sizeof(format_read_buffer_));
 }
 
 void SdLogWriter::reset_session(
@@ -471,9 +480,11 @@ bool SdLogWriter::process_initial_information() noexcept
             }
             result = write_info("char[16] sys_uuid", uuid, 16U);
         } else if (information_step_ == 1U) {
-            const std::int32_t utc_offset_minutes = 0;
-            result = write_info("int32_t time_ref_utc", &utc_offset_minutes,
-                                sizeof(utc_offset_minutes));
+            // PX4 的 time_ref_utc 单位是秒：北京时间为 +28800。UTC 绝对值
+            // 与单调采样时间不加时区，读端按此偏移显示本地时间，避免重复换算。
+            result = write_info("int32_t time_ref_utc",
+                                &dima::platform::kLogUtcOffsetSeconds,
+                                sizeof(dima::platform::kLogUtcOffsetSeconds));
         } else if (utc_confirmed_) {
             result = write_info("uint64_t boot_time_utc_us",
                                 &confirmed_boot_utc_us_,
@@ -589,29 +600,14 @@ SdLogWriter::StepResult SdLogWriter::write_format_group() noexcept
         format_group_ready_ = false;
         return StepResult::Skipped;
     }
-    /* 一份字段定义最多对应多个 Topic alias。先按 PX4 最大 F 结构保守预留整组
-     * 空间，之后所有 alias 要么全部写入，要么在修改 reader buffer 前整体重试。 */
-    if (writer_.available_bytes() <
-        output_aliases * sizeof(ulog_message_format_s)) {
+    // 整组预留输出空间；背压时 reader 和本组状态保持不变，下一轮原样重试。
+    if (writer_.available_bytes() < output_aliases * kFormatMessageCapacity) {
         return StepResult::Blocked;
     }
 
-    unsigned format_length = format_reader_->formatLength();
-    const unsigned leftover_length =
-        format_reader_->moveLeftoverToBufferEnd();
-    const int expanded = uORB::MessageFormatReader::expandMessageFormat(
-        format_message_.format, format_length,
-        sizeof(format_message_.format) - leftover_length);
-    if (expanded < 0) {
-        return StepResult::Failed;
-    }
-    format_length = static_cast<unsigned>(expanded);
-
-    int last_name_length = 0;
+    const unsigned tokenized_length = format_reader_->formatLength();
     for (const orb_id_size_t id : format_reader_->orbIDs()) {
         if (!topic_enabled(id)) {
-            /* 同组中重复 payload 或当前 Profile 未选 Topic 不写 F/A/D；
-             * 保留项和采样策略都来自生成合同。 */
             continue;
         }
         const orb_metadata *metadata = get_orb_meta(static_cast<ORB_ID>(id));
@@ -619,41 +615,42 @@ SdLogWriter::StepResult SdLogWriter::write_format_group() noexcept
             return StepResult::Failed;
         }
 
-        const int name_length =
-            static_cast<int>(std::strlen(metadata->o_name)) + 1;
-        if (format_length + name_length - last_name_length + 1U >
-            sizeof(format_message_.format) - leftover_length) {
+        const std::size_t name_length = std::strlen(metadata->o_name);
+        const std::size_t fields_offset = ULOG_MSG_HEADER_LEN + name_length + 1U;
+        if (fields_offset >= kFormatMessageCapacity ||
+            tokenized_length + 1U > kFormatMessageCapacity - fields_offset) {
             return StepResult::Failed;
         }
-        if (last_name_length != name_length) {
-            std::memmove(format_message_.format + name_length,
-                         format_message_.format + last_name_length,
-                         format_length + 1U - last_name_length);
-            format_message_.format[name_length - 1] = ':';
-            format_length = static_cast<unsigned>(
-                static_cast<int>(format_length) + name_length -
-                last_name_length);
-            last_name_length = name_length;
-        }
-        std::memcpy(format_message_.format, metadata->o_name,
-                    static_cast<std::size_t>(name_length - 1));
 
-        const std::size_t message_size =
-            sizeof(format_message_) - sizeof(format_message_.format) +
-            format_length;
-        format_message_.msg_size = static_cast<std::uint16_t>(
-            message_size - ULOG_MSG_HEADER_LEN);
-        format_message_.msg_type =
-            static_cast<std::uint8_t>(ULogMessageType::FORMAT);
-        if (!writer_.write_message(&format_message_, message_size)) {
-            /* 空间已在整组写入前预留；此处失败只可能是 SD 会话在发布期间
-             * 被撤销。等待新 generation 从 header 重建，不能把热插拔误判成
-             * 确定性的字段格式错误并永久停掉 Logger。 */
+        // 解码缓存保留压缩字段及下一组余留字节；只在独立输出缓存中展开。
+        // F 正文长度由生成的最大字段长度和 Topic 名称上限决定，不受 PX4
+        // ulog_message_format_s 的固定 1600 字节工作数组限制。复用数据缓存，
+        // 不增加运行期堆分配，也不手写字段列表或修改生成的 wire 结构。
+        std::memcpy(message_buffer_ + ULOG_MSG_HEADER_LEN,
+                    metadata->o_name, name_length);
+        message_buffer_[fields_offset - 1U] = ':';
+        auto *fields = reinterpret_cast<char *>(message_buffer_ + fields_offset);
+        std::memcpy(fields, format_read_buffer_, tokenized_length + 1U);
+        const int expanded = uORB::MessageFormatReader::expandMessageFormat(
+            fields, tokenized_length,
+            static_cast<unsigned>(kFormatMessageCapacity - fields_offset));
+        if (expanded < 0) {
+            return StepResult::Failed;
+        }
+
+        const std::size_t message_size = fields_offset +
+            static_cast<std::size_t>(expanded);
+        ulog_message_header_s header{};
+        header.msg_size = static_cast<std::uint16_t>(message_size - ULOG_MSG_HEADER_LEN);
+        header.msg_type = static_cast<std::uint8_t>(ULogMessageType::FORMAT);
+        std::memcpy(message_buffer_, &header, sizeof(header));
+        if (!writer_.write_message(message_buffer_, message_size)) {
+            // 会话撤销时不得推进 reader；新 generation 会从头重建文件。
             return StepResult::Blocked;
         }
     }
 
-    format_reader_->clearFormatAndRestoreLeftover();
+    format_reader_->clearFormatFromBuffer();
     format_group_ready_ = false;
     return StepResult::Emitted;
 }
@@ -1248,10 +1245,15 @@ void SdLogWriter::process_gps_time(std::uint64_t now_us) noexcept
 {
     for (std::size_t count = 0U; count < 4U && gps_subscription_.update();
          ++count) {
+        const sensor_gps_s &gps = gps_subscription_.get();
         std::uint64_t candidate = 0U;
-        if (!gps_candidate(gps_subscription_.get(), now_us, candidate)) {
+        if (!gps_candidate(gps, now_us, candidate) ||
+            gps.time_utc_usec == last_gps_utc_us_) {
             continue;
         }
+        // 合成位置消息可能重复携带同一条 RMC；两点确认必须来自不同 UTC 历元，
+        // 不能把缓存重发当作第二次授时证据。
+        last_gps_utc_us_ = gps.time_utc_usec;
 
         if (utc_confirmed_) {
             const std::uint64_t difference =
@@ -1292,13 +1294,15 @@ void SdLogWriter::process_gps_time(std::uint64_t now_us) noexcept
 
 void SdLogWriter::Run()
 {
-    if (!running_ || stream_failed_ || !recording_intent_) {
+    if (!running_ || stream_failed_) {
         return;
     }
 
     const std::uint64_t now = hrt_absolute_time();
+    // 等待首次解锁期间也确认时间，只更新 RAM；开始记录时文件即可使用已知
+    // 日期。没有有效授时时仍按原模式记录，不因等待定位而丢失启动/解锁日志。
     process_gps_time(now);
-    if (!writer_.ready()) {
+    if (!recording_intent_ || !writer_.ready()) {
         return;
     }
 

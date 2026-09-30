@@ -335,7 +335,7 @@ void LogWriter::handle_storage_failure(int error,
     accepting_.store(false);
     if (error == -ENOSPC && store_.log_open()) {
         /* 先封住 producer，再逐步缩小写块，把当前已分配 FAT 簇尚可容纳的
-         * Ring 前缀尽量写完。一次新分配会被后端限制在 50 MiB 停止线之上，
+         * Ring 前缀尽量写完。一次新分配会被后端限制在 10 MiB 停止线之上，
          * 因此这里只丢弃确实无法在空间合同内落盘的尾部。 */
         std::uint32_t attempt = kWriteChunkBytes;
         while (pending_bytes() != 0U) {

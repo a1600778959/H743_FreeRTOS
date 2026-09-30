@@ -787,7 +787,10 @@ extern "C" DRESULT disk_ioctl(BYTE drive, BYTE command_id, void *buffer)
     return drive == 0U ? port().control(command_id, buffer) : RES_PARERR;
 }
 
-extern "C" bool dima_sdmmc_get_io_stats(DimaSdIoStats *statistics)
+// 只读诊断合同：固件内无调用者，专供验证器/调试器读取；LTO 下必须显式
+// used 才不会被当作死码内部化移除（ELF 验证器要求该符号强链接在位）。
+extern "C" bool __attribute__((used))
+dima_sdmmc_get_io_stats(DimaSdIoStats *statistics)
 {
     if (statistics == nullptr) return false;
     port().snapshot(*statistics);

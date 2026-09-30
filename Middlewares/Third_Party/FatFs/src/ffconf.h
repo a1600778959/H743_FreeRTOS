@@ -49,8 +49,8 @@
 #define	_USE_EXPAND		0
 /* 0: Disable f_expand function */
 
-#define _USE_CHMOD		0
-/* 0: Disable attribute manipulation */
+#define _USE_CHMOD		1
+/* 启用 f_utime，补齐授时晚于日志创建时的修改日期。 */
 
 #define _USE_LABEL		0
 /* 0: Disable volume label functions */
@@ -108,11 +108,11 @@
 #define _FS_EXFAT	0
 /* 0: Disable exFAT */
 
-#define _FS_NORTC	1
+#define _FS_NORTC	0
 #define _NORTC_MON	1
 #define _NORTC_MDAY	1
 #define _NORTC_YEAR	2026
-/* No RTC available yet; fixed timestamp for file operations */
+/* get_fattime 从已确认 UTC 映射和单调时钟生成北京时间，无须硬件 RTC。 */
 
 #define	_FS_LOCK	0
 /* FatFsFileStore owns all FIL objects and serializes every physical call. */

@@ -5,6 +5,9 @@
 
 namespace dima::platform {
 
+// 中国标准时间固定为 UTC+8；FAT 本地日期与 ULog 时区说明共用秒单位偏移。
+inline constexpr std::int32_t kLogUtcOffsetSeconds = 8 * 60 * 60;
+
 /**
  * SD 日志文件 capability。
  *
@@ -55,7 +58,9 @@ public:
     virtual int storage_information(StorageInformation &information) noexcept = 0;
 
     /**
-     * 创建一个全新的 sessNNN/log100.ulg 会话。-EAGAIN 表示恢复或回收状态机
+     * 创建一个全新的 sessNNN 会话，ULog 文件按会话开始时刻的北京时间
+     * “月日时分”命名（如 09181430.ulg）；授时无效时退回旧版固定名
+     * log100.ulg，且不做会话中途改名。-EAGAIN 表示恢复或回收状态机
      * 已推进一步但尚未完成；调用方应在 storage worker 上尽快重试，而不能把
      * 它当作拔卡故障进入三秒退避。
      */

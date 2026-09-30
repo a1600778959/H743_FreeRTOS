@@ -129,7 +129,7 @@ topics:
     profiles: {GeneralRover: 20, RoverSystemIdentification: 50}
   rover_motion_request:
     disposition: record
-    profiles: {GeneralRover: 20, RoverSystemIdentification: 50}
+    profiles: {GeneralRover: 20, RoverSystemIdentification: 100}
   rover_control_status:
     disposition: record
     profiles: {GeneralRover: 20, RoverSystemIdentification: 100}

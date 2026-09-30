@@ -11,15 +11,18 @@
 - Logger 只读取一次重启参数快照：`SDLOG_MODE` 控制四种会话生命周期，`SDLOG_PROFILE` 合并通用 Rover、EKF2 回放和系统辨识采样策略，`SDLOG_DIRS_MAX` 给出包含当前会话的有限目录上限。三项定义只存在于 `module_logger.yaml`，QGC Metadata 与 C++ 合同均由正式参数工具生成。
 - 生成的 Topic 策略只保存运行期需要的分类、逐 Profile 索引和停止刷新标志；相同 kind/interval 共用只读采样表，间隔仍为完整微秒值，不做量化或运行期合并。Topic 名称/ID 继续直接使用 uORB metadata，回放注册继续使用独立生成索引，不保存无人读取的副本。
 - `SdLogWriter` producer 在 `wq:lp_default` 每 5 ms 有界扫描生成的 Topic catalog；`mavlink_log` 只映射为 `L`，`parameter_update` 只触发 `P/Q`，普通实例首次写 `A`、后续按 `o_size_no_padding` 写 `D`。启动定义段写 header/Flag Bits、硬件 UID、自动生成的 `F`、完整生成参数目录的 `P` 以及 current/system default `Q`，Active 段写 `L/O`、变化参数 `P`，并每 500 ms 写 `S` sync marker。
-- 当前 Profile 没有选中任何别名的格式组，在完整解码后使用上游 `clearFormatFromBuffer()` 跳过字符串展开；保留下一组剩余字节与单轮解码预算。有输出的组仍整体预留空间，并在背压时重试同一组。
+- Logger 正式生成工具从 uORB 生成的最大压缩/展开字段长度和 Topic 名称推导格式缓存容量；不把上游 `ulog_message_format_s::format[1600]` 当作 ULog 协议上限。解码缓存保留下一组余留字节，独立输出缓存展开 `name:fields`，避免长消息在 Definitions 阶段停止整份日志。容量超过 ULog uint16 长度边界时生成失败。
+- 当前 Profile 没有选中任何别名的格式组，在完整解码后使用上游 `clearFormatFromBuffer()` 跳过字符串展开；保留下一组剩余字节与单轮解码预算。有输出的组仍整体预留空间，并在背压时重试同一组，成功后同样清除原始压缩格式。
 - 普通 Topic 发送共用结果处理：固定频率通过原有时间门禁后最多写一条最新样本，源频率仍按队列深度及每轮预算逐 generation 排空。停止边沿仍取最新状态，Blocked 重试原 slot，dropout 与失败处理不改变。
 - 参数 `P/Q` 写入共用 key 长度校验；默认值相同只发合并类型的单条 `Q`，不同默认值按 setup 再 system 写入。保留双记录空间预留、与当前值相同则省略及遇背压立即重试的规则。
 - `P/Q` key 与硬件 UID 的纯字符串/整数格式化复用现有 `dima::format::format_to`，保留返回长度、截断拒绝、补零、大写十六进制和末尾 NUL；不再为两处缓冲格式化引入 newlib 的第二套 formatter。ULog 记录顺序、路由、过滤和背压不变，stdout/setvbuf 与 newlib 链接策略没有改动。
 - `LogWriter` consumer 独占 `wq:storage`，使用固定 64 KiB SPSC 字节 Ring，每次最多向 FatFs 提交 8192 bytes，并每 1 s 执行 `f_sync`；活动写入与关闭前的 UTC 侧车更新共用代次确认路径，写入失败不推进确认代次。producer 不调用任何 FatFs/SDMMC API；Ring 满时写标准 `O` dropout，而不是静默拼接损坏流。
 - producer/consumer 的立即唤醒与 uORB 回调必须保留各自的 5 ms/20 ms 周期。否则开机记录时 producer 可能先于文件创建执行并返回，consumer 只创建 0-byte 文件后也停止，且没有 I/O 错误可报告；文件缺少 ULog magic 时不会进入 QGC 列表。保留周期后，等待文件、Ring 暂空以及同步/重试分支都能继续推进。
 - 每个新介质/文件都推进 session generation，清空旧 Ring、Topic generation 与 message ID，并从 ULog header 全量重建。普通介质失败在 Mode 仍有记录意图时按 3 s 重试；低空间暂停按 60 s 复查，只停止 SD 副本，不影响实时 STATUSTEXT/Event。
-- `sessNNN/log100.ulg` 使用最多三条 64-byte CRC `meta.bin` 记录保存全局顺序、硬件 UID、关闭/恢复状态、最终文件大小/CRC 和可选 GPS UTC。恢复、`sessNNN -> delNNN` 删除及目录上限均由 `wq:storage` 分步推进。空间策略对照 PX4 v1.17 `logger/util.cpp::check_free_space`：回收目标为 `min(容量×10%, 300 MiB)`，停止记录门限独立为 50 MiB；本地小卷将回收目标抬到至少 50 MiB，以保证先回收再停写。无可删历史时允许使用回收目标与停止门限之间的空间。
-- 写入按下一块新增 FAT 簇提前判断；触线前先校正实际空闲计数、每轮至多回收一个会话并返回 `-EAGAIN`，consumer 保留 Ring 原字节重试。新建会话先预留 sess/sidecar/父目录扩展的三簇预算，创建后再次校正。只有无安全候选且下一次分配会突破 50 MiB 停止线时才因空间暂停。告警带实际 free/total MiB；ENOSPC 也可能表示受保护目录占满名额，不能仅凭提示判断卡的标称容量。
+- `sessNNN/MMDDHHMM.ulg`（北京时间“月日时分”，如 `09181430.ulg`）使用最多三条 64-byte CRC `meta.bin` 记录保存全局顺序、硬件 UID、关闭/恢复状态、最终文件大小/CRC 和可选 GPS UTC；授时无效的新会话退回旧版固定名 `log100.ulg`，且不做会话中途改名，扫描/下载对两种命名兼容。恢复、`sessNNN -> delNNN` 删除及目录上限均由 `wq:storage` 分步推进。空间策略：停止线 10 MiB，只为参数/任务/DroneCan 三代事务和未来固件文件保留最小空闲；空闲 150 MiB 时日志可写到约 140 MiB。空闲触线才回收最旧已关闭会话（滚动窗口），触线前不因空间预防性删除历史；无安全候选且下一分配会跌破停止线时才停写。
+- RTK 的 RMC UTC 通过现有 `sensor_gps` 时间字段授时；不同 UTC 历元的两份新鲜样本确认启动映射，等待解锁期间也提前确认。ULog 的 `time_ref_utc` 按 PX4 秒单位写入 `28800`（中国标准时间 UTC+8）；`boot_time_utc_us`、Topic 单调时间和 MAVLink `LOG_ENTRY.time_utc` 保持原有单位及 UTC 语义，不重复加时区。
+- SD 的 FatFs 时间回调使用已确认 UTC 映射加单调时钟，再转换成北京时间；正常新建文件的创建/修改日期均由该回调生成。冷启动未授时时继续记录，以 FAT 最早合法日期 `1980-01-01` 占位；授时后补齐当前文件和会话目录的修改日期、ULog 启动 UTC 及 sidecar。FatFs 标准 `f_utime` 不修改创建日期，因此授时前已创建文件的准确起始时刻以 sidecar 为准；没有同次上电时间证据的历史文件不回填。FAT 修改时间精度为 2 秒，确认后短时失联仍由单调时钟续走。
+- 写入按下一块新增 FAT 簇提前判断；触线前先校正实际空闲计数、每轮至多回收一个会话并返回 `-EAGAIN`，consumer 保留 Ring 原字节重试。新建会话先预留 sess/sidecar/父目录扩展的三簇预算，创建后再次校正。只有无安全候选且下一次分配会突破 10 MiB 停止线时才因空间暂停。告警带实际 free/total MiB；ENOSPC 也可能表示受保护目录占满名额，不能仅凭提示判断卡的标称容量。
 - 未知文件、当前 writer 和仍在传输的 QGC reader 不自动删除。正常下载完成不依赖地面站发送 `LOG_REQUEST_END`：reader 在请求区间完成后保留 5 s 补传窗口，随后由 `wq:storage` 关闭并解除回收保护；响应 Ring 的独立字节副本不受关闭影响。
 - H743 板没有 card-detect GPIO，无法证明“物理卡在位”。已挂载会话通过最长 500 ms 的 `CTRL_SYNC` 主动命令确认“最近一次探测可用”；失败立即撤销全部 FIL/DIR 与挂载，下一次重试执行完整 SDMMC/FatFs 初始化。
 - sink 不存在或 uORB 发布失败时只推进 `sink_dropped_records`；Critical Event 仍由独立 Event Ring 和故障锁存保存。

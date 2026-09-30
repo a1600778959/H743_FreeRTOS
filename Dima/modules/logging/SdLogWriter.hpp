@@ -116,8 +116,11 @@ private:
     static constexpr std::uint16_t kInvalidMessageId = UINT16_MAX;
     static constexpr std::size_t kCatalogSlots =
         ORB_TOPICS_COUNT * uORB::kMaximumInstances;
+    static constexpr std::size_t kFormatMessageCapacity =
+        ULOG_MSG_HEADER_LEN + generated::kFormatBodyCapacity;
     static constexpr std::size_t kMessageBufferSize =
-        sizeof(ulog_message_format_s);
+        kFormatMessageCapacity > sizeof(ulog_message_format_s)
+            ? kFormatMessageCapacity : sizeof(ulog_message_format_s);
     static constexpr std::size_t kFormatReaderStorageSize = 512U;
 
     bool validate_catalog() const noexcept;
@@ -176,7 +179,7 @@ private:
     alignas(std::max_align_t)
         std::uint8_t format_reader_storage_[kFormatReaderStorageSize]{};
     uORB::MessageFormatReader *format_reader_{nullptr};
-    ulog_message_format_s format_message_{};
+    char format_read_buffer_[generated::kFormatReadBufferSize]{};
     alignas(8) std::uint8_t message_buffer_[kMessageBufferSize]{};
     std::uint64_t topic_generations_[kCatalogSlots]{};
     std::uint64_t last_topic_write_us_[kCatalogSlots]{};
@@ -194,6 +197,7 @@ private:
     std::uint64_t hardware_uid_{0U};
     std::uint64_t pending_boot_utc_us_{0U};
     std::uint64_t confirmed_boot_utc_us_{0U};
+    std::uint64_t last_gps_utc_us_{0U};
     std::uint64_t last_utc_jump_warning_us_{0U};
     std::uint32_t boot_time_written_generation_{0U};
     SessionPhase phase_{SessionPhase::Header};

@@ -508,9 +508,33 @@ def merged_sampling(entry: dict[str, Any], profile_mask: int) -> tuple[str, int]
     return "FixedRate", 1_000_000 // frequency
 
 
+def format_buffer_capacities(topics_header: pathlib.Path, topics: list[Topic]) -> tuple[int, int]:
+    """从正式 uORB 生成上限推导缓存，不把上游 1600 字节数组当作协议上限。"""
+    fields_header = topics_header.with_name("uORBMessageFieldsGenerated.hpp")
+    text = fields_header.read_text(encoding="utf-8")
+
+    def bound(name: str) -> int:
+        match = re.search(r"\b" + re.escape(name) + r"\s*=\s*([0-9]+)\s*;", text)
+        if match is None:
+            raise ContractError(f"missing generated uORB format bound: {name}")
+        return int(match.group(1))
+
+    # 压缩格式组含两个 uint8 计数、uint16 Topic/依赖 ID 和末尾 NUL。
+    read_capacity = (bound("orb_tokenized_fields_max_length") + 3 +
+                     2 * (bound("orb_compressed_max_num_orb_ids") +
+                          bound("orb_compressed_max_num_orb_id_dependencies")))
+    # F 的正文是 name:fields，缓存额外保留 NUL，但写文件时不包含 NUL。
+    body_capacity = (max(len(topic.name.encode("ascii")) for topic in topics) +
+                     1 + bound("orb_untokenized_fields_max_length") + 1)
+    if body_capacity > 65535:
+        raise ContractError("uORB format exceeds ULog uint16 message size")
+    return read_capacity, body_capacity
+
+
 def render_logger_header(
     topics: list[Topic], entries: dict[str, dict[str, Any]],
     parameter_contracts: dict[str, dict[str, Any]],
+    format_capacities: tuple[int, int],
 ) -> bytes:
     mode_rows = [f"    {name} = {value}," for name, value in EXPECTED_MODES.items()]
     profile_rows = [
@@ -587,6 +611,10 @@ def render_logger_header(
         "#include <cstdint>",
         "",
         "namespace dima::modules::logging::generated {",
+        "",
+        "// 缓存上限来自正式 uORB 格式生成物；随消息字段变化自动更新。",
+        f"inline constexpr std::size_t kFormatReadBufferSize = {format_capacities[0]}U;",
+        f"inline constexpr std::size_t kFormatBodyCapacity = {format_capacities[1]}U;",
         "",
         "enum class LogMode : std::int32_t {",
         *mode_rows,
@@ -841,6 +869,8 @@ def canonical_input_hashes(
         "module_logger.yaml": sha256_file(arguments.parameter_source),
         "parameters.json": sha256_file(arguments.parameters),
         "uORBTopics.hpp": sha256_file(arguments.uorb_topics),
+        "uORBMessageFieldsGenerated.hpp": sha256_file(
+            arguments.uorb_topics.with_name("uORBMessageFieldsGenerated.hpp")),
         "px4_source_manifest.json": sha256_file(arguments.source_manifest),
         "px4_messages.h": sha256_file(arguments.ulog_source),
     }
@@ -893,7 +923,9 @@ def generate(arguments: argparse.Namespace) -> None:
         parameter_source_names,
     )
 
-    logger_header = render_logger_header(topics, entries, parameter_contracts)
+    logger_header = render_logger_header(
+        topics, entries, parameter_contracts,
+        format_buffer_capacities(arguments.uorb_topics, topics))
     sidecar_header = render_sidecar_header(sidecar)
     outputs: dict[str, bytes] = {
         "logger_contract.hpp": logger_header,
