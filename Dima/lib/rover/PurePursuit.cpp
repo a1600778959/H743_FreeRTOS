@@ -175,6 +175,7 @@ PurePursuitOutput PurePursuit::update(
     const float distance_to_waypoint = norm(vehicle_to_target);
     const float bearing_to_waypoint = bearing(vehicle_to_target);
     float target_bearing = bearing_to_waypoint;
+    bool lookahead_active = false;
 
     if (distance_to_waypoint < lookahead_distance ||
         path_length < FLT_EPSILON) {
@@ -203,6 +204,7 @@ PurePursuitOutput PurePursuit::update(
             target_bearing = bearing(vehicle_to_path);
         }
     } else {
+        lookahead_active = true;
         // 常规 Pure Pursuit：路径到车辆的垂足与前视圆交点构成直角三角形，
         // sqrt(L^2-e_ct^2) 是沿路径向前的距离。max 防止浮点舍入产生负根号。
         const float radicand = std::fmax(
@@ -222,7 +224,7 @@ PurePursuitOutput PurePursuit::update(
         return {};
     }
     return {target_bearing, lookahead_distance, crosstrack_error,
-            distance_to_waypoint, bearing_to_waypoint, true};
+            distance_to_waypoint, bearing_to_waypoint, true, lookahead_active};
 }
 
 } // namespace dima::lib::rover

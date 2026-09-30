@@ -31,6 +31,7 @@
 
 #include "RoverControl.hpp"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 
@@ -80,11 +81,10 @@ float slew_linear(float state, float target, float increasing_rate,
     const float candidate = state +
         clamp(target - state, -maximum_change, maximum_change);
 
-    // 测量值已经更接近目标时直接跟随目标，避免限速状态落在真实车辆之后，
-    // 否则控制器可能因“追赶过期 setpoint”产生不必要的反向输出。
-    return std::fabs(candidate - measured) > std::fabs(target - measured)
-               ? target
-               : candidate;
+    // 实测进度超过本拍斜坡时跟随实测值，不越级跳到最终目标。将跟随值
+    // 限在原状态与目标之间：已越过目标时仍以目标纠偏，不追随过冲扩大设定。
+    const float tracked = clamp(measured, std::min(state, target), std::max(state, target));
+    return target >= state ? std::max(candidate, tracked) : std::min(candidate, tracked);
 }
 
 float conditional_pi(float error, float feedforward, float proportional_gain,
@@ -128,14 +128,19 @@ bool valid_speed_config(const SpeedControlConfig &config) noexcept
 
 bool valid_yaw_rate_config(const YawRateControlConfig &config) noexcept
 {
+    // 与 PX4 rateControl 一致：前馈模型尚未建立时允许已有反馈增益工作，
+    // 不伪造满油门速度。前馈与反馈都不可用的配置仍必须拒绝。
+    const bool feedforward_available = config.wheel_track_m > FLT_EPSILON &&
+        config.speed_at_full_throttle_m_s > FLT_EPSILON;
     return finite(config.proportional_gain) &&
            config.proportional_gain >= 0.0F &&
            finite(config.integral_gain) && config.integral_gain >= 0.0F &&
            finite(config.yaw_rate_correction) &&
            config.yaw_rate_correction > 0.0F &&
-           finite(config.wheel_track_m) && config.wheel_track_m > 0.0F &&
+           finite(config.wheel_track_m) && config.wheel_track_m >= 0.0F &&
            finite(config.speed_at_full_throttle_m_s) &&
-           config.speed_at_full_throttle_m_s > FLT_EPSILON &&
+           config.speed_at_full_throttle_m_s >= 0.0F &&
+           (feedforward_available || config.proportional_gain > 0.0F || config.integral_gain > 0.0F) &&
            finite(config.yaw_rate_limit_rad_s) &&
            config.yaw_rate_limit_rad_s > 0.0F &&
            finite(config.yaw_acceleration_limit_rad_s2) &&
@@ -312,10 +317,12 @@ PiControlOutput YawRateController::update(
 
     // 差速运动学：左右轮半速度差 delta_v = yaw_rate*track/2；再除以
     // 满油门速度得到归一化 steering，CORR 补偿滑移与轮胎摩擦。
-    const float feedforward =
-        adjusted_setpoint_ * config_.wheel_track_m *
-        config_.yaw_rate_correction /
-        (2.0F * config_.speed_at_full_throttle_m_s);
+    // 零模型仅关闭前馈，反馈仍复用同一 PI；禁止用零速度作分母。
+    const float feedforward = config_.wheel_track_m > FLT_EPSILON &&
+        config_.speed_at_full_throttle_m_s > FLT_EPSILON
+        ? adjusted_setpoint_ * config_.wheel_track_m * config_.yaw_rate_correction /
+            (2.0F * config_.speed_at_full_throttle_m_s)
+        : 0.0F;
     const float error = adjusted_setpoint_ - measured;
     const float output = conditional_pi(
         error, feedforward, config_.proportional_gain,

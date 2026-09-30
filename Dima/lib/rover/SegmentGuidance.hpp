@@ -25,6 +25,19 @@ struct SegmentGuidanceOutput {
     bool valid{false};
 };
 
+// 从AutoMode提取的无I/O到达策略；任务推进仍由各自owner执行。
+float segment_arrival_speed(Position2f start, Position2f target, Position2f next,
+    bool final_waypoint, float cruise_speed, float maximum_speed,
+    float turn_threshold, float reduction_gain) noexcept;
+
+struct WaypointProgress {
+    bool hold{};
+    bool ready{};
+};
+WaypointProgress update_waypoint_progress(bool inside, bool final_waypoint,
+    float arrival_speed, float measured_speed, float stopped_threshold,
+    bool &arrival_latched) noexcept;
+
 // 复用调用者已配置的控制器及其连续状态，不复制控制核，也不推进 Mission。
 // 只有 valid 时才能消费物理设定；失效后的安全停机/复位由各模式入口负责。
 SegmentGuidanceOutput update_segment(PurePursuit &pursuit,

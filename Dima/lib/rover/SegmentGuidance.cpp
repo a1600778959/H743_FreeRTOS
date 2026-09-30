@@ -2,8 +2,42 @@
 #include "SegmentGuidance.hpp"
 
 #include <cmath>
+#include <cfloat>
 
 namespace dima::lib::rover {
+
+float segment_arrival_speed(Position2f start, Position2f target, Position2f next,
+    bool final_waypoint, float cruise_speed, float maximum_speed,
+    float turn_threshold, float reduction_gain) noexcept
+{
+    if (final_waypoint) return 0.0F;
+    const float incoming = std::hypot(target.north_m - start.north_m, target.east_m - start.east_m);
+    const float outgoing = std::hypot(next.north_m - target.north_m, next.east_m - target.east_m);
+    if (!std::isfinite(incoming) || !std::isfinite(outgoing)) return NAN;
+    if (incoming <= FLT_EPSILON || outgoing <= FLT_EPSILON) return 0.0F;
+    constexpr float pi = 3.14159265358979323846F;
+    const float bearing_delta = std::atan2(next.east_m - target.east_m, next.north_m - target.north_m) -
+        std::atan2(target.east_m - start.east_m, target.north_m - start.north_m);
+    float angle = std::fmod(bearing_delta + pi, 2.0F * pi);
+    if (angle < 0.0F) angle += 2.0F * pi;
+    angle = std::fabs(angle - pi);
+    if (!std::isfinite(angle)) return NAN;
+    // 原生产规则：大转角停车，小转角按同一降速函数带速通过。
+    if (angle > turn_threshold) return 0.0F;
+    return std::fmax(0.0F, reduce_speed_for_heading_error(
+        cruise_speed, angle, maximum_speed, reduction_gain));
+}
+
+WaypointProgress update_waypoint_progress(bool inside, bool final_waypoint,
+    float arrival_speed, float measured_speed, float stopped_threshold,
+    bool &arrival_latched) noexcept
+{
+    // 首次进入到达半径即锁存，抖出半径不重新加速；最后点/停车点须实测停稳。
+    arrival_latched = arrival_latched || inside;
+    const bool stop = final_waypoint || arrival_speed <= stopped_threshold;
+    return {arrival_latched && stop,
+        arrival_latched && (!stop || std::fabs(measured_speed) <= stopped_threshold)};
+}
 
 SegmentGuidanceOutput update_segment(PurePursuit &pursuit,
                                       HeadingController &heading,

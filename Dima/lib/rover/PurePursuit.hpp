@@ -51,6 +51,7 @@ struct PurePursuitOutput {
     float distance_to_waypoint_m;
     float bearing_to_waypoint_rad;
     bool valid;
+    bool lookahead_active{false}; // 本拍确实使用前视圆交点，供观测判定参数是否生效。
 };
 
 /**

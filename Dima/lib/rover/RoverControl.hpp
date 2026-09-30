@@ -140,7 +140,7 @@ private:
     bool initialized_{false};
 };
 
-/** 带差速运动学前馈和条件积分反饱和的 yaw-rate PI。 */
+/** 共用 yaw-rate PI：有模型时叠加差速前馈；无模型时允许仅反馈，带条件积分反饱和。 */
 class YawRateController {
 public:
     bool configure(const YawRateControlConfig &config) noexcept;

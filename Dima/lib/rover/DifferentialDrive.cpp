@@ -161,6 +161,8 @@ float DifferentialDrive::shape_motor(float command) const noexcept
     // 直接退出，MIN 不能令零输入自行起转。E 是本项目必须保留的轮端包络：
     // q=MIN/E+(1-MIN/E)*|u|，output=sign(u)*E*expo(q)。E=1 时与 APM
     // 百分比换算后的公式一致；E<1 时仍保证顶端为 E，不扩大校准安全包络。
+    // 校准只跳过 Manual 入口的正向地板；此处仍对所有来源应用一次 MIN，
+    // 避免重复抬高小请求，也保证校准所得映射适用于同一电机整形链。
     const float minimum_ratio = config_.throttle_min / config_.throttle_max;
     const float compensated = minimum_ratio + (1.0F - minimum_ratio) * std::fabs(bounded);
     const float magnitude = config_.throttle_max * expo_curve(compensated, config_.throttle_expo);
@@ -196,8 +198,18 @@ DifferentialDriveOutput DifferentialDrive::update(
     float longitudinal, float steering, bool manual_source, bool armed,
     std::uint64_t now_us, float dt_s) noexcept
 {
+    return update(longitudinal, steering, manual_source, armed, now_us, dt_s,
+                  true);
+}
+
+DifferentialDriveOutput DifferentialDrive::update(
+    float longitudinal, float steering, bool manual_source, bool armed,
+    std::uint64_t now_us, float dt_s, bool manual_throttle_floor, Purpose purpose) noexcept
+{
+    const bool braking = purpose == Purpose::Brake;
     if (!configured_ || !armed || !finite(longitudinal) ||
-        !finite(steering) || !finite(dt_s) || dt_s <= 0.0F || dt_s > 0.05F) {
+        !finite(steering) || !finite(dt_s) || dt_s <= 0.0F || dt_s > 0.05F ||
+        (braking && (longitudinal > 0.0F || steering != 0.0F))) {
         reset();
         return {};
     }
@@ -213,7 +225,6 @@ DifferentialDriveOutput DifferentialDrive::update(
         reset();
         return {};
     }
-
     float target = clamp(longitudinal, -1.0F, 1.0F);
     float requested_steering = clamp(steering, -1.0F, 1.0F);
     bool manual_input_limited = false;
@@ -224,8 +235,12 @@ DifferentialDriveOutput DifferentialDrive::update(
         manual_input_limited = scale > 1.0F;
         target /= scale;
         requested_steering /= scale;
+        // 前进命令直接从 MOT_THR_MIN 起步：越过死区的正杆量输出不低于破摩阻
+        // 下限；该额外输入地板仅由 Manual 启用。校准的连续 ramp 不在此
+        // 再夹到 MIN，仍由 shape_motor() 施加一次共有的静摩擦补偿。
+        if (manual_throttle_floor && target > 0.0F) target = std::fmax(target, config_.throttle_min);
     }
-    if (!manual_source && std::fabs(target) <= kZeroThreshold) {
+    if ((braking || !manual_source) && std::fabs(target) <= kZeroThreshold) {
         // Navigation/Calibration 零纵向是停车或原地转向的安全边界，立即
         // 清除旧 slew；Manual 按 APM 保留配置的 slew，设为 0 时直接跟随。
         limited_longitudinal_ = 0.0F;
@@ -236,14 +251,15 @@ DifferentialDriveOutput DifferentialDrive::update(
     } else {
         limited_longitudinal_ = target;
     }
+    // Brake 只对制动力增加保留 slew；减弱/撤力立即生效。历史负输出不能
+    // 超过当前制动请求，历史正输出也不能延迟进入零起点的反向斜坡。
+    if (braking) limited_longitudinal_ = clamp(limited_longitudinal_, target, 0.0F);
 
     const bool motor_slew_active = std::fabs(limited_longitudinal_ - target) > kZeroThreshold;
     const float before_projection = limited_longitudinal_;
+    // 转向符号只表示车头旋转方向：正值始终顺时针，不随油门或 slew 历史
+    // 跨过零点而翻转。轮端实际换向仍由下方逐轮等待与输出包络保护。
     float adjusted_steering = requested_steering;
-    if (manual_source && config_.reverse_steering_in_manual &&
-        limited_longitudinal_ < 0.0F) {
-        adjusted_steering = -adjusted_steering;
-    }
 
     if (!manual_source) {
         // Speed PI 在进入本层前已按 1-|steering| 限制输出；MOT_SLEW_RATE 的历史
@@ -257,7 +273,7 @@ DifferentialDriveOutput DifferentialDrive::update(
 
     float mixed_longitudinal = limited_longitudinal_;
     const float before_mix_steering = adjusted_steering;
-    const float lower_motor_limit = -1.0F / config_.thrust_asymmetry;
+    const float lower_motor_limit = braking ? -1.0F : -1.0F / config_.thrust_asymmetry;
     // Manual 继续使用 RD_STR_THR_MIX；Navigation 固定 steering priority=1，
     // 因为 Heading/YawRate 闭环的抗扰稳定性不能被人工油门优先参数削弱。
     const float axis_priority = manual_source
@@ -269,8 +285,11 @@ DifferentialDriveOutput DifferentialDrive::update(
     // 车体 FRD/NED：纵向正值为前进，转向正值为顺时针（车头右转）。
     // 因此右轮 = longitudinal - steering，左轮 = longitudinal + steering；
     // 电机安装方向只在 PWM_Sx_REV 处理，左右侧映射不能代替单侧方向校准。
-    float right = shape_motor(mixed_longitudinal - adjusted_steering);
-    float left = shape_motor(mixed_longitudinal + adjusted_steering);
+    // 主动制动 q=E*u，不叠加驱动 MIN/EXPO/ASYM。零附近连续撤力，避免
+    // u=-0.30 被 MIN=0.20 抬成 -0.44；旧正向 slew 不能变成制动期间的前推。
+    float right = braking ? config_.throttle_max * clamp(mixed_longitudinal, -1.0F, 0.0F)
+                          : shape_motor(mixed_longitudinal - adjusted_steering);
+    float left = braking ? right : shape_motor(mixed_longitudinal + adjusted_steering);
     // 各原因单独观测：正常曲线不是饱和，不能用一个 input_limited 把待辨识
     // 的 MIN/EXPO/ASYM 响应全部丢掉，也不能把安全 slew 冒充电机能力。
     const bool mixing_limited = manual_input_limited || std::fabs(mixed_longitudinal - before_projection) > kZeroThreshold ||
@@ -279,7 +298,9 @@ DifferentialDriveOutput DifferentialDrive::update(
         std::fabs(left - (mixed_longitudinal + adjusted_steering)) > kZeroThreshold;
 
     float arm_scale = 1.0F;
-    if (config_.arm_ramp_s > 0.0F) {
+    // Arm ramp限制驱动建立，不应削弱已获授权的停车制动力；Brake仍受
+    // Armed许可、E包络、换向等待与末端安全保护约束。
+    if (!braking && config_.arm_ramp_s > 0.0F) {
         const float elapsed_s = static_cast<float>(now_us - armed_since_us_) *
                                 1.0e-6F;
         arm_scale = clamp(elapsed_s / config_.arm_ramp_s, 0.0F, 1.0F);
