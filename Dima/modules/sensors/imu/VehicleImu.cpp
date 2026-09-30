@@ -621,7 +621,10 @@ void VehicleImu::service_pending_configuration() noexcept
      * applied handshake. */
     // 校准协调器已持有非重入 interlock；前端只检查 disarmed 后直接原子切换，
     // 再发布 applied generation，避免二次加锁造成 CAL_* 永久等待。
-    if (!configuration_pending_ || armed_.armed()) return;
+    // Armed 校准必须已锁存并确认物理停波；不影响普通行驶时的参数冻结。
+    if (!configuration_pending_) return;
+    dima::platform::ConfigurationUpdateLease lease{armed_};
+    if (!lease) return;
 
     const std::uint32_t applied_instance =
         pending_configuration_instance_;

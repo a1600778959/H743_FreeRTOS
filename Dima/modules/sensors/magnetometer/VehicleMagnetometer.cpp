@@ -377,7 +377,10 @@ void VehicleMagnetometer::service_pending_configuration() noexcept
      * must not attempt to acquire the same non-reentrant lock again. */
     // SensorCalibration 已持有全局锁，前端只检查 disarmed 并直接应用，再确认
     // parameter_update instance；重复获取非重入锁会使 QGC 校准永久等待。
-    if (!configuration_pending_ || armed_.armed()) return;
+    // Armed 校准必须已锁存并确认物理停波；不影响普通行驶时的参数冻结。
+    if (!configuration_pending_) return;
+    dima::platform::ConfigurationUpdateLease lease{armed_};
+    if (!lease) return;
     const std::uint32_t applied_instance =
         pending_configuration_instance_;
     apply_configuration(pending_configuration_);

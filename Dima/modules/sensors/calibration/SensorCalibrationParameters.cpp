@@ -159,6 +159,7 @@ bool SensorCalibration::restore_parameters() noexcept
 
     bool restored = true;
     px4::AtomicTransaction transaction;
+    const auto before_restore = param_set_count();
     if (parameter_snapshot_.type != Type::Level &&
         param_set_no_notification(id, &parameter_snapshot_.id) != 0) {
         restored = false;
@@ -173,6 +174,12 @@ bool SensorCalibration::restore_parameters() noexcept
     }
     // 必须最后恢复观测组；前面的旧校正写入会触发同一原子失效规则。
     restored = restore_observations(parameter_snapshot_) && restored;
+    if (parameter_snapshot_.type == Type::Level &&
+        feedback_owner_ == sensor_calibration_request_s::FEEDBACK_AUTO) {
+        // 自动 Level 的恢复同样是 worker 自有写入；只累计本原子段增量，
+        // 不把外部修改吸收进计数，供会话收尾核对完整应用/回滚历史。
+        level_owned_changes_ += static_cast<std::uint8_t>(param_set_count() - before_restore);
+    }
     if (restored) {
         notify_parameter_changes();
         clear_parameter_snapshot();

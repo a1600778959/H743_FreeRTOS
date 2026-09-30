@@ -252,8 +252,11 @@ bool SensorCalibration::begin(Type type, std::uint8_t feedback_owner, std::uint6
     failure_reason = nullptr;
     // 开始条件同时要求有效 disarmed 状态、目标传感器和所需辅助 IMU 都在
     // 500 ms freshness 内、device_id 非零且数值有限。
-    const bool disarmed = fresh(now, actuator_armed_.timestamp, 1500000ULL) &&
-        !actuator_armed_.armed && !actuator_armed_.kill &&
+    // 仅 AUTO-owned Level 可使用 Armed 停波窗口；外部传感器校准合同不变。
+    const bool calibration_stopped = type == Type::Level &&
+        feedback_owner == sensor_calibration_request_s::FEEDBACK_AUTO && armed_.calibration_output_stopped();
+    const bool safe = fresh(now, actuator_armed_.timestamp, 1500000ULL) &&
+        (!actuator_armed_.armed || calibration_stopped) && !actuator_armed_.kill &&
         !actuator_armed_.termination && !actuator_armed_.lockdown;
     const bool gyro_ready = sensor_gyro_.device_id != 0U && fresh(
         now, sensor_gyro_.timestamp, kSensorFreshnessUs) &&
@@ -270,8 +273,8 @@ bool SensorCalibration::begin(Type type, std::uint8_t feedback_owner, std::uint6
             fresh(now, attitude_.timestamp, 100000ULL) &&
             fresh(now, imu_.timestamp, 100000ULL)
                               : mag_ready && accel_ready && gyro_ready;
-    if (!disarmed) {
-        failure_reason = "vehicle must be safely disarmed";
+    if (!safe) {
+        failure_reason = "vehicle must be disarmed or calibration output stopped";
         return false;
     }
     if (!source_ready) {
@@ -298,18 +301,21 @@ bool SensorCalibration::begin(Type type, std::uint8_t feedback_owner, std::uint6
     }
     // 获取全局 maintenance interlock 后直到成功应用或完整回滚才释放，确保采样/
     // 参数切换期间不能武装，也不能与其他 Flash/维护事务并发。
-    if (!armed_.begin_maintenance()) {
+    // AUTO-owned Level 可在 Armed 停波窗口执行；外部 QGC 校准仍要求 Disarmed。
+    if (!armed_.begin_maintenance(feedback_owner == sensor_calibration_request_s::FEEDBACK_AUTO)) {
         failure_reason = "maintenance interlock is busy";
         return false;
     }
 
     interlock_held_ = true;
-    if (!param_storage_pause(this)) {
+    // 自动 Level 的存储保护由整场会话持有，worker 只拥有维护锁；手动校准保持独立事务。
+    const bool session_owned = type == Type::Level && feedback_owner == sensor_calibration_request_s::FEEDBACK_AUTO;
+    if (session_owned ? !param_storage_paused() : !param_storage_pause(this)) {
         release_interlock();
         failure_reason = "parameter storage transaction is busy";
         return false;
     }
-    storage_paused_ = true;
+    storage_paused_ = !session_owned;
     if (type == Type::Level) {
         level_mag_present_ = mag_ready;
         px4::AtomicTransaction transaction;
@@ -521,7 +527,9 @@ void SensorCalibration::Run()
     if (type_ != Type::None) {
         if (phase_ == Phase::WaitForRollback) {
             process_wait_for_rollback(now);
-        } else if (actuator_armed_.armed || actuator_armed_.kill ||
+        } else if (!fresh(now, actuator_armed_.timestamp, 1500000ULL) ||
+            (actuator_armed_.armed && !(type_ == Type::Level &&
+             feedback_owner_ == sensor_calibration_request_s::FEEDBACK_AUTO && armed_.calibration_output_stopped())) || actuator_armed_.kill ||
             actuator_armed_.termination || actuator_armed_.lockdown) {
             fail("safety state changed");
         } else {
