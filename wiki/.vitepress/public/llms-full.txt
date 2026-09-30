@@ -1,0 +1,4833 @@
+<doc title="Dima H743 Rover" path="index.md">
+# Dima H743 Rover
+
+STM32H743VIT6（Cortex-M7, 480 MHz）+ FreeRTOS 差速漫游车固件。以 PX4 v1.17.0 为代码基线、ArduPilot Rover 为行为参考；产品名 Dima，C++ 命名空间 `dima`。
+
+## Quick Start
+
+```bash
+# 完整验证目标：fast 架构门禁 + 构建 + 签名/镜像校验 + ELF 校验
+make verify
+
+# 纯固件构建 / 完整发布产物
+make firmware
+make dima_rover
+
+# 显式全量架构审计（修改模块边界或构建规则后必须）
+make check-architecture
+```
+
+所有 make 命令在仓库根目录执行（Windows 下经 `make.cmd`）。工具链（Arm GCC 10.3.1、ccache）由构建系统按需解析到 `~/.cache/dima-rover/host-tools/`，无需手工安装。
+
+## Architecture Overview
+
+```mermaid
+graph LR
+  APP[application 启动壳] --> ROVER[rover 控制域]
+  ROVER --> MODS[modules 运行模块]
+  ROVER --> MW[middleware 服务]
+  MODS --> API[platform/api capability]
+  MW --> API
+  API --> RT[platform/freertos]
+  API --> MCU[platform/stm32h7]
+  MCU --> BOARD[Boards/H743 板级]
+  BOARD --> HAL[Core/ STM32 HAL]
+```
+<!-- Sources: AGENTS.md:1, Dima/platform/api/Flash.hpp:1, Boards/H743/Src/platform_composition.cpp:1 -->
+
+依赖方向是本仓库的硬性合同：`rover → modules / middleware / messages / lib / platform/api`；`platform/freertos` 与 `platform/stm32h7` 互不依赖；只有 `Boards/H743/Src/platform_composition.cpp` 这一个组合根能把具体后端装配到 capability 契约上。
+
+## Documentation Map
+
+| Section | Description |
+|---------|-------------|
+| [Onboarding](./onboarding/) | 面向贡献者 / 资深工程师 / 管理层 / 产品经理的四份导读 |
+| [快速上手](./01-getting-started/) | 项目总览、构建与验证、快速参考 |
+| [架构](./02-architecture/) | 分层架构与依赖规则 |
+| [Rover 控制域](./03-rover-domain/) | 差速控制栈与公共算法 |
+| [自动校准](./04-auto-calibration/) | 状态机、调度合同、事务机 |
+| [运行模块](./05-modules/) | Motor / Commander / MAVLink / 日志 / 传感器 |
+| [中间件](./06-middleware/) | 参数、uORB、存储域 |
+| [平台层](./07-platform/) | Capability 契约与组合根 |
+| [驱动](./08-drivers/) | UM982 GNSS 与 DroneCAN 链路 |
+| [构建与发布](./09-build-release/) | 构建、签名、MCUboot OTA |
+| [工具链](./10-tooling/) | 架构门禁与验证工具 |
+| [首次运行与参数标准](./11-first-run/) | 参数设置建议、分阶段验收标准、现场清单 |
+| [启动与板级](./12-startup-board/) | 启动链、Boards/H743、CubeMX 生成层 |
+| [驱动与外设](./13-drivers-peripherals/) | 驱动全量、串口/RC、Mission |
+| [平台内幕](./14-platform-internals/) | FreeRTOS 与 STM32H7 后端实现 |
+| [MAVLink 运行配置](./15-mavlink-runtime/) | 模式投影权威输入与双链路 |
+| [支撑库](./16-support-libs/) | lib/ 下 14 个平台无关库 |
+| [文档地图](./17-docs-map/) | 27 篇权威文档导读与 ADR 索引 |
+
+## Key Files
+
+| File | Purpose | Source |
+|------|---------|--------|
+| `AGENTS.md` | 仓库合同：目录边界、依赖方向、构建命令 | [AGENTS.md:1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L1) |
+| `GNUmakefile` | 外层调度 Make：进度计划化、ccache 门控 | [GNUmakefile:48](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile#L48) |
+| `make/project.mk` | 应用源、生成链与编译规则（含 LTO） | [make/project.mk:1141](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/project.mk#L1141) |
+| `make/release.mk` | 签名、MCUboot、镜像验证与上传规则 | [make/release.mk:57](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/release.mk#L57) |
+| `Dima/rover/ApplicationContext.cpp` | 应用上下文：模块装配与生命周期 | [Dima/rover/ApplicationContext.cpp:285](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/ApplicationContext.cpp#L285) |
+| `Boards/H743/Src/platform_composition.cpp` | 后端与 capability 的唯一组合根 | [Boards/H743/Src/platform_composition.cpp:1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/platform_composition.cpp#L1) |
+| `docs/ARCHITECTURE_ZH.md` | 软件架构与依赖规则权威文档 | [docs/ARCHITECTURE_ZH.md:1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/ARCHITECTURE_ZH.md#L1) |
+
+## Tech Stack
+
+| Technology | Purpose |
+|-----------|---------|
+| STM32H743VIT6 / Cortex-M7 480 MHz | 目标 MCU |
+| FreeRTOS + px4 WorkQueue 模式 | RTOS 与调度 |
+| C++17（`dima` 命名空间）+ C（HAL 生成层） | 实现语言 |
+| uORB 消息总线（PX4 移植） | 模块间通信 |
+| MAVLink v2（裁剪方言生成） | 地面站链路 |
+| MCUboot + 签名镜像 | 安全启动与 OTA |
+| DroneCAN（动态节点分配） | 外设总线（磁力计等） |
+| UM982 双天线 RTK | GNSS 定位定向 |
+| VitePress + Mermaid | 本 wiki 站点 |
+</doc>
+
+<doc title="贡献者指南" path="onboarding\contributor-guide.md">
+# 贡献者指南
+
+面向第一次接触本仓库的嵌入式开发者。假设你熟悉 C/C++ 与实时系统概念，但不了解本仓库。全文引用均指向 GitHub `main` 分支源文件。
+
+## Part I · 技术栈基础
+
+### 与通用 C++ 项目的差异
+
+| 维度 | 桌面/服务端 C++ | 本仓库 |
+|------|----------------|--------|
+| 内存 | 堆分配自由 | 静态分配为主，`bss=627 KB` 上限受 SRAM 预算约束 |
+| 并发 | 线程 + 锁 | FreeRTOS Task + PX4 式 WorkQueue（模块在自己的队列排队执行） |
+| 模块通信 | 直接函数调用 | uORB 发布/订阅（异步、有代次语义） |
+| 构建产物 | 可执行文件 | 签名二进制镜像 + MCUboot 引导 |
+
+### 必须先建立的四个概念
+
+1. **uORB**：PX4 的发布/订阅总线。Topic 以 `.msg` 契约定义在 `Dima/messages/schemas/`，如 [AutoCalibrationStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/AutoCalibrationStatus.msg)。发布方与订阅方解耦，读侧用 `uORB::Subscription` 拷贝最新值。
+2. **WorkItem**：模块继承 `px4::ScheduledWorkItem`，按周期或事件被调度。每个模块的 README 声明它运行在哪个队列、周期多少。
+3. **Capability 契约**：硬件能力抽象为 `Dima/platform/api/` 下的纯虚接口（如 [Flash.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Flash.hpp)），上层只依赖接口，不依赖 HAL。
+4. **架构门禁**：每次 `make verify` 会跑依赖方向检查（fast 档），违规直接构建失败——见 [工具链](../10-tooling/tooling.md)。
+
+## Part II · 本仓库的架构与领域模型
+
+### 目录即边界
+
+```mermaid
+graph TB
+  subgraph Dima
+    APP[application]
+    ROVER[rover<br>控制域]
+    MODS[modules<br>运行模块]
+    MW[middleware<br>服务]
+    MSG[messages<br>契约]
+    LIB[lib<br>纯算法]
+    DRV[drivers]
+    PLAT[platform]
+  end
+  ROVER --> MODS
+  ROVER --> MW
+  ROVER --> LIB
+  ROVER --> MSG
+  MODS --> PLAT
+  MW --> PLAT
+  PLAT --> BOARD[Boards/H743<br>组合根+HAL]
+```
+<!-- Sources: AGENTS.md:1, docs/ARCHITECTURE_ZH.md:1 -->
+
+### 领域模型：车在跑什么
+
+- **运动链**：`AutoMode`（航段任务）或手动输入 → `RoverDifferential`（差速控制、PI 速度环/偏航率环）→ `MotorOutput`（PWM 后端、安全限幅）→ 电机。
+- **校准链**：`Commander` 受理请求 → `AutoCalibrationMode` 状态机（直线/转圈/磁测/辨识/验证）→ 候选参数经 `CalibrationParameters` 事务（临时写入→确认→提交/回滚）。
+- **安全链**：`Commander` 维护 Armed 状态与 failsafe；`MotorOutputSafety` 做输出级失鲜/限幅；`BootHealthService` 决定 IWDG 喂狗。
+
+三条链全部通过 uORB 解耦，任何一环的失败不得级联阻塞喂狗与通信链路（见 [MotorOutput 参数应用租约](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) 的注释合同）。
+
+## Part III · 上手与合入
+
+### 环境
+
+- Windows + Git Bash（本仓库的现实工作环境）；工具链由 make 自动解析，无需手工安装。
+- `make verify` 是唯一验收门：改任何代码后必须跑通。
+
+### 第一次改代码的建议路径
+
+1. 选一个 `Dima/modules/` 下的独立模块（推荐 `boot_health` 或 `logging`），读完它的 `README.md`。
+2. 改动 → `make verify` → 观察 `[N/M] 文件名` 进度输出与 `ARCH check-architecture(fast)` 结果。
+3. 如果动了目录结构/构建规则，显式跑 `make check-architecture`（full 档）。
+
+### 仓库规则速记
+
+| 规则 | 出处 |
+|------|------|
+| 禁止上层反向依赖 rover | [AGENTS.md 依赖方向](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L52) |
+| 同目录头文件直接写文件名，跨目录从职责层根写起 | [AGENTS.md 头文件引用](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L64) |
+| CubeMX 生成区 `Core/` 不写业务逻辑 | [AGENTS.md CubeMX](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L67) |
+| 参数尽量少、自动调整尽量多 | `docs/` 产品原则 |
+| MAVLink 按实际能力裁剪，禁止全量引入 | [AGENTS.md MAVLink](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L63) |
+
+## 术语表（节选）
+
+| 术语 | 含义 |
+|------|------|
+| uORB | PX4 发布/订阅总线，Topic 有代次（generation）语义 |
+| WorkQueue | FreeRTOS 优先级队列上的延迟执行上下文 |
+| Capability | `platform/api` 中的硬件能力虚接口 |
+| 组合根 | `platform_composition.cpp`，唯一把具体后端接上 capability 的位置 |
+| 停波（stop-wave） | 校准维护窗口内 PWM 后端确认物理停止脉冲输出的状态 |
+| 候选/事务 | 校准参数的临时写入→确认→提交/回滚流程 |
+| fast/full 门禁 | `make verify` 内嵌的关键检查 vs 显式 `check-architecture` 全量审计 |
+
+## References
+
+- [AGENTS.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md) — 仓库合同
+- [docs/ARCHITECTURE_ZH.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/ARCHITECTURE_ZH.md) — 架构权威文档
+- [docs/AUTO_CALIBRATION_PLAN_ZH.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_PLAN_ZH.md) — 自动校准方案
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [构建与验证](../01-getting-started/build-and-verify.md) | make 目标详解 |
+| [分层架构与依赖规则](../02-architecture/layered-architecture.md) | Part II 的展开 |
+| [资深工程师指南](./staff-engineer-guide.md) | 架构深读路径 |
+</doc>
+
+<doc title="管理层指南" path="onboarding\executive-guide.md">
+# 管理层指南
+
+面向工程负责人。无代码、无工程术语堆砌，只回答三个问题：这台车固件**能做什么**、**风险在哪**、**该往哪投入**。
+
+## 项目能力地图
+
+```mermaid
+mindmap
+  root Dima 固件能力
+    运动
+      手动遥控驾驶
+      航段自主任务
+      差速 PI 速度与转向控制
+    自动校准
+      弱动力起步补偿
+      转向/速度模型辨识
+      磁力计与航向校准
+      候选参数安全提交
+    安全
+      解锁预检与 failsafe
+      看门狗分级喂狗
+      制动与停波保护
+    运维
+      USB/MAVLink 地面站
+      SD 飞行日志
+      MCUboot 签名 OTA
+```
+<!-- Sources: AGENTS.md:1, docs/H743_VEHICLE_COMMISSIONING_ZH.md:1 -->
+
+## 现状评估
+
+| 维度 | 状态 | 说明 |
+|------|------|------|
+| 架构债 | **低且受控** | 依赖方向有机器门禁强制，违规无法合入 |
+| 代码规模 | 固件 Flash 占用 75% | 每次构建输出实时水位，接近前有预警 |
+| 测试 | 编译期验证完善 | 架构审计 + 镜像校验 + ELF 符号合同；**实车路测覆盖是短板** |
+| 团队效率 | 高 | 增量构建快（ccache + 计划化进度），验证闭环 ~3.5 分钟 |
+| 单点依赖 | 单人深度上下文 | 文档密度高（337 篇 markdown）正在对冲 |
+
+## 风险清单（按优先级）
+
+1. **实车验证缺口**：自动校准的终态路径、OTA 恢复、极端工况尚未完成系统性实车验收。缓解：上车部署指南（`docs/H743_VEHICLE_COMMISSIONING_ZH.md`）已给出分阶段验收流程。
+2. **RAM 水位**：D2 SRAM 占用 82.6%，接近告警线。缓解：构建时水位可视 + TCM 预算独立受控。
+3. **自动校准复杂度**：状态机是全仓库最复杂模块，历史上多次实车问题集中于此。缓解：已完成整体重构（47→11 状态）并建立调度合同文档。
+4. **供应链**：工具链/依赖全部锁定版本并校验，风险低。
+
+## 投资建议
+
+| 方向 | 建议优先级 | 理由 |
+|------|-----------|------|
+| 实车系统性验收（按上车指南分阶段） | **最高** | 当前所有"已实现"都缺最终证据 |
+| 自动校准实车标定迭代 | 高 | 产品核心卖点，代码已就绪 |
+| 第二车型/板级抽象复用 | 中 | capability 合同已为多板预留 |
+| 仿真/HIL 前置 | 中 | 减少实车迭代成本 |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [项目总览](../01-getting-started/overview.md) | 技术视角总览 |
+| [产品经理指南](./product-manager-guide.md) | 面向产品视角的能力细节 |
+</doc>
+
+<doc title="Onboarding 使用指南" path="onboarding\index.md">
+# Onboarding 使用指南
+
+本节提供四份按角色裁剪的导读。内容均基于当前源码（HEAD `ac25482`），引用指向 GitHub `main` 分支源文件。
+
+```mermaid
+flowchart LR
+  Q{你的角色?}
+  Q -->|写代码/改代码| C[贡献者指南<br>从零到第一次合入]
+  Q -->|评审/把关架构| S[资深工程师指南<br>核心洞察与决策日志]
+  Q -->|管理团队/风险| E[管理层指南<br>能力地图与风险]
+  Q -->|产品/需求| P[产品经理指南<br>能力边界与 FAQ]
+  C --> R[快速上手<br>01-getting-started]
+  S --> R
+  E -.-> A[02 架构]
+  P -.-> A
+```
+<!-- Sources: AGENTS.md:1, docs/ARCHITECTURE_ZH.md:1 -->
+
+| 指南 | 适合谁 | 篇幅 |
+|------|--------|------|
+| [贡献者指南](./contributor-guide.md) | 第一次接触本仓库的嵌入式开发者 | 详细 |
+| [资深工程师指南](./staff-engineer-guide.md) | 评审架构、把关技术方向的 IC | 密集 |
+| [管理层指南](./executive-guide.md) | 工程 VP / 总监 | 概览 |
+| [产品经理指南](./product-manager-guide.md) | 产品、测试与非工程干系人 | 概览 |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [项目总览](../01-getting-started/overview.md) | 所有导读的共同起点 |
+| [分层架构与依赖规则](../02-architecture/layered-architecture.md) | 全部导读都会引用的硬合同 |
+</doc>
+
+<doc title="产品经理指南" path="onboarding\product-manager-guide.md">
+# 产品经理指南
+
+零工程术语版本。读完你能回答：这台车是什么、能可靠做什么、哪些事不能承诺。
+
+## 这是什么产品
+
+一台 **STM32H743 差速轮小车固件**（产品名 Dima）：既能人拿遥控器开，也能按任务自己跑直线/转弯；有一套"自动校准"流程让车自己测出自己的动力特性并调好参数；有完整的日志、地面站连接和固件升级能力。
+
+## 用户旅程
+
+```mermaid
+journey
+  title 一台新车的生命周期
+  上电点亮: 5
+  遥控器手动驾驶: 5
+  连接地面站看状态: 4
+  一键自动校准: 3
+  保存参数重启验证: 4
+  下发任务自主跑: 4
+  OTA 升级固件: 3
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:1 -->
+
+## 能力边界（能承诺什么）
+
+| 能承诺 | 不能承诺（当前版本） |
+|--------|----------------------|
+| 遥控器手动驾驶稳定 | 自动返航（遥控丢失默认解锁停车） |
+| 直线/航段自主行驶 | 复杂避障（无避障传感器接入） |
+| 自动校准动力参数 | 校准一次必定成功（弱动力车可能分多次） |
+| SD 卡完整飞行日志 | 掉电不丢当前段日志 |
+| 签名固件 OTA 升级 | 升级失败自动回滚到旧版本 |
+
+## 已知限制
+
+1. **默认参数不是调好的**：新车必须先走"上车部署流程"，手动确认电机方向、中位、传感器安装，再跑自动校准。
+2. **自动校准会真实开车**：校准过程车辆会实际运动（包括到全速和主动刹车），必须在空旷场地进行。
+3. **低电量无自动动作**：不会自动返航/降落，需要人工接管。
+4. **地面站断链不等于失控保护**：遥控器（RC）才是安全主链路。
+
+## 常见问题（FAQ）
+
+**Q: 校准做到一半失败了会怎样？**
+会自动恢复原参数、停车、报告失败原因，车保持可用。校准的设计原则是"失败不留痕"。
+
+**Q: 升级固件有风险吗？**
+固件是签名的，引导器只运行签名固件。升级失败的恢复流程见 USB DFU 恢复文档。
+
+**Q: 怎么判断车"好了"？**
+走完上车指南的分阶段验收：手动驾驶通过 → 校准成功并重启后参数保持 → 简单任务跑完。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [管理层指南](./executive-guide.md) | 同一边界的风险视角 |
+| [项目总览](../01-getting-started/overview.md) | 技术实现对应关系 |
+</doc>
+
+<doc title="资深工程师指南" path="onboarding\staff-engineer-guide.md">
+# 资深工程师指南
+
+密集、有观点、为评审与把关服务。全部结论基于源码阅读，推断处显式标注。
+
+## THE 核心洞察
+
+**这是一个把 PX4 的"消息总线 + WorkQueue 调度"骨架，套上"capability 依赖倒置"合同，再以"事务化参数提交"为安全核心的固件。**
+
+用伪代码（Python 风格）表达整个仓库的运行时模型：
+
+```python
+# 每个模块 ≈ 一个自调度循环
+class Module:
+    def Run(self):                    # 运行在各自的 WorkQueue 上
+        msgs = self.subs.copy()       # uORB: 拷贝最新代次
+        state = self.evaluate(msgs)   # 纯状态机推进
+        self.publish(state)           # 发布结果
+
+# 唯一的跨模块写路径是"事务"
+class CalibrationTransaction:
+    def apply(self, candidates):      # 临时写入（Provisional）
+        ...
+    def commit(self): ...             # 前端确认后原子生效
+    def rollback(self): ...           # 任何失败统一回滚
+```
+
+为什么这样设计：无人车固件最常见的死亡螺旋是"一个模块的故障阻塞喂狗 → IWDG 复位 → 全系统重启"。本仓库把"安全收敛"做成不变量：**任何故障路径最终到达的是停波 + 参数回滚 + 一次落盘，而不是复位**。所有机制——ArmedFlash 协调器、参数租约、校准停波窗口、BootHealth 例外窗口——都是这一个不变量的实现细节。
+
+## 系统架构图
+
+```mermaid
+graph TB
+  subgraph 控制平面
+    CMD[Commander<br>安全状态机]
+    AC[AutoCalibrationMode<br>校准调度器]
+    AUTO[AutoMode<br>航段任务]
+  end
+  subgraph 执行平面
+    RD[RoverDifferential<br>差速控制]
+    MO[MotorOutput<br>PWM 后端]
+  end
+  subgraph 保障平面
+    BH[BootHealth<br>IWDG 策略]
+    MW[参数/uORB/日志]
+  end
+  CMD -->|request/status| AC
+  AC -->|calibration_status| RD
+  AUTO -->|motion_request| RD
+  RD -->|actuator_motors| MO
+  MO -->|armed_flash lease| CMD
+  BH -.->|IWDG 例外窗口| MO
+  MW -.-> CMD
+```
+<!-- Sources: Dima/modules/safety/CommanderAutoCalibration.cpp:34, Dima/rover/control/RoverDifferential.hpp:115, Dima/modules/motor/MotorOutput.cpp:15, Dima/modules/boot_health/BootHealthService.cpp:305 -->
+
+## 领域模型（核心实体）
+
+```mermaid
+erDiagram
+  Commander ||--o{ AutoCalibrationMode : "start/stop 握手"
+  AutoCalibrationMode ||--|| SessionController : "唯一状态属主"
+  SessionController ||--o{ TransactionKind : "Level/Rtk/Dynamics/Magnetic/Imu/Runtime/Gains"
+  AutoCalibrationMode ||--|| CalibrationParameters : "候选事务机"
+  RoverDifferential ||--|| RoverDifferentialBraking : "制动接管"
+  MagMotorOutputHistory ||--|| CalibrationBraking : "反向冲量 J"
+  ArmedFlashCoordinator ||--o{ ConfigurationUpdateLease : "参数短租约"
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp:1, Dima/lib/rover/CalibrationBraking.hpp:5, Dima/platform/api/Flash.hpp:59 -->
+
+## 设计权衡与决策日志（节选）
+
+| 决策 | 备选 | 取舍理由 | 证据 |
+|------|------|----------|------|
+| capability 契约 + 单一组合根 | 直接依赖 HAL | 换后端/仿真不改上层；组合根唯一保证装配一致性 | [platform_composition.cpp:1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/platform_composition.cpp#L1) |
+| DNA 分配表迁 SD 原子文件域 | 与参数共用 FlashFS 分区 | 两 token 互相锁死整区擦除（ADR 0006），满区即永久不可回收 | [ApplicationContext.cpp:285](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/ApplicationContext.cpp#L285) |
+| 校准参数走 Provisional 事务 | 直接写参数 | 校准失败必须无痕回滚；`saved=0` 是统一保存设计 | [flashfs.cpp:434](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/flashfs.cpp#L434) |
+| 制动用两轮自校准比例律 | 固定指数尾模型 | τ₂≡T₁ 的指数尾在 15s 预算内不可辨识；比例律 g=J/(E·T·Δv) 每轮自校准 | [CalibrationBraking.hpp:5](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationBraking.hpp#L5) |
+| 自动 Level 校准允许 Armed 停波窗口 | 一律要求 Disarmed | 弱动力车解锁即停波会造成 IWDG 复位循环；改为锁存+后端确认 | [Flash.hpp:59](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Flash.hpp#L59) |
+| 强制解锁加 20~50ms 持续确认 | 单帧即触发 | SBUS 坏帧/EMI 单帧瞬态会误杀会话 | [Commander.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/Commander.cpp) |
+| LTO 跨编译单元瘦身 | 逐 TU 编译 | 省 33.8 KiB Flash；符号合同由 ELF 验证器兜底 | [project.mk:1141](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/project.mk#L1141) |
+
+## "去哪深读"顺序
+
+1. [分层架构与依赖规则](../02-architecture/layered-architecture.md) — 合同层
+2. [自动校准状态机](../04-auto-calibration/state-machine.md) — 复杂度中心（SessionController、事务机、组调度）
+3. [Capability 契约与组合根](../07-platform/platform.md) — ArmedFlash 协调器是安全链枢轴
+4. [差速控制栈](../03-rover-domain/control-stack.md) — 制动接管与限速迟滞
+5. [中间件服务](../06-middleware/middleware.md) — 存储域与参数事务
+
+## 风险与开放问题
+
+- 实车验收尚未覆盖全部分支（校准终态、OTA 恢复路径）。
+- 自动校准模块仍是全仓库复杂度最高点，`docs/AUTO_CALIBRATION_STATE_MACHINE_ZH.md` 与源码需同步演进。
+- D2 SRAM 占用 82.6%，新增静态分配需谨慎（构建汇总有实时水位）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [分层架构与依赖规则](../02-architecture/layered-architecture.md) | 本页洞察的合同化表述 |
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 核心复杂度所在 |
+| [管理层指南](./executive-guide.md) | 同一架构的非技术视图 |
+</doc>
+
+<doc title="构建与验证" path="01-getting-started\build-and-verify.md">
+# 构建与验证
+
+## 速查表
+
+| 目标 | 做什么 | Source |
+|------|--------|--------|
+| `make verify` | **验收门**：fast 架构门禁 + 构建 + 签名/镜像校验 + ELF 校验 | [GNUmakefile:48](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile#L48) |
+| `make firmware` | 仅固件构建（验证是显式目标，不隐式跑） | [GNUmakefile](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile) |
+| `make dima_rover` | 完整发布产物（纯构建） | [GNUmakefile](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile) |
+| `make check-architecture` | full 档全量架构审计 | [check_architecture.py:4](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/check_architecture.py#L4) |
+| `make mcuboot` | MCUboot 引导程序 | [GNUmakefile](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile) |
+| `make upload` | mcumgr OTA 上传 | [release.mk:57](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/release.mk#L57) |
+| `make intellisense` | IDE 跳转数据库 | [GNUmakefile](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile) |
+
+## 双层 Make 架构
+
+```mermaid
+flowchart LR
+  U[用户 make verify] --> OUTER[GNUmakefile 外层调度]
+  OUTER -->|干跑依赖图计数| PLAN[计划进度]
+  OUTER --> INNER[内层 Make 汇合生成物]
+  INNER --> ARCH[ARCH fast 门禁]
+  ARCH --> CXX[编译 ccache 加速]
+  CXX --> LD[链接 LTO]
+  LD --> SIGN[签名/合并镜像]
+  SIGN --> ELFV[ELF 符号合同验证]
+  ELFV --> IMGV[镜像摘要验证]
+```
+<!-- Sources: GNUmakefile:48, make/project.mk:1141, make/release.mk:57 -->
+
+## 构建性能特性
+
+| 特性 | 控制 | 行为 |
+|------|------|------|
+| 计划化进度 | `DIMA_PROGRESS=off` 逃生门 | 默认干跑一次依赖图，按 `[N/M] 文件名` 逐文件显示 |
+| ccache | `DIMA_CCACHE=on/auto/off` | 默认 `on`，缓存不可用**立即失败**（防止"以为在缓存其实在裸编"）；`auto` 才降级 |
+| LTO | `DIMA_LTO=off` 逃生门 | 跨编译单元折叠，省 33.8 KiB；ELF 验证器兜底符号合同 |
+| 并行度 | 内存自适应 | 内存紧张自动降单任务（`[BUILD] jobs=` 可见） |
+| OTA 窗口 | `MCUMGR_MAX_WINDOW` | 生产默认 3（板测期可回退） |
+
+## 每次构建产物
+
+```mermaid
+graph TB
+  SRC[源码 + 生成物] --> ELF[H743_FreeRTOS.elf]
+  ELF --> HEX[.hex / .bin]
+  HEX --> SIGN[签名 signed.bin]
+  SIGN --> FACTORY[factory.hex<br>bootloader+app 合并]
+  FACTORY --> VERIFY[摘要/布局/符号三层验证]
+```
+<!-- Sources: make/release.mk:57, tools/elf_support/layout.py -->
+
+## 常见坑
+
+1. **Git Bash 直跑架构检查器会有 `make -pn` 伪违规**——必须走 `make.cmd`。
+2. MAVLink C 库是生成物不入库，权威位置 `build/generated/mavlink/`；改参数定义后必须从 Make 入口重新生成。
+3. `verify` 中的 fast 门禁只跑 4 项关键检查（依赖方向、include 所有权、硬件操作边界）；**改了模块边界/构建规则要显式跑 `make check-architecture`**。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [快速参考](./quick-reference.md) | 常用命令与参数速查 |
+| [架构门禁与验证工具](../10-tooling/tooling.md) | 门禁的检查项明细 |
+| [构建、签名与 OTA](../09-build-release/build-release.md) | 发布产物与升级链 |
+</doc>
+
+<doc title="项目总览" path="01-getting-started\overview.md">
+# 项目总览
+
+Dima 是运行在 STM32H743VIT6 上的 FreeRTOS 差速漫游车固件。它存在的核心理由：把 PX4 成熟的"消息总线 + WorkQueue"飞控骨架，改造成一台弱动力地面车辆的控制系统，并让车辆能**自动测出自己的动力特性**（弱动力车手工调参极其困难，这是自动校准存在的第一性原因）。
+
+## 30 秒速览
+
+| 组件 | 职责 | 关键文件 | Source |
+|------|------|----------|--------|
+| application | 启动壳、C ABI 入口 | `Dima/application/` | [AGENTS.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L25) |
+| rover | 控制域：模式、差速控制 | `Dima/rover/` | [AutoMode.cpp:328](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto/AutoMode.cpp#L328) |
+| modules | 运行模块（电机/安全/日志…） | `Dima/modules/` | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+| middleware | 参数、uORB、存储、日志服务 | `Dima/middleware/` | [flashfs.cpp:434](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/flashfs.cpp#L434) |
+| platform | capability 契约 + RTOS/MCU 后端 | `Dima/platform/` | [AtomicFileStore.hpp:14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/AtomicFileStore.hpp#L14) |
+| Boards/H743 | 板级初始化 + 唯一组合根 | `Boards/H743/Src/platform_composition.cpp` | [platform_composition.cpp:1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/platform_composition.cpp#L1) |
+
+## 数据流大图
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant RC as RC 接收机
+  participant CMD as Commander
+  participant MODE as 模式层
+  participant RD as RoverDifferential
+  participant MO as MotorOutput
+  participant PWM as PWM 后端
+  RC->>CMD: 手动输入/解锁请求
+  CMD->>MODE: 导航状态 + 运动请求
+  MODE->>RD: 差速运动请求
+  RD->>RD: PI 速度环/偏航率环
+  RD->>MO: actuator_motors
+  MO->>PWM: 限幅/失鲜检查后输出
+  PWM-->>MO: 硬件回读确认
+```
+<!-- Sources: Dima/modules/safety/CommanderAutoCalibration.cpp:34, Dima/rover/control/RoverDifferential.hpp:115, Dima/modules/motor/MotorOutput.cpp:15 -->
+
+## 技术血缘
+
+| 来源 | 拿来了什么 | 本地化改造 |
+|------|-----------|-----------|
+| PX4 v1.17.0 | uORB、WorkItem 调度、模块骨架、MAVLink | 重命名 `dima` 命名空间，裁剪到车辆场景 |
+| ArduPilot Rover | 差速车行为参考（转向/制动语义） | 不直接移植代码 |
+| MCUboot | 安全启动与 OTA | 自研签名/镜像验证工具链 |
+| 自研 | 自动校准、参数事务、架构门禁工具链 | `docs/` 下有完整方案文档 |
+
+## 资源水位（当前基线）
+
+| 资源 | 占用 | 上限 | 使用率 |
+|------|------|------|--------|
+| Flash | 586,528 B | 782,336 B | 75.0% |
+| DTCM | 60,928 B | 131,072 B | 46.5% |
+| SRAM | 576,768 B | 884,736 B | 65.2% |
+| D2 data | 216,544 B | 262,144 B | **82.6%（告警区）** |
+
+数据来自最近一次 `make verify` 构建汇总，随代码演进实时变化。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [构建与验证](./build-and-verify.md) | 如何编译与验收 |
+| [分层架构与依赖规则](../02-architecture/layered-architecture.md) | 目录边界的合同细节 |
+| [贡献者指南](../onboarding/contributor-guide.md) | 渐进式上手路径 |
+</doc>
+
+<doc title="快速参考" path="01-getting-started\quick-reference.md">
+# 快速参考
+
+## 命令速查
+
+| 场景 | 命令 |
+|------|------|
+| 改代码后验收 | `make verify` |
+| 只编译 | `make firmware` |
+| 改了模块边界/构建规则 | `make check-architecture` |
+| 静默直通构建 | `DIMA_PROGRESS=off make firmware` |
+| 关闭缓存调试 | `DIMA_CCACHE=off make firmware` |
+| 生成 IDE 数据库 | `make intellisense` |
+| OTA 上传 | `make upload` |
+
+## 目录速查
+
+| 路径 | 内容 |
+|------|------|
+| `Dima/rover/` | 控制域（control/ + modes/） |
+| `Dima/modules/` | motor、safety、mavlink、logging、sensors、parameters、boot_health、ekf2、rc |
+| `Dima/middleware/` | parameters、logging、rover 契约 |
+| `Dima/lib/rover/` | 校准/控制纯算法 |
+| `Dima/platform/api/` | capability 契约（唯一允许上层依赖的硬件接口层） |
+| `Boards/H743/` | 板级 + 组合根 |
+| `docs/` | 权威文档（架构、校准方案、资源基线、ADR） |
+| `tools/` | Python 工具链（架构检查、ELF 验证、参数生成） |
+
+## 文档路由（权威入口）
+
+| 要找什么 | 去哪 |
+|----------|------|
+| 依赖方向/禁止事项 | `docs/ARCHITECTURE_ZH.md` |
+| 模块职责与调度约束 | 各模块 `README.md` |
+| 自动校准方案与状态机 | `docs/AUTO_CALIBRATION_PLAN_ZH.md` / `AUTO_CALIBRATION_STATE_MACHINE_ZH.md` |
+| 上车操作流程 | `docs/H743_VEHICLE_COMMISSIONING_ZH.md` |
+| 来源与上游 commit | `docs/DIMA_SOURCE_MANIFEST.md` |
+| 架构决策记录 | `docs/adr/`（0001-0006） |
+
+## 关键 uORB Topic
+
+| Topic | 生产者 | 消费者 |
+|-------|--------|--------|
+| `actuator_motors` | RoverDifferential | MotorOutput |
+| `vehicle_status` / `armed` | Commander | 全仓库安全判定 |
+| `auto_calibration_status` / `_request` | 校准模式 / Commander | 校准模式、BootHealth、MotorOutput |
+| `sensor_gps` / `rtk_heading_status` | Um982Gps | EKF2、校准、MAVLink |
+| `actuator_output_status` | MotorOutput | Commander、BootHealth、校准 |
+
+## 排障速查
+
+| 症状 | 第一检查点 |
+|------|-----------|
+| 构建失败于 ARCH 检查 | 最近是否 include 了禁止的头（HAL/CMSIS 进了上层） |
+| USB 不枚举 | MotorOutput 租约失败是否 pending（已有 defer 250ms 保护） |
+| 日志下载卡 0 字节 | 空闲回收是否清了列表状态（已有 Data 请求独立化修复） |
+| 校准满区失败 | 参数分区是否还有遗留 token（DNA 已迁 SD，见 ADR 0006） |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [构建与验证](./build-and-verify.md) | make 体系详解 |
+| [模块全景](../05-modules/modules.md) | Topic 生产/消费关系全集 |
+</doc>
+
+<doc title="话题与数据流" path="02-architecture\data-flow.md">
+# 话题与数据流
+
+## 为什么先看数据流
+
+本仓库模块间**只通过 uORB 说话**（调用关系被架构门禁限制在依赖方向内）。读懂 Topic 拓扑 = 读懂整个系统。
+
+## Topic 生产/消费矩阵
+
+| Topic | 定义 | 生产者 | 消费者 | Source |
+|-------|------|--------|--------|--------|
+| `actuator_motors` | 电机归一化输出 | RoverDifferential | MotorOutput | [RoverDifferential.cpp:871](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferential.cpp#L871) |
+| `actuator_output_status` | 输出运行状态/停波证据 | MotorOutput | Commander、BootHealth、校准 | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+| `vehicle_status` / `armed` | 安全状态投影 | Commander | 全仓库 | [Commander.cpp:143](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/Commander.cpp#L143) |
+| `auto_calibration_status` | 11 状态 + 证据字段 | AutoCalibrationMode | Commander、BootHealth、MotorOutput | [AutoCalibrationStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/AutoCalibrationStatus.msg) |
+| `auto_calibration_request` | 启停/取消请求 | Commander / QGC | AutoCalibrationMode | [AutoCalibrationRequest.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/AutoCalibrationRequest.msg) |
+| `rover_motion_request` | 归一化运动意图 | 各模式 | RoverDifferential | [RoverMotionRequest.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/RoverMotionRequest.msg) |
+| `rover_control_status` | 控制内部状态（speed_integral 等） | RoverDifferential | 校准、日志 | [RoverControlStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/RoverControlStatus.msg) |
+| `sensor_gps` / `rtk_heading_status` | GNSS 位置/速度/基线航向 | Um982Gps | EKF2、校准、MAVLink | [Um982Gps.cpp:532](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp#L532) |
+| `vehicle_imu` / `vehicle_magnetometer` | 传感器数据 | VehicleImu / VehicleMagnetometer | EKF2、校准 | [VehicleImu.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/imu/VehicleImu.cpp) |
+| `parameter_update` | 参数变更通知 | ParameterService | MotorOutput 等需冻结快照的模块 | [RoverDifferential.cpp:105](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferential.cpp#L105) |
+
+## 主数据流：手动驾驶一拍
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant RC as rc 模块
+  participant CMD as Commander
+  participant RD as RoverDifferential
+  participant MO as MotorOutput
+  RC->>CMD: manual_control (SBUS)
+  CMD->>CMD: 安全评估 evaluate_safety
+  CMD->>RD: vehicle_status 投影 + 运动请求
+  RD->>RD: manual_source 仲裁 → PI/整形
+  RD->>MO: actuator_motors
+  MO-->>CMD: actuator_output_status（停波/健康证据）
+```
+<!-- Sources: Dima/modules/safety/Commander.cpp:143, Dima/rover/control/RoverDifferential.cpp:124, Dima/modules/motor/MotorOutput.cpp:15 -->
+
+## 主数据流：校准观测一拍
+
+```mermaid
+flowchart LR
+  GPS[Um982Gps] -->|sensor_gps + rtk_heading_status| AC[AutoCalibrationMode]
+  IMU[VehicleImu] -->|vehicle_imu| AC
+  MAG[VehicleMagnetometer] -->|vehicle_magnetometer| AC
+  MO[MotorOutput] -->|actuator_output_status| AC
+  AC -->|rover_motion_request| RD[RoverDifferential]
+  AC -->|auto_calibration_status| OUT[Commander/BootHealth/日志]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp:16, Dima/drivers/gps/um982/Um982Gps.cpp:532, Dima/modules/motor/MotorOutput.cpp:15 -->
+
+## 消息契约演进规则
+
+| 规则 | 出处 |
+|------|------|
+| 契约只放 schema（类型/常量/注释版本日期），不放逻辑 | [messages/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/README.md) |
+| MAVLink 按当前能力裁剪，禁止全量方言 | [AGENTS.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L63) |
+| 优先删减字段； MESSAGE_VERSION = 重新生成 hash/logger contract | [AutoCalibrationStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/AutoCalibrationStatus.msg) |
+
+日志侧的 Topic 登记：[logger_topics.yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/logger_topics.yaml)（49 Topics，经生成工具校验）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [分层架构与依赖规则](./layered-architecture.md) | 依赖方向的合同本体 |
+| [线程与调度](./threading-scheduling.md) | 这些 Topic 在哪些队列上流转 |
+| [模块全景](../05-modules/modules.md) | 生产者/消费者模块的实现 |
+</doc>
+
+<doc title="分层架构与依赖规则" path="02-architecture\layered-architecture.md">
+# 分层架构与依赖规则
+
+## 为什么存在这份合同
+
+无人车固件最常见的腐烂路径：某个模块图省事直接 include 了 HAL 或别的模块的头，三个月后没人能画出依赖图，改一处崩一片。本仓库的做法是**把依赖规则做成构建期门禁**——违规代码根本编译不过，而不是靠 code review 记住。
+
+## 依赖方向（硬合同）
+
+```mermaid
+graph TB
+  subgraph 上层
+    APP[application]
+    ROVER[rover]
+    MODS[modules]
+    MW[middleware]
+    LIB[lib]
+    MSG[messages]
+    ADP[adapters]
+  end
+  APP & ROVER & MODS & MW --> API[platform/api<br>capability 契约]
+  LIB --> API
+  ROVER --> MODS & MW & LIB & MSG
+  API --> FR[platform/freertos]
+  API --> STM[platform/stm32h7]
+  FR x--x STM
+  STM --> BOARD[Boards/H743]
+  BOARD x--x ROVER
+```
+<!-- Sources: AGENTS.md:52, docs/ARCHITECTURE_ZH.md:1 -->
+
+规则逐条（[AGENTS.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L52)）：
+
+| 规则 | 强制手段 |
+|------|----------|
+| `rover → modules / middleware / messages / lib / platform/api` | dependency.py 依赖图检查 |
+| `modules / middleware → platform/api`，**禁止反向依赖 rover** | 同上 |
+| `platform/freertos` 与 `platform/stm32h7` **互不包含** | fast 门禁 |
+| `Boards/H743` 不依赖上层控制模块 | full 审计 |
+| 上层禁止 include FreeRTOS/HAL/CMSIS/Core/Board/USB 生成头 | include 所有权检查 |
+| `platform_composition.cpp` 是唯一组合根 | full 审计（构建隔离） |
+
+## 目录职责
+
+| 目录 | 职责 | 明确禁止 |
+|------|------|----------|
+| `Dima/rover/` | 唯一 Rover 产品域：`control/`（差速控制）+ `modes/`（模式编排） | 放非算法代码到 lib |
+| `Dima/modules/` | 独立生命周期运行模块 | 互相 import 内部细节 |
+| `Dima/middleware/` | Parameter、uORB、WorkQueue、Event、Perf、Log | 感知业务语义 |
+| `Dima/messages/` | 共享消息契约（.msg） | 写逻辑 |
+| `Dima/lib/` | 平台无关算法 | 依赖任何硬件上下文 |
+| `Dima/adapters/` | 外部协议适配（USB Console、MAVLink） | 反向调用业务 |
+| `Dima/platform/` | `api/`（契约）、`freertos/`、`stm32h7/`（后端） | api 依赖具体后端 |
+| `Boards/H743/` | 板级初始化、Flash 布局、组合根 | 依赖上层控制模块 |
+| `Core/` | CubeMX/HAL 生成区 | 写任何业务逻辑 |
+
+## 组合根：唯一的装配点
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant BOOT as 启动流程
+  participant COMP as platform_composition.cpp
+  participant CTX as ApplicationContext
+  participant MODS as 各运行模块
+  BOOT->>COMP: 板级外设就绪
+  COMP->>COMP: 构造 stm32h7 后端对象
+  COMP->>CTX: 把 capability 注入应用上下文
+  CTX->>MODS: 创建并启动模块（经 flashfs 迁移等）
+  MODS-->>CTX: 就绪状态
+```
+<!-- Sources: Boards/H743/Src/platform_composition.cpp:1, Dima/rover/ApplicationContext.cpp:285 -->
+
+组合根唯一性的价值：比如 DNA 分配表迁移（ADR 0006）这类涉及多个存储域交接的变更，只需要在组合根/应用上下文一条链路上做（[ApplicationContext.cpp:285](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/ApplicationContext.cpp#L285) 的 `invalidate_records` 调用），不会出现第二个装配点漂移。
+
+## 门禁两档
+
+```mermaid
+flowchart LR
+  VERIFY[make verify] -->|fast ~5s| FAST[4 项关键检查]
+  CHECK[make check-architecture] -->|full ~15s| FULL[全量扩展审计]
+  FAST --> F1[依赖方向]
+  FAST --> F2[include 所有权]
+  FAST --> F3[硬件操作边界]
+  FULL --> F4[构建隔离/目录合同/命名空间...]
+```
+<!-- Sources: tools/check_architecture.py:4, GNUmakefile:48 -->
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [Capability 契约与组合根](../07-platform/platform.md) | 契约层的实现细节 |
+| [架构门禁与验证工具](../10-tooling/tooling.md) | 门禁如何机器化 |
+| [差速控制栈](../03-rover-domain/control-stack.md) | rover 域的内部结构 |
+</doc>
+
+<doc title="资源预算" path="02-architecture\resource-budget.md">
+# 资源预算
+
+## 四本账（当前基线）
+
+| 账本 | 占用 | 上限 | 使用率 | 风险位 |
+|------|------|------|--------|--------|
+| Flash | 586,528 B | 782,336 B | 75.0% | 健康 |
+| DTCM | 60,928 B | 65,536 B 静态预算 | 93% of budget | **紧张**（总 46.5% 但有专用静态预算） |
+| SRAM D1 | 352,256 B | 524,288 B | 67.2% | 健康 |
+| SRAM D2 data | 216,544 B | 262,144 B | **82.6%** | **告警区** |
+| DMA 区 | 7,744 B | 32,768 B | 23.6% | 健康 |
+
+数据来自 `make verify` 构建汇总（每次构建实时输出）；DTCM 另有 MSP 保留 64KB 未计入运行峰值。
+
+## Flash 优化战役
+
+```mermaid
+timeline
+  title Flash 占用演进（代码占比）
+  六重角色重构 : ~600KB 占用识别
+  减法重构批次 : 状态 47→11
+  LTO 启用 : 省 33.8 KiB（80.0%→75.6%）
+  公式删减 : dead 判据移除
+```
+<!-- Sources: make/project.mk:1141, docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md:1 -->
+
+| 优化 | 手段 | 效果 | Source |
+|------|------|------|--------|
+| LTO | `-flto` 全量 + 符号合同兜底 | -33.8 KiB | [project.mk:1141](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/project.mk#L1141) |
+| used 属性修复 | LTO 下的 io_stats/初始化数组保活 | 防 LTO 误删 | [tools/elf_support/layout.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/elf_support/layout.py) |
+| 公式删减 | 删 8 类无消费者判据/候选设计器 | 见删减清单 | [AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md) |
+| 行数门 | autocal 模块 <5890 行硬门 | 拆分+减法 | [rover/modes/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/README.md) |
+
+## RAM 纪律
+
+```mermaid
+flowchart LR
+  ALLOC[新增静态分配] --> Q{D2 data 余量?}
+  Q -->|82.6% 告警区| ALT[复用现有缓冲/挪 DMA 区]
+  Q -->|DTCM 静态预算| DT[4,608 B 余量<br>先算后用]
+  ALLOC --> ELF[ELF 验证 DMA 区边界 0x30040000]
+```
+<!-- Sources: tools/elf_support/layout.py, make/release.mk:17 -->
+
+- **D2 SRAM 是当前最紧的账**：新增大数组前先看构建汇总水位。
+- DMA 区域由 ELF 验证器强制（`0x30040000, 32768 bytes maximum`）——DMA 可达缓冲必须放对段。
+- 栈：MSP 保留 64KB（运行峰值未测量），任务栈静态给定。
+
+## 预算护栏机制
+
+1. 构建汇总每次输出全部分区水位 + 历史基线文档（[DIMA_RESOURCE_BASELINE_ZH.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DIMA_RESOURCE_BASELINE_ZH.md)）。
+2. ELF 验证器校验向量/DMA/符号合同，越界即失败。
+3. 阶段资源基线（PHASE3/4/5）记录每次功能波动的增量验收。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [构建与验证](../01-getting-started/build-and-verify.md) | 水位在构建汇总中查看 |
+| [构建、签名与 OTA](../09-build-release/build-release.md) | Flash 布局细节 |
+| [架构门禁与验证工具](../10-tooling/tooling.md) | ELF 层护栏实现 |
+</doc>
+
+<doc title="线程与调度" path="02-architecture\threading-scheduling.md">
+# 线程与调度
+
+## 调度模型
+
+本仓库采用 PX4 式 **WorkItem**：模块不是线程，而是挂在 WorkQueue 上的可调度单元——按周期或订阅事件排队执行。收益：单队列内天然串行（无锁化）、优先级分级清晰、避免"每模块一线程"的栈开销。
+
+| 队列角色 | 典型驻留 | 约束 |
+|----------|----------|------|
+| 实时控制 | RoverDifferential、MotorOutput | 禁阻塞调用；失鲜检查兜底 |
+| 传感器 | VehicleImu、VehicleMagnetometer、Um982Gps | 高频、小延迟 |
+| 通信 | Commander、MAVLink、UsbConsole | 中频；日志下载批量发送 |
+| 存储 | SdLogWriter、参数持久化 | 慢速大块 IO，独立队列避免拖垮控制 |
+| 低优先级 | 校准模式、日志契约 | 大计算（拟合）放低队列 |
+
+## 校准调度的周期选择
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Q as WorkQueue
+  participant AC as AutoCalibrationMode::step
+  participant T as poll_active_transaction
+  Q->>AC: 每 10ms（kIntervalUs）
+  AC->>AC: 门谓词 fresh/rtk_quality
+  AC->>AC: 阶段 step() 返回 StepResult
+  AC->>T: 事务轮询
+  AC-->>Q: publish 状态
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp:94 -->
+
+校准从 20ms 收紧到 **10ms**（[AutoCalibrationMode.hpp:94](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp#L94)）的原因：制动观测需要足够的 GNSS 历元密度与输出帧分辨率。
+
+## 失鲜检查：跨队列的时间合同
+
+跨队列通信没有锁，靠**时间戳新鲜度**兜底。各消费者独立定义失鲜窗，例如：
+
+| 判据 | 窗口 | Source |
+|------|------|--------|
+| `fresh(timestamp, now, limit)` 通用谓词 | 逐调用指定 | [Gates.cpp:16](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp#L16) |
+| actuator_output 失鲜 | 750ms（校准维护判定） | [Finalize.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationFinalize.cpp#L15) |
+| vehicle_status 新鲜度 | 3s（EKF2 静止约束） | [Ekf2Inputs.cpp:113](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/ekf2/Ekf2Inputs.cpp#L113) |
+| RTK 航向缓存 | 300ms | [Um982Gps.cpp:532](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp#L532) |
+
+重要细节：**新鲜度一律按"处理时刻"的单调时钟判定，不能拿两个消息的采样时间戳互比**——`vehicle_status` 可以晚于当前 IMU 采样到达，直接比较会把正常 Disarmed 反复判成过期（这是修过的真实 bug，见 [Ekf2Inputs.cpp:113](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/ekf2/Ekf2Inputs.cpp#L113) 注释）。
+
+## 调度抖动的防御
+
+```mermaid
+flowchart LR
+  J[调度抖动 105ms] --> SELF[模块自证判定 100ms]
+  SELF -->|击穿| FAIL[误报 CONTROL_LOSS]
+  DEF[消费端 ≤100ms 兜底] -.->|已知缓解| OK[不级联]
+```
+<!-- Sources: docs/ 与实车日志分析结论；防御点见 Dima/rover/modes/auto_calibration/AutoCalibrationDiagnostics.cpp:14 -->
+
+实车曾出现 105ms 调度抖动击穿 100ms 自证判定的事件（无人干预）；防御原则是**消费端对瞬态失鲜有兜底**，单次抖动不得直接升级为失败——新增自证判定时必须同时给出消费端兜底。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [话题与数据流](./data-flow.md) | 在队列间流转的内容 |
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 最大周期用户 |
+| [BootHealth 喂狗策略](../05-modules/boot-health.md) | 调度健康的最终权衡者 |
+</doc>
+
+<doc title="AutoMode 航段任务" path="03-rover-domain\auto-mode.md">
+# AutoMode 航段任务
+
+## 定位
+
+AutoMode 是 Mission（自主航段）模式：把任务拆成 STRAIGHT/TURN 等段，用共享引导原语跟踪，产出 `rover_motion_request` 交给差速层。它与自动校准**共享同一套引导原语**（这是官方调参计划的关键决策：校准不另造导航）。
+
+## 组件表
+
+| 组件 | 职责 | Source |
+|------|------|--------|
+| AutoMode | 段推进、参数快照绑定、错误入口 | [AutoMode.cpp:328](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto/AutoMode.cpp#L328) |
+| PurePursuit | 纯跟踪横向制导 | [PurePursuit.cpp:132](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/PurePursuit.cpp#L132) |
+| SegmentGuidance | 航段几何：到达速度、进度更新 | [SegmentGuidance.hpp:18](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/SegmentGuidance.hpp#L18) |
+| Heading/Driving 控制器 | 航向环 + 驱动环（公共内环） | [RoverControl.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/RoverControl.hpp) |
+
+## 段推进
+
+```mermaid
+stateDiagram-v2
+  [*] --> 段装载
+  段装载 --> 跟踪: prepare_segment
+  跟踪 --> 跟踪: run_guidance 每拍
+  跟踪 --> 到达: 段进度完成
+  到达 --> 段装载: 下一段
+  到达 --> ERROR: 配置无效/失鲜
+  ERROR --> [*]: enter_error
+```
+<!-- Sources: Dima/rover/modes/auto/AutoMode.cpp:328 -->
+
+`run_guidance` 每拍产出 GuidanceOutput（期望速度+偏航率）；段几何（`update_segment`、到达速度）由 SegmentGuidance 提供——校准的路径验证复用同一实现（[AutoCalibrationPath.cpp:276](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationPath.cpp#L276) 直接调用 `dima::lib::rover::update_segment`）。
+
+## 参数快照绑定
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant PS as ParameterService
+  participant AM as AutoMode
+  participant CFG as 内部 Config
+  PS->>AM: parameter_update 通知
+  AM->>AM: invalidate_parameter_bindings
+  AM->>AM: Disarmed 快照新鲜时 apply_parameter_snapshot
+  AM-->>AM: 校准参数代次核对后应用
+```
+<!-- Sources: Dima/rover/modes/auto/AutoMode.cpp:328 -->
+
+与全仓库一致的规则：**Armed 运行中不应用参数**；快照在安全窗口应用，且校准相关参数需核对代次（`calibration_parameters_applied`）防止旧代次覆盖新会话。
+
+## 与校准的共享边界
+
+| 共享 | 不共享 |
+|------|--------|
+| PurePursuit / SegmentGuidance / Heading / Driving | 模式层编排（校准有自己的 SessionController） |
+| 公共速度/偏航率内环 | 候选事务（仅校准有） |
+| 围栏/安全链 | 电机直接发布权（校准永不直接发 PWM） |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [差速驱动与控制环](./differential-drive.md) | 请求的最终执行者 |
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 复用同一引导原语的另一模式 |
+| [话题与数据流](../02-architecture/data-flow.md) | rover_motion_request 契约 |
+</doc>
+
+<doc title="制动接管" path="03-rover-domain\braking-takeover.md">
+# 制动接管
+
+## 背景：为什么制动是专页
+
+弱动力车的制动曾连续多轮实车失败（倒退误判、指数尾不可辨识、振铃污染），最终收敛为当前设计：**有界反向驱动制动 + 两轮自校准比例律 + 位置法候选**。执行层落在 `RoverDifferentialBraking.cpp`（从 RoverDifferential 拆出的独立文件）。
+
+## 组件表
+
+| 组件 | 职责 | Source |
+|------|------|--------|
+| `calibration_braking_command` | 制动接管执行入口 | [RoverDifferentialBraking.cpp:8](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferentialBraking.cpp#L8) |
+| `stopping_distance` / 比例律 | 停距与增益数学 | [CalibrationBraking.hpp:5](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationBraking.hpp#L5) |
+| `MagMotorOutputHistory::reverse_impulse` | 反向冲量 J 积分 | [MagMotorOutputHistory.hpp:17](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/magnetometer/MagMotorOutputHistory.hpp#L17) |
+| 校准锁存 | 两轮制动验证协议 | [RoverDifferentialCalibration.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferentialCalibration.cpp) |
+
+## 接管判据（执行层五路）
+
+```mermaid
+flowchart TB
+  IN[本拍纵向/转向请求] --> P{probe? straight_active 且非加速相}
+  IN --> STOP{明确零/零停车意图}
+  IN --> FULL{full_output_trial}
+  IN --> LIM{开环超速且过释放线}
+  P & STOP & FULL & LIM --> TAKEN[接管：公共停车通路]
+  CLOSED[闭环请求] -->|不接管| PI[交速度 PI 处理]
+```
+<!-- Sources: Dima/rover/control/RoverDifferentialBraking.cpp:8 -->
+
+合同要点（源码注释即合同）：
+- **零/零请求 = 停车意图**：不等 `motion_allowed=false`（那时请求已被上游撤销）。
+- **闭环不覆盖 PI**：巡航限速只服务未标定开环；PI 之后不得再覆盖纵/转向。
+- **回带迟滞**：释放线 = 限速 − max(0.08, 测量阈值)；超速立即接管，回下边界才释放。
+- **GNSS 速度龄期保守计龄**：速度落后时计入历元差，不向未来外推。
+
+## 比例律与两轮协议
+
+```mermaid
+stateDiagram-v2
+  [*] --> gen0: 首轮无模型
+  gen0 --> 有界返程: 临时观测
+  gen0 --> gen1:首轮完成
+  gen1 --> ACT: 以实际减速度规划
+  ACT --> SETTLE: 速度过零
+  SETTLE --> 静止确认: RTK 位置静止滑窗
+  静止确认 --> gen2: 第二轮验证
+  gen2 --> [*]: g=J/(E·T·Δv) 收敛
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationBraking.cpp:14, Dima/rover/control/RoverDifferentialCalibration.cpp -->
+
+第一轮用有界返程提供临时观测；第二轮验证新策略并使用其实际减速度。停距 = 名义距离 + v×delay（`MOT_REV_DELAY` 是已知等待，后端首次反向时间补充真实等待——不固定假设 0.3s）。
+
+## 观测证据链
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AC as 校准模式
+  participant MH as 电机输出历史
+  participant RTK as RTK 速度
+  participant G as 门谓词
+  AC->>MH: reverse_impulse(from,to)
+  MH-->>AC: J, J², 反向时刻（仅已应用负向输出）
+  RTK-->>G: 起末速度/历元（龄期保守计龄）
+  G-->>AC: 停止=位置静止滑窗确认
+  AC->>AC: g = J/(E·T·Δv)
+```
+<!-- Sources: Dima/modules/sensors/magnetometer/MagMotorOutputHistory.hpp:17, Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp:230 -->
+
+反向制动不可辨识（滑停主导）时的退化行为与失败分类见 [自动校准状态机](../04-auto-calibration/state-machine.md) 的 FINALIZE 族。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 制动观测的调度方 |
+| [差速驱动与控制环](./differential-drive.md) | 被接管的正常通路 |
+| [UM982 链路](../08-drivers/um982.md) | 速度龄期的生产端 |
+</doc>
+
+<doc title="差速控制栈" path="03-rover-domain\control-stack.md">
+# 差速控制栈
+
+## 概览
+
+| 组件 | 职责 | 关键文件 | Source |
+|------|------|----------|--------|
+| RoverDifferential | 差速控制核心：模式路由、PI 环、模式来源仲裁 | `Dima/rover/control/RoverDifferential.cpp` | [RoverDifferential.hpp:115](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferential.hpp#L115) |
+| RoverDifferentialBraking | 校准制动接管：比例律制动、限速迟滞带 | `RoverDifferentialBraking.cpp` | [RoverDifferentialBraking.cpp:8](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferentialBraking.cpp#L8) |
+| RoverDifferentialCalibration | 校准锁存协议（两轮制动验证） | `RoverDifferentialCalibration.cpp` | [RoverDifferentialCalibration.cpp:1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferentialCalibration.cpp#L1) |
+| lib/rover 公共算法 | 混控、纯跟踪、段引导、校准数学 | `Dima/lib/rover/` | [CalibrationBraking.hpp:5](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationBraking.hpp#L5) |
+| AutoMode | 航段任务模式（Mission） | `Dima/rover/modes/auto/AutoMode.cpp` | [AutoMode.cpp:328](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto/AutoMode.cpp#L328) |
+
+## 控制管线
+
+```mermaid
+flowchart LR
+  REQ[运动请求<br>Manual/Auto/校准] --> ARB[模式来源仲裁]
+  ARB --> PI[速度 PI / 偏航率 PI]
+  PI --> MIX[差速混控 shape_motor]
+  MIX --> LIMIT[限幅/斜坡]
+  LIMIT --> PUB[actuator_motors 发布]
+  BRAKE[制动接管] -.->|校准停波/超速| PUB
+  FENCE[速度限迟滞带] -.-> BRAKE
+```
+<!-- Sources: Dima/rover/control/RoverDifferential.hpp:115, Dima/rover/control/RoverDifferentialBraking.cpp:8 -->
+
+## 制动接管（Braking takeover）
+
+`RoverDifferential::calibration_braking_command` 是校准制动的执行层。设计要点（全部可在源码注释与逻辑中追溯）：
+
+- **零请求即停车意图**：正常有效零/零请求直接进入停车通路，不等 `motion_allowed=false`（那时请求已被上游安全检查撤销）。
+- **限速迟滞带**：超速立即接管；释放须回到下边界（`release_speed`），避免在同一限速线上反复换向。
+- **闭环不覆盖 PI**：巡航限速只服务未标定的开环输入；闭环已有速度 PI，不得在 PI 计算后再覆盖纵向/转向（否则候选验证混入另一套控制器）。
+- **GNSS 速度龄期保守计龄**：速度落后时把历元差计入年龄，不向未来外推。
+
+```mermaid
+stateDiagram-v2
+  [*] --> 正常控制
+  正常控制 --> 制动接管: 超出限速带 / 校准零请求
+  制动接管 --> 制动接管: 速度>释放线
+  制动接管 --> 正常控制: 速度回到下边界
+  正常控制 --> [*]
+```
+<!-- Sources: Dima/rover/control/RoverDifferentialBraking.cpp:8 -->
+
+## lib/rover 公共算法
+
+| 算法 | 用途 | Source |
+|------|------|--------|
+| `DifferentialDrive` | 差速混控 + 起步下限（弱动力车死区跳过） | [DifferentialDrive.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/DifferentialDrive.cpp) |
+| `PurePursuit` / `SegmentGuidance` | 路径跟踪与航段推进（校准与 AutoMode 共享） | [SegmentGuidance.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/SegmentGuidance.cpp) |
+| `CalibrationBraking` | 停距 + 比例制动输入增益数学 | [CalibrationBraking.hpp:5](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationBraking.hpp#L5) |
+| `CalibrationIdentification` | 一阶+延迟模型辨识，PI 候选用 Skogestad 解析公式 | [CalibrationIdentification.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationIdentification.cpp) |
+| `CalibrationResponse` | 响应统计：平台判据、低速下界 | [CalibrationResponse.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationResponse.cpp) |
+| `CalibrationMath::CircularMean` | 圆均值（带浓度判据，用于 RTK 航向一致性） | [CalibrationMath.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationMath.hpp) |
+| `CalibrationFence` | 圆形围栏评估 | [CalibrationFence.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationFence.cpp) |
+
+## 制动输入的测量闭环
+
+校准制动增益 g = J/(E·T·Δv) 的 J（反向冲量）来自电机输出历史的反向积分：
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AC as 校准模式
+  participant MH as MagMotorOutputHistory
+  participant MO as MotorOutput
+  participant RTK as UM982
+  AC->>MH: 请求区间 [from, to] 反向冲量
+  MH->>MO: 读已应用输出历史（32 条环形）
+  MH->>MH: 零阶保持积分两侧负向幅值
+  MH-->>AC: impulse / squared_impulse / 反向时刻
+  RTK-->>AC: 起末速度 Δv（带龄期保守计龄）
+  AC->>AC: g = J/(E·T·Δv)
+```
+<!-- Sources: Dima/modules/sensors/magnetometer/MagMotorOutputHistory.hpp:17, Dima/lib/rover/CalibrationBraking.hpp:5, Dima/rover/control/RoverDifferentialBraking.cpp:8 -->
+
+关键约束：只积分**已应用**的负向输出，未知区间拒绝——不能把未执行的请求当成制动力。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 制动观测的调度方 |
+| [模块全景](../05-modules/modules.md) | MotorOutput 输出链 |
+| [驱动与传感器链路](../08-drivers/drivers.md) | RTK 速度/航向来源 |
+</doc>
+
+<doc title="差速驱动与控制环" path="03-rover-domain\differential-drive.md">
+# 差速驱动与控制环
+
+## 组件表
+
+| 组件 | 职责 | Source |
+|------|------|--------|
+| `DifferentialDrive` | 输入整形（死区/起步下限/EXPO）→ 左右轮输出 | [DifferentialDrive.cpp:149](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/DifferentialDrive.cpp#L149) |
+| `SpeedController` | 前向速度 PI（车体系） | [RoverControl.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/RoverControl.hpp) |
+| `YawRateController` | 偏航率 PI | [RoverControl.hpp:144](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/RoverControl.hpp#L144) |
+| `RoverDifferential` | 模式来源仲裁 + 环路组装 + `actuator_motors` 发布 | [RoverDifferential.cpp:124](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferential.cpp#L124) |
+
+## 一拍控制流水线
+
+```mermaid
+flowchart TB
+  REQ[rover_motion_request<br>speed_m_s + yaw_rate_rad_s] --> SP[速度 PI]
+  YAW[期望偏航率] --> YP[偏航率 PI]
+  SP --> MIX[DifferentialDrive.update]
+  YP --> MIX
+  MIX --> OUT[左右轮 + speed_integral 回填 rover_control_status]
+```
+<!-- Sources: Dima/rover/control/RoverDifferential.cpp:124, Dima/lib/rover/DifferentialDrive.cpp:149 -->
+
+## 起步下限（弱动力车关键设计）
+
+弱动力车实测单轮约 0.15、双轮约 0.20 归一化输出才起步——死区内只有 cogging 摆振与大电流。`shape_motor` 的处理：
+
+| 输入 | 行为 | Source |
+|------|------|--------|
+| 精确零 | 不加补偿，直出零 | [DifferentialDrive.cpp:149](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/DifferentialDrive.cpp#L149) |
+| 手动正向杆量越死区 | 抬到起步下限（参数化） | 同上 |
+| 校准起步加速分支 | 同样保底 | [params yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml) |
+| 倒退/闭环调速/减速 | 不受下限影响 | 同上 |
+
+历史教训：校准专属轮端限速 + 无效周期归零曾把前进削成脉动爬升，导致单轮破摩阻原地枢转——起步下限与"无效周期不归零"是这一教训的结构化修复。
+
+## 偏航率 PI
+
+```mermaid
+stateDiagram-v2
+  [*] --> 空闲
+  空闲 --> 调节: 期望偏航率有效
+  调节 --> 饱和: 舵量到顶
+  饱和 --> 调节: 误差回落
+  调节 --> 空闲: 请求归零（积分冻结策略）
+```
+<!-- Sources: Dima/lib/rover/RoverControl.hpp:144, Dima/lib/rover/RoverControl.cpp -->
+
+`valid_yaw_rate_config` 在配置加载时把关（死区/限幅/积分限一致），坏配置拒绝启用而不是带病运行。
+
+## 参数冻结与租约
+
+RoverDifferential 订阅 `parameter_update`，在 Disarmed 快照新鲜时应用参数（[RoverDifferential.cpp:105](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferential.cpp#L105)）； Armed 行驶期间参数冻结——这是所有"运行中改参"模块的统一模式。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [差速控制栈](./control-stack.md) | 本页的上级总览 |
+| [制动接管](./braking-takeover.md) | 覆盖本页输出的校准路径 |
+| [手动模式语义](./manual-mode.md) | manual_source 的上游 |
+</doc>
+
+<doc title="手动模式语义" path="03-rover-domain\manual-mode.md">
+# 手动模式语义
+
+## 为什么值得单独一页
+
+"同一根遥控杆在不同模式下行为不一致"是本仓库历史上被反复审计的主题（[MANUAL_DRIVE_DIRECTION_AUDIT_ZH.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/MANUAL_DRIVE_DIRECTION_AUDIT_ZH.md)）。RC/PWM 反转都在共享层，但 DifferentialDrive 的 manual_source 曾有四处分叉——审计合并后统一了语义。
+
+## 手动链路
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant RC as rc 模块（SBUS）
+  participant CMD as Commander
+  participant RD as RoverDifferential
+  participant DD as DifferentialDrive
+  participant MO as MotorOutput
+  RC->>CMD: manual_control
+  CMD->>RD: vehicle_status(MANUAL) + 请求
+  RD->>RD: manual_source 仲裁（手动分支）
+  RD->>DD: 归一化 T/Y
+  DD->>DD: 死区→起步下限→EXPO
+  DD->>MO: actuator_motors（左右轮）
+```
+<!-- Sources: Dima/rover/control/RoverDifferential.cpp:124, Dima/lib/rover/DifferentialDrive.cpp:149, Dima/modules/rc/README.md -->
+
+## 语义合同（审计定稿）
+
+| 事项 | 合同 | Source |
+|------|------|--------|
+| 电机左右侧别 | 以站在**车尾、面朝车头**的视角定义（与前进方向一致） | [actuator params yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml) |
+| RD_REV_STEER | **已退役**——倒车转向不再有反转开关，保持单侧 PWM 方向合同 | [params yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml) |
+| MOT_THR_MIN 地板 | 仅手动享有（AUTO 停走的第一嫌疑曾在此） | [rc/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/rc/README.md) |
+| 起步下限 | 覆盖手动正向杆量与校准起步分支 | [DifferentialDrive.cpp:149](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/DifferentialDrive.cpp#L149) |
+| 上锁输出 | Disarmed 输出 CENT 中位；Kill/故障/停波窗口停止脉冲 | [commissioning doc](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md) |
+
+## 安全语义差异
+
+```mermaid
+flowchart TB
+  DISARMED[普通 Disarmed] --> CENT[有效通道输出 CENT 中位]
+  KILL[Kill/故障/失效] --> STOP[停止脉冲]
+  CALSTOP[校准停波窗口] --> STOP
+  NOTE["电调必须分别验证：中位停止 vs 无信号停止；撤驱动力≠机械制动"]
+  CENT -.-> NOTE
+  STOP -.-> NOTE
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:1, Dima/platform/api/Flash.hpp:59 -->
+
+上车验收必须覆盖这两种停止方式的差异——坡面上"中位停止"与"无信号停止"的溜车行为不同（指南明确写了边界）。
+
+## 电机诊断流的退役
+
+原 `MavlinkDriveDiagnostics`（手动 Armed 时每秒四条 STATUSTEXT 输出 `[drive in]` 诊断）已删除——诊断职责回归日志与地面站遥测，避免低速率诊断通道与实时控制争资源（[mavlink README](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/README.md)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [差速驱动与控制环](./differential-drive.md) | 整形与环路实现 |
+| [Commander 安全链](../05-modules/commander.md) | 手动模式的状态门 |
+| [MotorOutput 输出链](../05-modules/motor-output.md) | 物理输出的最后一级 |
+</doc>
+
+<doc title="激励与剖面观测" path="04-auto-calibration\excitation-profiling.md">
+# 激励与剖面观测
+
+## 激励设计原则
+
+校准的可观测性来自**激励**。本仓库的激励合同：初始直线为开环激励（不做闭环假设）、观测窗口有明确的开始/结束边界、动力学量不做先验硬门（两类门公理）。
+
+## 响应窗口机制
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant E as Excitation（阶段文件）
+  participant W as 响应窗口
+  participant RS as ResponseStatistics
+  E->>W: begin_profile_window(now, rate)
+  E->>W: record_response_sample(ts, value, usable)
+  W->>RS: 有效样本入统计
+  E->>W: finish_response_window(rate)
+  W-->>E: 平台/瞬态斜率结果
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationExcitation.cpp:18, Dima/lib/rover/CalibrationResponse.cpp -->
+
+窗口函数族（[Excitation.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationExcitation.cpp)）：`begin_profile_window`（区分速度/角速度窗）→ 逐样本 `record_response_sample`（可标记不可用）→ `reset_response_tail` → `finish_response_window`。观测数学在 `lib/rover/CalibrationResponse`（平台判据 + 低速下界）。
+
+## 慢转向两级激励
+
+```mermaid
+flowchart TB
+  SLOW[慢转向: 低速率起步] --> GATE{能否建立角速度?}
+  GATE -->|不能| L2[第二级: 提高速率]
+  GATE -->|能| COLLECT[采样至窗口满]
+  L2 --> COLLECT
+  COLLECT --> CHECK{车辆无关物理门通过?}
+  CHECK -->|是| OK[有效转向观测]
+  CHECK -->|否| UNAV[组级 unavailable<br>不伪造数据]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp:16, docs/AUTO_CALIBRATION_STATE_MACHINE_ZH.md:1 -->
+
+两级激励是对"激励锁定即冻结"教训的修复：第一级速率不够时允许行为升档（这不是动力学硬门，是激励调节）；仍然不满足时组如实失败。
+
+## PROFILE 窗
+
+| 项 | 合同 | Source |
+|----|------|--------|
+| 目的 | 固定速度平台下的响应剖面（速度/角速度阶跃响应） | [Profile.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationProfile.cpp) |
+| 圈数 | 每向 1 圈 + bias 窗跑满 45s 帽（设计行为：PROFILE 从旋转终点起跑） | [rover/modes/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/README.md) |
+| 航向修正 | 三套私有航向修正已删（真实围栏+公共安全链执行） | [FORMULA_REMOVAL](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md) |
+| TURN→PROFILE | 无回场步骤属设计行为（正常 2 圈 / 最多 4） | [rover/modes/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/README.md) |
+
+## 观测去向
+
+| 观测 | 消费者 | 产出 |
+|------|--------|------|
+| 速度响应 | 速度模型辨识 | 一阶+延迟候选 |
+| 角速度响应 | 转向模型辨识 | 偏航率模型候选 |
+| 电机响应剖面 | MotorResponseProfile | 平台下界（低速不可辨识保护） |
+| 磁场样本 | 磁校准（另页） | 椭球/油门补偿 |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [会话生命周期](./session-lifecycle.md) | 窗口挂在哪个阶段 |
+| [辨识与 PI](./identification-pi.md) | 窗口数据的下游 |
+| [RTK 与导航](./rtk-navigation.md) | 直线段的 GNSS 观测 |
+</doc>
+
+<doc title="收尾与失败分类" path="04-auto-calibration\finalize-failures.md">
+# 收尾与失败分类
+
+## FINALIZE 族：一次收尾，三种结局
+
+候选提交、用户取消、会话失败共用同一条收尾链：**停波/Disarm → 组回滚 → 按需恢复会话 RAM → 一次保存**。
+
+```mermaid
+flowchart TB
+  ENTER[enter_finalize] --> WAIT{等待 Disarm 确认}
+  WAIT --> MR{maintenance_ready?}
+  MR -->|故障/失鲜/15s 超窗| FAILPATH[不写参数不恢复输出<br>锁存 FAILURE_CONTROL_LOSS]
+  MR -->|是| RB[组回滚 abort_rollback_complete]
+  RB --> RESTORE[恢复会话 RAM]
+  RESTORE --> SAVE[一次保存<br>session_save]
+  SAVE --> DONE[terminate/finish]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationFinalize.cpp:15 -->
+
+决策锁与握手链条不变（自 Mode.cpp 原样迁入）；`maintenance_ready` 要求 ArmedFlash 维护锁 + 输出后端确认。
+
+## 停波确认链
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AC as 校准模式
+  participant F as ArmedFlash
+  participant MO as MotorOutput/PWM
+  AC->>F: 校准停波锁存
+  F->>MO: set_calibration_output_inhibited(true)
+  MO->>MO: Hard Safe Off + 停帧确认
+  MO-->>F: calibration_output_stopped 证据
+  F-->>AC: 停波完成（可写参数）
+```
+<!-- Sources: Dima/platform/api/Flash.hpp:59, Dima/modules/motor/MotorOutput.cpp:15, Dima/modules/boot_health/BootHealthService.cpp:305 -->
+
+Commander 故障 Disarm 会把 External1 切回 Manual，但**校准回滚仍需完成**——BootHealth 的 `calibration_rollback_safe` 例外窗口（30s、要求停波锁仍有效 + Hard Safe Off 证据）允许继续发行 Runtime 健康代次喂 IWDG，**绝不允许任何 PWM 恢复**（[BootHealthService.cpp:305](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/boot_health/BootHealthService.cpp#L305)）。
+
+## 失败枚举（uORB 契约）
+
+| 枚举 | 含义 | 典型根因 |
+|------|------|----------|
+| `FAILURE_SENSOR_STALE` | 传感器失鲜 | GNSS/IMU 断流 |
+| `FAILURE_FENCE_SPACE` | 越围栏 | 场地不足 |
+| `FAILURE_PATH_UNOBSERVABLE` | 路径不可观测 | 参数钳位/前视圆过大 |
+| `FAILURE_CONTROL_LOSS` | 控制丢失 | 105ms 调度抖动击穿自证（有消费端兜底） |
+| `RESULT_CANCELLED` | 用户/上游取消 | 手动切模式（曾有误记为 FAILED 的通道，已防） |
+
+完整枚举见 [AutoCalibrationStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/AutoCalibrationStatus.msg)。
+
+## 诊断报告
+
+```mermaid
+flowchart LR
+  FAILC[capture_motion_failure] --> EVI[复制三短行证据<br>时间戳龄期/速度/航向]
+  EVI --> ST[STATUSTEXT 传输<br>127B 容量内拆分]
+  FAILC --> LATCH[失败确认点锁存<br>回滚后仍报同一现场]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationDiagnostics.cpp:14 -->
+
+`capture_motion_failure` 只在**失败确认点**复制证据（不新增周期采样）；年龄编码 -1=无样本、9999=约 10 秒封顶，防止失鲜时间撑爆 STATUSTEXT 正文。
+
+## saved=0 是设计
+
+保存成功后参数计数为 0（`saved=0x0`）是**统一保存设计**——所有变更已应用到活动层并由统一保存落盘，不是丢失。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [事务与组调度](./transactions-groups.md) | 回滚的执行者 |
+| [Capability 契约与组合根](../07-platform/platform.md) | 停波窗口的契约层 |
+| [BootHealth 喂狗策略](../05-modules/boot-health.md) | 回滚窗口的例外判定 |
+</doc>
+
+<doc title="辨识与 PI 公式" path="04-auto-calibration\identification-pi.md">
+# 辨识与 PI 公式
+
+## 辨识模型
+
+被控对象建模为**一阶带延迟**：`G(s) = K·exp(-θs)/(τs+1)`。辨识器为 `FirstOrderDelayIdentifier`（ARX-RLS 带延迟 bank），输入是控制器整形前的归一化输入到车体响应——**单位与公共 PI 一致，E 只由公共混控施加一次**（第二套线性拟合与 PI 坐标换算已删）。
+
+| 组件 | 职责 | Source |
+|------|------|--------|
+| `FirstOrderDelayIdentifier` | ARX-RLS 延迟 bank 拟合 K/τ/θ | [CalibrationIdentification.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationIdentification.cpp) |
+| `StepResponseValidator` | 阶跃响应有效性（超时/超调/平台） | 同上 |
+| `calculate_inner_gains` | 由模型计算内环增益候选 | [AutoCalibrationIdentification.cpp:137](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationIdentification.cpp#L137) |
+
+## Skogestad 解析 PI
+
+```mermaid
+flowchart LR
+  MODEL[一阶+延迟模型<br>K, τ, θ] --> SIMC[Skogestad SIMC 公式<br>式 23/24, 2003]
+  SIMC --> CAND[PI 候选 Kp/Ki]
+  CAND --> LIMITS[pi_limits_valid 校验]
+  LIMITS --> TX[事务候选]
+```
+<!-- Sources: Dima/lib/rover/CalibrationIdentification.cpp, docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md:1 -->
+
+公式来源（有出处的替换，非发明）：Sigurd Skogestad, *Simple analytic rules for model reduction and PID controller tuning*, J. Process Control 13 (2003) 291–309，第 295 页式 (23)(24)；来源与勘误链接记录在 [FORMULA_REMOVAL 文档](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md)与 [DIMA_SOURCE_MANIFEST.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DIMA_SOURCE_MANIFEST.md)。FF 余量不足时组如实失败，**禁比例法**（不允许用经验比例凑 FF 缺口）。
+
+## 候选校验链
+
+```mermaid
+stateDiagram-v2
+  [*] --> 辨识中: 响应窗口数据
+  辨识中 --> 拟合评估: 窗口满
+  拟合评估 --> 有效: identification_config_valid + evaluate_model
+  拟合评估 --> 失败: 配置无效/模型不收敛
+  有效 --> PI候选: Skogestad
+  PI候选 --> 事务: pi_limits_valid 通过
+  PI候选 --> 失败: FF 余量不足
+  失败 --> [*]: 组级 unavailable
+```
+<!-- Sources: Dima/lib/rover/CalibrationIdentification.cpp, Dima/rover/modes/auto_calibration/AutoCalibrationIdentification.cpp:137 -->
+
+## 删除清单（防回潮）
+
+| 已删除 | 理由 | Source |
+|--------|------|--------|
+| 控制器输入→电机输入第二套线性拟合 | 单位二义；直接辨识归一化输入到车体 | [FORMULA_REMOVAL](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md) |
+| 斜率 0.1..10 门、能量残差 0.25% 门 | 无产品运行证据的先验硬门 | 同上 |
+| PI 二次坐标换算 | 与公共 PI 单位合同冲突 | 同上 |
+| 首轮转向/前馈/动态模型三处 20% 双向增益差门 | 妨碍有效样本利用；保留两方向各自有效性 | 同上 |
+
+## 增益验证
+
+候选经事务写入后由 [GainValidation](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGainValidation.cpp) 闭环验证（inner/heading 分窗），验证失败的组按依赖传播回滚——见 [事务与组调度](./transactions-groups.md)。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [激励与剖面观测](./excitation-profiling.md) | 辨识的数据来源 |
+| [事务与组调度](./transactions-groups.md) | 候选的提交路径 |
+| [RTK 与导航](./rtk-navigation.md) | 减速度候选的并行法则 |
+</doc>
+
+<doc title="磁校准与磁油门补偿" path="04-auto-calibration\magnetic-calibration.md">
+# 磁校准与磁油门补偿
+
+## 两个目标
+
+磁校准阶段回答两件事：① 磁力计本身准不准（偏场/椭球/扇区覆盖）；② 电机电流对磁场的干扰有多大（磁油门补偿）。
+
+## 扇区采集
+
+```mermaid
+flowchart TB
+  ROT[原地旋转采集] --> SEC{sector 覆盖计数}
+  SEC -->|不足| MORE[继续旋转]
+  SEC -->|足量| FIT[椭球/偏场拟合]
+  FIT --> Q{拟合质量门}
+  Q -->|过| TX[事务候选]
+  Q -->|不过| UNAV[组失败如实报告]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationMag.cpp:90 -->
+
+`collect_mag(now, direction)` 按旋转方向采集（[AutoCalibrationMag.cpp:90](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationMag.cpp#L90)），`sectors(mask)` 统计扇区覆盖；`finish_mag(bootstrap)` 判定采集完整性。
+
+## 磁油门补偿事务
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AC as 校准模式
+  participant MH as MagMotorOutputHistory
+  participant TX as CalibrationParameters 事务
+  AC->>MH: sample_mag_throttle 逐档采样
+  MH-->>AC: 各油门档磁场干扰观测
+  AC->>TX: begin_mag_transaction 候选
+  TX->>TX: Provisional 写入
+  AC->>TX: commit_mag_throttle（前端确认后）
+  TX-->>AC: Commit / Rollback
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationMag.cpp:215, Dima/rover/modes/auto_calibration/AutoCalibrationMag.cpp:256, Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp:14 -->
+
+合同：`begin_mag_transaction`/`commit_mag_throttle` 建立事务候选，**事务身份由调度器统一登记**——阶段文件不自行管理事务生命周期（[Mag.cpp:49](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationMag.cpp#L49) 注释）。
+
+## 反向冲量的双用途历史
+
+`MagMotorOutputHistory` 的 32 条环形输出历史服务两个观测：
+
+| 消费 | 用途 | Source |
+|------|------|--------|
+| 磁油门补偿 | 各油门档的磁场干扰曲线 | [Mag.cpp:215](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationMag.cpp#L215) |
+| 制动输入增益 | `reverse_impulse` 反向冲量 J | [MagMotorOutputHistory.hpp:17](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/magnetometer/MagMotorOutputHistory.hpp#L17) |
+
+## 模式内磁参数与全局参数的边界
+
+| 参数 | 归属 | 说明 |
+|------|------|------|
+| 磁偏场/椭球 | 传感器校准域 | 由 [VehicleMagnetometer](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/magnetometer/VehicleMagnetometer.cpp) 与 SensorCalibration 管理 |
+| 磁油门补偿 | 校准会话事务 | 候选制，失败回滚 |
+| 电机 MIN/EXPO/ASYM | **不归校准管**——候选设计器已删（无产品运行调用） | [FORMULA_REMOVAL](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md) |
+
+## 磁身份统一
+
+磁场来源节点号不再走 `MAG1_CAN_NODE` 参数——由首个合法磁场广播推断（[middleware/parameters/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/README.md)），DroneCAN 设备身份见 [DroneCAN 链路](../08-drivers/dronecan.md)。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [事务与组调度](./transactions-groups.md) | 事务机细节 |
+| [UM982 链路](../08-drivers/um982.md) | 航向替代来源（磁失效时） |
+| [会话生命周期](./session-lifecycle.md) | MAGNETIC 阶段的位置 |
+</doc>
+
+<doc title="RTK 与校准导航" path="04-auto-calibration\rtk-navigation.md">
+# RTK 与校准导航
+
+## RTK 在校准里的三个角色
+
+| 角色 | 内容 | Source |
+|------|------|--------|
+| 速度观测 | 停车确认（位置静止滑窗）、减速度候选 | [AutoCalibrationRtk.cpp:480](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L480) |
+| 能力观测 | 最大速度候选（上界通过=删失观测，不反解等式） | [AutoCalibrationRtk.cpp:230](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L230) |
+| 航向基准 | rtk_yaw_fused 一致性 + 返场基准 | [Gates.cpp:16](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp#L16) |
+
+## 速度解振铃教训（位置法唯一法则）
+
+实车曾连续两天出现"制动倒退 -0.35 m/s"假象——根因是 GNSS 速度解在急停时振铃（轮端已零、航向稳）。定案修复：
+
+```mermaid
+flowchart LR
+  V[GNSS 速度解] --> NEG[负历元判据: 已删]
+  V --> POS[位置法候选:<br>min(Δv/Δt, v0²/2d)]
+  POS --> STOP[停稳门: 位置静止滑窗]
+  STOP --> OK[减速度候选]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp:480, docs/AUTO_CALIBRATION_STATE_MACHINE_ZH.md:1 -->
+
+时间法被实证虚高 2×；**位置法（位移交叉校验）是减速度候选的唯一法则**，负历元判据已删。
+
+## rtk_yaw_fused 与旋转自锁
+
+已定案问题：`rtk_yaw_fused` 的 5° 一致性检查在旋转速度下抖动，会清零稳定窗造成自锁（6 圈 = 每向 1 圈 + bias 窗跑满 45s 帽的定案与此相关）。圆均值带浓度判据（[CalibrationMath.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationMath.hpp)）用于野点剔除——返程 rocking（速度矢量 180° 逐历元翻转野点）曾击穿 finish_rtk 的 0.998 圆均值门。
+
+## 返场（Return）
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AC as 校准调度器
+  participant RN as Return 阶段文件
+  participant F as 围栏圆心
+  AC->>RN: WantReturn 进入
+  RN->>RN: distance_to_start / heading_to_start
+  RN->>RN: STRAIGHT 段保留标定采样
+  RN->>RN: Align 对齐（蜗速预算 90s）
+  RN-->>AC: Advance 后按 resume_substate 恢复
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationReturn.cpp:13, Dima/rover/modes/auto_calibration/AutoCalibrationNavigation.cpp:11 -->
+
+返场按**入场 GNSS 点（围栏圆心）**返回；超时/传感器失败经 `abort_step` 上抛。实车教训：Align 蜗速 2°/s × 90s 预算耗尽曾导致整场 TIMEOUT（RTK 健康、恒差 16.8° = 安装偏置）。
+
+## 路径验证（官方调参法）
+
+| 项 | 合同 | Source |
+|----|------|--------|
+| 共享实现 | `update_segment`/PurePursuit/Heading/Driving 与 AutoMode 完全同源 | [AutoCalibrationPath.cpp:276](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationPath.cpp#L276) |
+| jerk 观测 | 直接用 EKF 车辆参考点 NED 加速度逐历元投影，不用天线二次差分 | [OFFICIAL_TUNING_PLAN](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_OFFICIAL_TUNING_PLAN_ZH.md) |
+| RED 能力 | 上界通过=删失观测；四点路径观察转弯能力 | 同上 |
+| 观测不足 | 不进入搜索收缩；超时=未完成（不误判能力边界） | 同上 |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [UM982 链路](../08-drivers/um982.md) | 速度/航向的生产端与配对规则 |
+| [制动接管](../03-rover-domain/braking-takeover.md) | 减速度候选的消费方 |
+| [收尾与失败分类](./finalize-failures.md) | 返场失败的上抛处置 |
+</doc>
+
+<doc title="会话生命周期" path="04-auto-calibration\session-lifecycle.md">
+# 会话生命周期
+
+## SessionController：唯一状态属主
+
+校准模式压平后，所有"进行到哪了"的状态收敛进 `SessionController`（内部结构，非 uORB）：子状态、事务身份、停车意图、直行方向、轮次、回滚标记。外部世界只看到 11 个 uORB 状态（[AutoCalibrationStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/AutoCalibrationStatus.msg)）。
+
+| 字段族 | 内容 | Source |
+|--------|------|--------|
+| `substate` / `substate_started` | PhaseSubstate{WaitArm,Running,TurnAround,Return,Braking,WaitStop,Evaluate} + 时间戳 | [AutoCalibrationMode.hpp:94](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp#L94) |
+| `kind` / `transaction_stages` | 当前事务身份（Level/Rtk/Dynamics/Magnetic/…/Gains） | [Transactions.cpp:14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp#L14) |
+| `stop_intent` | None/Braking/RtkCommit | 同上 |
+| `straight_outward` / `turn_direction` / `turn_round` | 运动几何记忆 | [Fence.cpp:30](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationFence.cpp#L30) |
+| `force_rollback` / `abort_reason` / `abort_group` | 失败会计 | [GroupScheduler.cpp:10](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGroupScheduler.cpp#L10) |
+
+## 启动序列
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Commander
+  participant AC as AutoCalibrationMode
+  participant F as ArmedFlash
+  C->>AC: request（start/level）
+  AC->>F: 校准停波锁存（Level 型可 Armed）
+  F-->>AC: motion_inhibited / 后端确认
+  AC->>AC: begin() → WaitArm
+  AC->>AC: 预检（15s）→ 围栏捕获 capture_fence
+  AC-->>C: STATE_PREFLIGHT → STRAIGHT
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp:94, Dima/rover/modes/auto_calibration/AutoCalibrationFence.cpp:30, Dima/platform/api/Flash.hpp:59 -->
+
+## WaitArm 四合一
+
+历史上四套 WaitArm 等待逻辑（模式内/Commander 侧/恢复路径/取消路径）合并为一个 `step_wait_arm`——RequestExit 单发、请求不重发、臂态与停波窗统一判定。
+
+## 围栏捕获
+
+```mermaid
+flowchart LR
+  ENTER[入场点] --> CAP[capture_fence<br>记录圆心=入场 GNSS 点]
+  CAP --> REF[围栏参考基准]
+  REF --> EVAL[update_fence 每拍评估<br>evaluate_circle]
+  EVAL --> OK[在圈内]
+  EVAL --> BAD[越界 → FAILURE_FENCE_SPACE]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationFence.cpp:30, Dima/lib/rover/CalibrationFence.cpp:67 -->
+
+围栏语义（上车指南强调过）：`RO_CAL_DIST` 约束直线、`RO_CAL_RADIUS` 约束转圈与二维路径，参考入场固定 GNSS 点——**不是全程物理安全围栏**。
+
+## 会话失败与恢复
+
+| 事件 | 处置 | Source |
+|------|------|--------|
+| 预检失败 | 终止会话，报告原因 | [Gates.cpp:16](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp#L16) |
+| 传感器失鲜 | 组级 unavailable（不中断整场） | [GroupScheduler.cpp:10](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGroupScheduler.cpp#L10) |
+| REQUEST_EXIT | 单发发布；Commander 握手期只 Disarm 不切模式 | [CommanderAutoCalibration.cpp:34](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderAutoCalibration.cpp#L34) |
+| 会话级失败 | enter_finalize → 回滚 → 一次保存 | [Finalize.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationFinalize.cpp#L15) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [状态机总览](./state-machine.md) | 本页是状态机的深读 |
+| [事务与组调度](./transactions-groups.md) | 事务身份如何挂到会话上 |
+| [收尾与失败分类](./finalize-failures.md) | 会话的最终处置 |
+</doc>
+
+<doc title="阶段深读：GainParameters.cpp" path="04-auto-calibration\stage-gain-params.md">
+# 阶段深读：GainParameters.cpp
+
+`AutoCalibrationGainParameters.cpp`（54 行）是增益组事务的**接线文件**：事务开启、前端确认、控制器就绪三件事。
+
+## 函数地图
+
+| 函数 | 职责 | Source |
+|------|------|--------|
+| `begin_gain_transaction(now, group)` | 开启增益组事务（按组位） | [GainParameters.cpp:18](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGainParameters.cpp#L18) |
+| `gain_frontend_confirmed` | 增益前端确认（差速层对新增益的确认） | [GainParameters.cpp:35](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGainParameters.cpp#L35) |
+| `gain_controller_ready` | 增益控制器就绪（验证闭环可用） | [GainParameters.cpp:44](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGainParameters.cpp#L44) |
+
+## 在增益链中的位置
+
+```mermaid
+flowchart LR
+  ID[辨识候选<br>Skogestad PI] --> TX[begin_gain_transaction<br>kind=Gains]
+  TX --> PV[Provisional 生效]
+  PV --> GV[GainValidation 闭环验证<br>inner/heading 分窗]
+  GV --> FC{gain_frontend_confirmed?}
+  FC -->|是| COMMIT[Commit]
+  FC -->|否/失败| RB[Rollback → 组级会计]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationGainParameters.cpp:18, Dima/rover/modes/auto_calibration/AutoCalibrationGainValidation.cpp:1, Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp:14 -->
+
+## 与组调度的关系
+
+增益组依赖 IMU/磁组（依赖位在 `kGroupSteps` 表）；本文件不感知依赖——依赖由 [GroupScheduler](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGroupScheduler.cpp) 的 `group_entry_available` 把关（进场门禁：依赖未完成/unavailable 都不许入场）。
+
+**文件小的原因**：v4 重构后"事务推进"全部收敛到 Transactions.cpp 统一事务机，阶段文件只保留本阶段特有的确认判据——这是"阶段文件只返回 StepResult、不自行 transition()"合同的直接体现。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [事务与组调度](./transactions-groups.md) | 事务机与组依赖 |
+| [辨识与 PI 公式](./identification-pi.md) | 候选来源 |
+| [收尾与失败分类](./finalize-failures.md) | 回滚收尾 |
+</doc>
+
+<doc title="阶段深读：Rtk.cpp" path="04-auto-calibration\stage-rtk.md">
+# 阶段深读：Rtk.cpp
+
+`AutoCalibrationRtk.cpp`（569 行）是实验动作的**唯一实现地**：所有直线/制动/转角实验动作都以 `StepResult` 函数形式在这里（[AutoCalibrationRtk.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp)）。
+
+## 函数地图
+
+| 函数 | 行 | 职责 | Source |
+|------|-----|------|--------|
+| `baseline_collect` | 18 | 基线采集（静态观测窗） | [Rtk.cpp:18](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L18) |
+| `straight_leg` | 40 | 直线段执行（去程/返程共用） | [Rtk.cpp:40](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L40) |
+| `observe_straight` | 88 | 直线观测（含 `full_output_trial` 全输出试验） | [Rtk.cpp:88](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L88) |
+| `speed_model_leg` | 144 | 速度模型段 | [Rtk.cpp:144](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L144) |
+| `request_turn_rate` / `stop_turn_rate_request` | 257/241 | 转向激励请求 | [Rtk.cpp:257](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L257) |
+| `straight_turnaround` | 358 | 直线掉头 | [Rtk.cpp:358](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L358) |
+| `turn_spin` | 377 | 原地转圈 | [Rtk.cpp:377](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L377) |
+| `finish_rtk` | 480 | RTK 组收口判定 | [Rtk.cpp:480](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L480) |
+
+## 全输出制动试验的数据流
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant O as observe_straight(full_output_trial)
+  participant RD as 差速层（制动接管）
+  participant RTK as RTK 速度/位置
+  participant MH as 电机输出历史
+  O->>RD: 全输出直线（允许超 RO_SPEED_LIM）
+  RD->>RTK: 超速→接管→有界反向制动
+  RTK-->>O: 起末速度/历元（龄期保守计龄）
+  MH-->>O: 反向冲量 J
+  O->>O: g = J/(E·T·Δv)（位置法候选）
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp:88, Dima/rover/control/RoverDifferentialBraking.cpp:8, Dima/modules/sensors/magnetometer/MagMotorOutputHistory.hpp:17 -->
+
+## 关键判据（源码注释即合同）
+
+- **能力观测是删失的**：最大速度候选（[Rtk.cpp:230](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRtk.cpp#L230)）达到合法上界只证明"不低于"，不反解等式；候选有效性检查 `isfinite && >0 && ≤100`。
+- **停稳 = 位置静止滑窗**（负历元判据已删，时间法虚高 2×已弃用）。
+- 圆均值 0.998 门配浓度判据防返程 rocking 野点（[CalibrationMath.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationMath.hpp)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [RTK 与校准导航](./rtk-navigation.md) | 本页的上层概念 |
+| [制动接管](../03-rover-domain/braking-takeover.md) | 执行层 |
+| [激励与剖面观测](./excitation-profiling.md) | 观测窗口机制 |
+</doc>
+
+<doc title="阶段深读：RuntimeParameters.cpp" path="04-auto-calibration\stage-runtime-params.md">
+# 阶段深读：RuntimeParameters.cpp
+
+`AutoCalibrationRuntimeParameters.cpp`（163 行）把响应观测转成**运行参数候选**并走事务。
+
+## 函数地图
+
+| 函数 | 职责 | Source |
+|------|------|--------|
+| `origin_gain`（静态） | 从 MotorResponseProfile 提取某方向起步增益 | [RuntimeParameters.cpp:14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRuntimeParameters.cpp#L14) |
+| `calculate_runtime_candidates` | 汇总生成运行参数候选 | [RuntimeParameters.cpp:44](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRuntimeParameters.cpp#L44) |
+| `begin_runtime_transaction` | 开启 Runtime 事务 | [RuntimeParameters.cpp:99](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRuntimeParameters.cpp#L99) |
+| `runtime_frontend_confirmed` | 前端确认判据 | [RuntimeParameters.cpp:129](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRuntimeParameters.cpp#L129) |
+| `revise_runtime_candidates` | 修订候选（apply_revisions 路径） | [RuntimeParameters.cpp:140](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationRuntimeParameters.cpp#L140) |
+
+## 候选流水线
+
+```mermaid
+flowchart TB
+  PROF[MotorResponseProfile<br>各方向响应剖面] --> OG[origin_gain<br>方向起步增益]
+  OG --> CALC[calculate_runtime_candidates]
+  BRAKE[制动增益 g] --> CALC
+  CALC --> TX[begin_runtime_transaction<br>Provisional]
+  TX --> FE{runtime_frontend_confirmed?}
+  FE -->|是| COMMIT[Commit]
+  FE -->|新证据| REV[revise_runtime_candidates<br>apply_revisions]
+  FE -->|失败| RB[Rollback]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationRuntimeParameters.cpp:14, Dima/rover/modes/auto_calibration/AutoCalibrationRuntimeParameters.cpp:44 -->
+
+## 语义要点
+
+- **起步下限来自实测**：`origin_gain` 只从有效响应剖面提取（起步增益=实测平台），不从理论推——对应 `MOT_THR_MIN` 语义（[params yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml)）。
+- **revise 路径**：同会话内新证据到达时用 `apply_revisions` 修订而非重新开事务——候选代次连续，前端确认不重置。
+- 事务身份由调度器统一登记（`TransactionKind::Runtime`），本文件只提供候选与确认判据。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [事务与组调度](./transactions-groups.md) | 事务机本体 |
+| [辨识与 PI 公式](./identification-pi.md) | 候选数学 |
+| [差速驱动与控制环](../03-rover-domain/differential-drive.md) | 起步下限的消费方 |
+</doc>
+
+<doc title="阶段深读：Tuning.cpp" path="04-auto-calibration\stage-tuning.md">
+# 阶段深读：Tuning.cpp
+
+`AutoCalibrationTuning.cpp`（104 行）承载调参实验的反馈通路：读配置 → 验估计器 → 采样。
+
+## 函数地图
+
+| 函数 | 职责 | Source |
+|------|------|--------|
+| `read_tuning_config` | 读取本轮调参实验配置 | [Tuning.cpp:17](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationTuning.cpp#L17) |
+| `body_yaw` | 车体偏航角提取 | [Tuning.cpp:55](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationTuning.cpp#L55) |
+| `tuning_estimator_valid` | 估计器有效性门（新鲜度/状态） | [Tuning.cpp:62](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationTuning.cpp#L62) |
+| `tuning_feedback` | 反馈有效性（速度/角速度可观测） | [Tuning.cpp:81](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationTuning.cpp#L81) |
+| `take_tuning_sample` | 逐拍采样（区分速度/角速度窗） | [Tuning.cpp:92](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationTuning.cpp#L92) |
+
+## 采样通路
+
+```mermaid
+flowchart LR
+  CFG[read_tuning_config] --> EV{tuning_estimator_valid?}
+  EV -->|是| FB{tuning_feedback?}
+  FB -->|是| S[take_tuning_sample<br>按窗分类入响应统计]
+  FB -->|否| SKIP[本拍跳过，不伪造样本]
+  EV -->|否| UNAV[组级 unavailable]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationTuning.cpp:17 -->
+
+**跳过而非伪造**：估计器或反馈无效的拍不产生样本——这与"观测不足不进入搜索收缩"的官方调参原则一致（[OFFICIAL_TUNING_PLAN](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_OFFICIAL_TUNING_PLAN_ZH.md)）。
+
+## 与 GainValidation 的接力
+
+调参实验产生的观测由增益验证阶段消费（[GainValidation.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGainValidation.cpp) 的 inner/heading 分窗闭环验证）；`body_yaw` 等公共提取函数保持与导航实验同一坐标合同。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [辨识与 PI 公式](./identification-pi.md) | 候选生成 |
+| [激励与剖面观测](./excitation-profiling.md) | 窗口机制 |
+| [事务与组调度](./transactions-groups.md) | 验证失败的处理 |
+</doc>
+
+<doc title="自动校准状态机" path="04-auto-calibration\state-machine.md">
+# 自动校准状态机
+
+这是全仓库复杂度中心。历史上它经历过从 47 状态到 11 状态的整体替换（v4），再拆分为职责文件；本页描述当前形态。
+
+## 结构总览
+
+| 文件 | 职责 | Source |
+|------|------|--------|
+| `AutoCalibrationMode.cpp/.hpp` | 调度器主循环、状态属主 `SessionController` | [AutoCalibrationMode.hpp:94](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp#L94) |
+| `AutoCalibrationTransactions.cpp` | 统一事务机（apply/poll/rollback） | [Transactions.cpp:14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp#L14) |
+| `AutoCalibrationGates.cpp` | 测量/安全门谓词（fresh/rtk_quality/stopped…） | [Gates.cpp:16](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp#L16) |
+| `AutoCalibrationGroupScheduler.cpp` | 组依赖与失败会计 | [GroupScheduler.cpp:8](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGroupScheduler.cpp#L8) |
+| `AutoCalibrationReturn.cpp` | 返场阶段（按围栏圆心返回） | [Return.cpp:13](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationReturn.cpp#L13) |
+| `AutoCalibrationBraking.cpp` | 制动观测 helper | [Braking.cpp:14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationBraking.cpp#L14) |
+| `AutoCalibrationFinalize.cpp` | FINALIZE 族（停波/回滚/保存） | [Finalize.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationFinalize.cpp#L15) |
+| `AutoCalibrationDiagnostics.cpp` | 失败现场捕获与 STATUSTEXT 报告 | [Diagnostics.cpp:13](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationDiagnostics.cpp#L13) |
+| `CalibrationParameters.cpp/.hpp` | 候选参数事务机（Provisional→Commit/Rollback） | [CalibrationParameters.hpp:1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/CalibrationParameters.hpp#L1) |
+
+权威合同正文在 [Dima/rover/modes/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/README.md)（调度合同一节）；头文件只保留声明。
+
+## 状态模型
+
+```mermaid
+stateDiagram-v2
+  [*] --> WaitArm: begin()
+  WaitArm --> PREFLIGHT: Armed+预检
+  PREFLIGHT --> STRAIGHT: 围栏捕获
+  STRAIGHT --> TURN: 直线段完成
+  TURN --> STRAIGHT: 掉头/换向
+  STRAIGHT --> MAGNETIC: 磁测段
+  STRAIGHT --> PROFILE: PROFILE 窗
+  TURN --> IDENTIFICATION: 辨识数据足量
+  IDENTIFICATION --> VALIDATION: 候选生成
+  VALIDATION --> FINALIZE: 验证通过/失败
+  VALIDATION --> Return: 第二趟返程
+  Return --> VALIDATION: 回到起点
+  FINALIZE --> [*]: 停波/回滚/一次保存
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp:1, Dima/rover/modes/auto_calibration/AutoCalibrationMode.cpp:1 -->
+
+外层是 11 个 uORB 状态（`AutoCalibrationStatus.msg`）；内层由 `SessionController` 管理 `PhaseSubstate{WaitArm, Running, TurnAround, Return, Braking, WaitStop, Evaluate}` 与 `StepResult{Busy, Advance, WantTurn, WantBrake, WantReturn, WantStop, Failed, Abort}`——**阶段文件只返回 StepResult，禁止自行 transition()**（调度合同核心条款）。
+
+## 调度节奏
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Q as WorkQueue 10ms
+  participant S as step()
+  participant G as Gates
+  participant T as 事务机
+  Q->>S: 周期 tick
+  S->>G: fresh/rtk_quality/stopped 门
+  G-->>S: 通过/拒绝
+  S->>S: dispatch_step_result(当前阶段)
+  S->>T: poll_active_transaction
+  T-->>S: Provisional→确认→Commit/Rollback
+  S-->>Q: publish(status)
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp:94, Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp:14 -->
+
+调度周期 20ms→10ms（[AutoCalibrationMode.hpp:94](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationMode.hpp#L94)），为制动观测提供足够历元密度。
+
+## 事务机（候选参数的生死路径）
+
+```mermaid
+flowchart LR
+  CAND[候选生成] --> APPLY[apply 临时写入]
+  APPLY --> PROV[Provisional 生效]
+  PROV -->|前端确认| COMMIT[Commit 原子提交]
+  PROV -->|失败/超时| RB[Rollback]
+  APPLY -->|apply 部分失败| RB
+  RB --> RESTORE[恢复 RAM 会话]
+  COMMIT --> SAVE[统一一次保存]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp:14, Dima/middleware/parameters/flashfs.cpp:434 -->
+
+关键不变量：候选先登记身份再写入（apply 可能部分失败进 Rollback）；`saved=0` 是统一保存设计不是 bug；FAILURE_STORAGE 不降级。
+
+## 组调度与失败会计
+
+```mermaid
+graph TB
+  IMU[IMU bias 组] --> GAINS[增益组]
+  MAG[磁组] --> GAINS
+  GAINS --> RTKG[RTK 组]
+  RTKG --> DYN[动力学组]
+  DYN --> NAV[导航组]
+  FAIL[组失败] -.->|拓扑传播| DEP[所有依赖后继 unavailable]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationGroupScheduler.cpp:8 -->
+
+`group_dependents` 按拓扑序单遍扫描：依赖失败组的后继全部计入失败，不允许"假装可独立完成"。
+
+## 与安全链的握手
+
+校准启停由 Commander 仲裁（[CommanderAutoCalibration.cpp:34](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderAutoCalibration.cpp#L34)）：Level 型校准允许在 Armed 状态进入停波窗口（[Flash.hpp:59](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Flash.hpp#L59)），但要求 PWM 后端确认物理停波；回滚收尾期间 BootHealth 维持运行健康判定（[BootHealthService.cpp:305](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/boot_health/BootHealthService.cpp#L305)）。
+
+## 两类门公理（设计原则）
+
+- **动力学量是被测对象**：速度/角速度/加速度上限不允许先验硬门，只允许行为调整——否则校准器把探测判据当成了工作点。
+- **硬门只留车辆无关物理量**：位置（围栏）、IMU 质量、操作者输入，且测量源必须不振铃。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [差速控制栈](../03-rover-domain/control-stack.md) | 制动观测的执行层 |
+| [中间件服务](../06-middleware/middleware.md) | 候选事务的存储路径 |
+| [Capability 契约与组合根](../07-platform/platform.md) | ArmedFlash 停波窗口 |
+</doc>
+
+<doc title="事务与组调度" path="04-auto-calibration\transactions-groups.md">
+# 事务与组调度
+
+## 事务机：候选参数的生死合同
+
+校准产出的参数**永远不直接写**——走 `CalibrationParameters` 事务机：临时写入（Provisional）→ 生效观察 → 前端确认 → 原子提交；任何失败统一回滚。
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Applying: apply(kind, stages)
+  Applying --> Provisional: 写入生效
+  Provisional --> WaitingFrontend: 等待前端确认
+  Provisional --> RollingBack: 观察/确认失败
+  WaitingFrontend --> Committed: transaction_frontend_confirmed
+  WaitingFrontend --> RollingBack: 超时/拒绝
+  RollingBack --> Failed: abort_rollback_complete
+  Committed --> Idle: on_transaction_finished
+  Failed --> Idle: 组级会计
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/CalibrationParameters.hpp:20, Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp:14 -->
+
+## 身份先行
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant S as 调度器
+  participant T as 事务机
+  participant F as 前端（差速层/传感器）
+  S->>T: apply_transaction(kind, stages)
+  Note over T: 先登记 session_.kind 再写入
+  T->>T: apply / apply_revisions(provisional)
+  T-->>S: applied?
+  F-->>T: transaction_frontend_confirmed(now)
+  T->>T: Committed → on_transaction_finished
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationTransactions.cpp:14 -->
+
+关键细节：**候选准备好后先登记身份再写入**——apply 可能部分失败进 Rollback，等返回成功才登记会让回滚按旧 kind 确认错误的前端。
+
+## 四套轮询合一
+
+历史上 `poll_transaction` / `poll_gain` / `poll_imu` / `step_magnetic_transaction` 四套轮询并存；现收敛为 `poll_active_transaction` + 差异化回调（on_transaction_provisional / on_transaction_finished），`switch(phase)` 全模块仅一份。
+
+## 组调度与失败会计
+
+```mermaid
+flowchart TB
+  IMU[Imu bias] --> GAINS[Gains]
+  MAG[Magnetic] --> GAINS
+  GAINS --> RTK[Rtk]
+  RTK --> DYN[Dynamics]
+  DYN --> NAV[Navigation]
+  FAIL[任一组失败] --> PROP{group_dependents<br>拓扑序传播}
+  PROP --> DEP[依赖后继全部 unavailable]
+  PROP --> IND[无依赖组仍可独立完成]
+```
+<!-- Sources: Dima/rover/modes/auto_calibration/AutoCalibrationGroupScheduler.cpp:10 -->
+
+- `group_entry_available`：依赖组未完成/unavailable 都不许本组入场——**不能假装可独立完成**。
+- `group_dependents`：拓扑序单遍扫描，直接或链式引用失败组的后继全部计入（含失败组自身位）。
+- 两类门公理的落地：动力学量无先验硬门；固定加速度门滤波器已删（[Gates.cpp:16](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp#L16)）。
+
+## deferred_save_ 的删除
+
+旧设计里存在会话中途的延迟保存挂起；现在 **Phase::Saving 只属于 FINALIZE 的 session_save**——保存是收尾的一次性动作，不是过程中的状态。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [收尾与失败分类](./finalize-failures.md) | 回滚后的最终处置 |
+| [参数 / uORB / 存储域](../06-middleware/middleware.md) | 事务底层的参数写入 |
+| [磁校准](./magnetic-calibration.md) | 事务身份统一登记的案例 |
+</doc>
+
+<doc title="BootHealth 喂狗策略" path="05-modules\boot-health.md">
+# BootHealth 喂狗策略
+
+## 第一性约束
+
+IWDG 超时 2048ms。任何设计都不得让"模块自己的等待"超过它——这是 MotorOutput 参数应用 defer 250ms、租约超时、校准例外窗等全部设计的硬上界。
+
+## 运行健康判定
+
+```mermaid
+flowchart TB
+  RUN[Run 周期] --> OUT{output_status_runtime_healthy?}
+  OUT -->|是| FEED[喂狗]
+  OUT -->|否| NOFEED[不喂 → IWDG 复位]
+  OUT --> CAL{校准停波窗口?}
+  CAL -->|External1 + 停波证据 + 控制失效| OK[视为健康]
+```
+<!-- Sources: Dima/modules/boot_health/BootHealthService.cpp:78, Dima/modules/boot_health/BootHealthService.cpp:305 -->
+
+`output_status_runtime_healthy`（[BootHealthService.cpp:305](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/boot_health/BootHealthService.cpp#L305)）的三条校准例外：
+
+| 例外 | 条件 | 上限 |
+|------|------|------|
+| 停波窗口健康 | External1 + calibration 新鲜 + motion_inhibited + 后端停波确认 | 20s（维护近期）/ 200ms |
+| 回滚收尾健康 | !armed + Manual + 停波锁有效 + Hard Safe Off 证据 | 30s，且禁 Kill/Termination |
+| 过渡窗 | calibration_output_transition 200ms 内 + stopped_frame | kActuatorArmTransitionUs |
+
+## 两条铁律
+
+1. **例外绝不允许 Disarmed Neutral 或任何 PWM 恢复**——喂狗例外≠输出例外。
+2. **模块合同：电机侧问题不得阻塞 BootHealth/USB/MAVLink**——某模块故障不能拖垮喂狗链（[MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15)）。
+
+## 启动健康
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant BT as BootHealthService
+  participant MODS as 各模块
+  participant W as IWDG
+  BT->>MODS: 启动健康登记/依赖满足检查
+  MODS-->>BT: output_status 就绪
+  BT->>W: 进入周期喂狗
+  Note over BT: 启动失败路径不走 IWDG 复位<br>而是报告+安全态
+```
+<!-- Sources: Dima/modules/boot_health/BootHealthService.cpp:78 -->
+
+## 与其他模块的耦合
+
+| 模块 | 交互 | Source |
+|------|------|--------|
+| MotorOutput | 输出健康证据 + 参数 defer 上限 | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+| 校准模式 | 停波/回滚窗口的发起方 | [Finalize.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationFinalize.cpp#L15) |
+| Commander | External1/Manual 状态投影 | [Commander.cpp:143](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/Commander.cpp#L143) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [MotorOutput 输出链](./motor-output.md) | 健康证据来源 |
+| [收尾与失败分类](../04-auto-calibration/finalize-failures.md) | 回滚窗口的发起方 |
+| [构建、签名与 OTA](../09-build-release/build-release.md) | mcuboot watchdog 链验证 |
+</doc>
+
+<doc title="Commander 安全链" path="05-modules\commander.md">
+# Commander 安全链
+
+## 定位
+
+Commander 是安全状态的最终处置者：RC、Kill、Failsafe、参数与执行器故障都在这里收敛为 `vehicle_status`/`armed` 投影。其余模块**只观察、不处置**（校准模式的门谓词明确声明这一点，[Gates.cpp:16](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto_calibration/AutoCalibrationGates.cpp#L16)）。
+
+## 解锁状态机
+
+```mermaid
+stateDiagram-v2
+  [*] --> Disarmed
+  Disarmed --> Armed: preflight_checks_pass + 解锁
+  Armed --> Disarmed: 解锁/故障/RC loss(Disarm)
+  Armed --> External1: Level 校准受理
+  External1 --> Armed: 校准收尾
+  Disarmed --> Termination: Kill/失效
+```
+<!-- Sources: Dima/modules/safety/Commander.cpp:143, Dima/modules/safety/CommanderSafety.cpp:137 -->
+
+## 预检
+
+`preflight_checks_pass` 检查左右电机功能分配等基础项（[CommanderSafety.cpp:80](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderSafety.cpp#L80)）；摇杆居中、传感器标定、实际电机方向属于操作员确认项（上车指南边界：**Manual 解锁不替代上车检查**）。
+
+## 强制解锁消抖
+
+```mermaid
+flowchart LR
+  FRAME[单帧瞬态<br>EMI/SBUS 坏帧] --> OLD[旧: 一帧即杀]
+  FRAME --> NEW[新: 20~50ms 持续确认起点]
+  NEW --> CONFIRM[持续确认成立才终止会话]
+  OLD -.->|曾误杀正常会话| LESSON[教训沉淀]
+```
+<!-- Sources: Dima/modules/safety/Commander.cpp:143 -->
+
+单帧瞬态（电机堵转 EMI 让 SBUS 坏一帧、控制链单帧无效）历史上一帧即杀会话与解锁；现在强制解锁需要持续确认窗。
+
+## 校准握手
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant QGC as 地面站/RC
+  participant C as Commander
+  participant AC as 校准模式
+  QGC->>C: start_auto_calibration
+  C->>C: start/stop/revoke 仲裁（无 resume 旁路）
+  C->>AC: request 单发发布
+  C->>C: auto_calibration_control_inhibit_expected / output_stopped 判定
+  C-->>QGC: 状态投影（nav_state External1）
+```
+<!-- Sources: Dima/modules/safety/CommanderAutoCalibration.cpp:34 -->
+
+握手重构要点：`resume_auto_calibration`/`revoke_auto_calibration` 旁路已移除——Arm/Disarm 不再携带校准续跑参数，消除 REQUEST_EXIT 自取消竞态；COMMANDER 判定 `control_inhibit_expected`/`output_stopped` 与 ArmedFlash 证据对齐。
+
+## Failsafe
+
+| 触发 | 处置 | Source |
+|------|------|--------|
+| RC loss | Disarm（当前合同） | [CommanderSafety.cpp:137](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderSafety.cpp#L137) |
+| 数据链 loss | 不触发自动返航（RC 才是主链） | [commissioning](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md) |
+| 执行器故障 | Disarm + 事件 | [CommanderSafety.cpp:137](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderSafety.cpp#L137) |
+| 动作执行 | `execute_action`（[CommanderActions.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderActions.cpp)） | |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [MotorOutput 输出链](./motor-output.md) | 停波证据生产者 |
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 握手的对端 |
+| [手动模式语义](../03-rover-domain/manual-mode.md) | 手动链路的状态门 |
+</doc>
+
+<doc title="EKF2 输入" path="05-modules\ekf2.md">
+# EKF2 输入
+
+## 定位
+
+`Ekf2Inputs` 把传感器话题打包成 EKF2 输入并维护系统标志（armed/静止/地面检测等）。它消费 uORB、产出估计器输入，**不做传感器业务**。
+
+## 时间语义（修过的真实 bug）
+
+```mermaid
+flowchart LR
+  VS[vehicle_status 到达] --> WRONG{拿 status.timestamp<br>与 IMU sample_time_us 比?}
+  WRONG -->|是| BUG[正常 Disarmed 被反复判过期<br>静止约束随调度抖动]
+  WRONG -->|否 正确做法| OK[新鲜度用处理时刻 now_us]
+  IMU[IMU 采样时间] --> OUT[系统标志仍用采样时刻]
+```
+<!-- Sources: Dima/modules/ekf2/Ekf2Inputs.cpp:113 -->
+
+合同（源码注释+README）：**状态新鲜度按当前处理时刻的单调时钟判断**；`vehicle_status` 可以晚于当前 IMU 样本到达，二者直接比较会把正常状态反复判成过期，导致静止约束和地面 GNSS 检查随任务调度抖动。未来时间戳或 >3s 仍按未知运动处理。
+
+## 系统标志
+
+| 标志 | 判据 | Source |
+|------|------|--------|
+| 静止约束 | vehicle_status 新鲜（≤3s）+ 状态投影 | [Ekf2Inputs.cpp:113](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/ekf2/Ekf2Inputs.cpp#L113) |
+| 地面检测 | 静止 + GNSS 检查 | 同上 |
+| Armed 投影 | Commander 状态 | [Commander.cpp:143](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/Commander.cpp#L143) |
+
+## 输入清单
+
+| 输入 | 来源 | 备注 |
+|------|------|------|
+| IMU | VehicleImu | 多实例 |
+| GNSS | sensor_gps / rtk_heading_status | 位置/速度/航向 |
+| 磁力计 | VehicleMagnetometer | 校准后数据 |
+| 状态 | vehicle_status | 见时间语义 |
+
+## 与校准的关系
+
+校准模式大量消费 EKF 风格的车辆参考点数据（如 jerk 观测直接用 EKF NED 加速度逐历元投影——[OFFICIAL_TUNING_PLAN](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_OFFICIAL_TUNING_PLAN_ZH.md)），**不**自建私有滤波器（导航私有 0.5s 滤波器已删，复用 EKF 滤波与 200ms 失鲜合同）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [话题与数据流](../02-architecture/data-flow.md) | 输入 Topic 全集 |
+| [RTK 与校准导航](../04-auto-calibration/rtk-navigation.md) | jerk/加速度的下游消费 |
+| [线程与调度](../02-architecture/threading-scheduling.md) | 失鲜判定的调度背景 |
+</doc>
+
+<doc title="日志系统" path="05-modules\logging.md">
+# 日志系统
+
+## 结构
+
+| 组件 | 职责 | Source |
+|------|------|--------|
+| SdLogWriter | ULog 写入主循环（存储队列） | [SdLogWriter.cpp:292](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/SdLogWriter.cpp#L292) |
+| LogWriter | 写接口 + 存储失败处置 | [LogWriter.cpp:332](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/LogWriter.cpp#L332) |
+| logger_topics.yaml | Topic 登记（49 Topics） | [logger_topics.yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/logger_topics.yaml) |
+| generate_logger_contract.py | 从 uORB 元数据推导格式缓存容量 | [generate_logger_contract.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/logging/generate_logger_contract.py) |
+
+## 会话与命名
+
+```mermaid
+flowchart LR
+  START[开始记录] --> SESS[sessNNN 会话目录]
+  SESS --> NAME[ULog 文件按北京时间<br>月日时分.ulg 例 09181430.ulg]
+  NAME --> FALLBACK[授时无效→log100.ulg<br>不中途改名]
+  SESS --> META[meta.bin：CRC 记录<br>顺序/UID/关闭状态/GPS UTC]
+  ENDX[停止/写满] --> RECYCLE[sessNNN → delNNN 回收]
+```
+<!-- Sources: Dima/platform/api/LogFileStore.hpp, Dima/modules/logging/SdLogWriter.cpp:292 -->
+
+双名识别兼容老卡；命名规则固化在 [LogFileStore.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/LogFileStore.hpp)（含 UTC+8 偏移常量）。
+
+## 授时链
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant UM as Um982 RMC
+  participant SW as SdLogWriter
+  participant FAT as FatFs get_fattime
+  UM->>SW: UTC 微秒 + timestamp_time_relative
+  SW->>SW: 会话开始时刻确定文件名
+  FAT->>FAT: UTC 映射 + 单调时钟 → 北京时间
+  Note over FAT: _FS_NORTC=0 + f_utime 补齐修改日期
+```
+<!-- Sources: Dima/modules/logging/SdLogWriter.cpp:292, Middlewares/Third_Party/FatFs/src/ffconf.h, Boards/H743/Src/fatfs_diskio.cpp -->
+
+FatFs 侧改动：`_USE_CHMOD=1`（启用 f_utime）、`_FS_NORTC=0`（get_fattime 从已确认 UTC 映射生成北京时间，无须硬件 RTC）；`dima_sdmmc_get_io_stats` 加 `used` 属性防 LTO 内部化。
+
+## 格式缓存容量推导
+
+| 旧 | 新 |
+|----|----|
+| 把上游 `ulog_message_format_s::format[1600]` 当协议上限 | 从 uORB 生成元数据推导最大压缩/展开字段长度与 Topic 名 |
+| 长消息卡死 Definitions 阶段 | 独立输出缓存展开 `name:fields`，容量超 uint16 边界时**生成期失败** |
+
+无别名的格式组跳过字符串展开，有输出组背压重试（[SdLogWriter.cpp:558](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/SdLogWriter.cpp#L558)）。
+
+## 空间策略
+
+| 项 | 值 |
+|----|----|
+| 停止线 | 10 MiB（曾 50 MiB） |
+| 回收目标 | 与停止线同值，写满卡滚动 |
+| SDLOG_DIRS_MAX | 默认 50 先于空间触发；写满卡场景调 999 |
+| 恢复 | wq:storage 分步推进 sessNNN→delNNN |
+
+存储失败经 `handle_storage_failure` 统一处置（[LogWriter.cpp:332](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/LogWriter.cpp#L332)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [MAVLink 链路](./mavlink.md) | 日志下载的对端 |
+| [UM982 链路](../08-drivers/um982.md) | 授时来源 |
+| [参数 / uORB / 存储域](../06-middleware/middleware.md) | SD 介质会话共享 |
+</doc>
+
+<doc title="MAVLink 链路" path="05-modules\mavlink.md">
+# MAVLink 链路
+
+## 结构
+
+| 组件 | 职责 | Source |
+|------|------|--------|
+| MavlinkService / Endpoint | 端点生命周期与发送节拍 | [MavlinkService.cpp:176](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkService.cpp#L176) |
+| MavlinkSensorStreams | 13 路传感器/估计器遥测流 | [MavlinkSensorStreams.cpp:481](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkSensorStreams.cpp#L481) |
+| MavlinkLogHandler | 日志列表/下载/擦除 | [MavlinkLogHandler.cpp:730](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkLogHandler.cpp#L730) |
+| MavlinkIdentity / Manager | 身份与组件管理 | [MavlinkManager.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkManager.cpp) |
+
+## 方言裁剪原则
+
+MAVLink C 库是**生成物不入库**（权威位置 `build/generated/mavlink/`），从锁定 XML + 受校验的 pymavlink 缓存生成；按当前系统实际能力裁剪，禁止全量引入（[AGENTS.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L63)）。
+
+## GPS_RAW_INT 航向合同
+
+```mermaid
+flowchart LR
+  RTK[rtk_heading_status] --> FRESH{航向样本+发布时间<br>均 ≤300ms?}
+  FRESH -->|是| ENC[yaw = heading − yaw_offset<br>编码 0.01deg]
+  FRESH -->|否| ZERO[清零]
+  ENC --> OUT[GPS_RAW_INT]
+  ZERO --> OUT
+```
+<!-- Sources: Dima/modules/mavlink/MavlinkSensorStreams.cpp:481, Dima/modules/mavlink/README.md -->
+
+要点：`sensor_gps.heading = NaN` 表示本拍无新航向观测，**不能**用来决定遥测是否显示航向；RTK 速度重配不延长航向寿命；正北编码 36000、0 保留不可用。
+
+## 日志下载三态协议
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant QGC as QGC
+  participant LH as MavlinkLogHandler
+  participant USB as Console/CDC
+  QGC->>LH: LOG_REQUEST_DATA(id, offset)
+  LH->>LH: 同 id 复用已开 reader
+  LH->>USB: 32 帧批次（3488B）
+  USB-->>LH: Confirmed / InFlight / Rejected
+  Note over LH: InFlight → tx_idle() 确认后按 sequence 消费
+  LH-->>QGC: LOG_DATA
+```
+<!-- Sources: Dima/modules/mavlink/MavlinkLogHandler.cpp:730, Dima/modules/mavlink/README.md -->
+
+| 设计点 | 值 | 理由 |
+|--------|-----|------|
+| 批次 | 32 帧 | 恰好一个 QGC chunk 完整响应 |
+| 三态消费 | Confirmed 立即弹 / InFlight 保留 / Rejected 重试 | "提交即超时"批次不能重发也不能丢（迟到 IRQ 会把已提交批次变空闲） |
+| 提交判定 | 取自本次 transmit 结果，**不能用超时后 tx_idle() 推断** | 否则重复发送 |
+| reader 复用 | 同 id 连续请求 | 避免每 2880B 重开 ULog |
+| QGC written 字段 | 累计量含重传，超 size 不代表文件变大 | 需核对实际文件长度 |
+
+## 退役项
+
+`MavlinkDriveDiagnostics`（手动模式 STATUSTEXT 电机诊断流）已删除；诊断回归日志与遥测流。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [USB Console](../07-platform/usb-console.md) | 底层 CDC 写语义 |
+| [日志系统](./logging.md) | 被下载的 ULog 结构 |
+| [话题与数据流](../02-architecture/data-flow.md) | 遥测流的数据源 |
+</doc>
+
+<doc title="模块全景" path="05-modules\modules.md">
+# 模块全景
+
+## 模块清单
+
+| 模块 | 职责 | 关键合同 | Source |
+|------|------|----------|--------|
+| motor/MotorOutput | PWM 输出后端、安全限幅、ArmedFlash 租约 | 参数应用经租约；故障不阻塞喂狗链 | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+| safety/Commander | 解锁/导航状态/failsafe/校准握手 | 强制解锁需持续确认；RC 是安全主链 | [CommanderAutoCalibration.cpp:34](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderAutoCalibration.cpp#L34) |
+| boot_health | IWDG 喂狗策略与启动健康 | 校准停波/回滚窗口的例外判定 | [BootHealthService.cpp:305](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/boot_health/BootHealthService.cpp#L305) |
+| mavlink | 地面站链路：遥测/参数/日志下载 | 32 帧批次 + 三态消费 | [MavlinkService.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkService.cpp) |
+| logging | ULog 飞行日志 | 格式缓存按生成元数据推导；北京时间授时 | [SdLogWriter.cpp:558](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/SdLogWriter.cpp#L558) |
+| sensors/imu + mag | IMU/磁力计数据通路 | 状态新鲜度按处理时刻单调时钟 | [VehicleImu.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/imu/VehicleImu.cpp) |
+| sensors/calibration | 传感器校准（含自动 Level） | AUTO 校准可在停波窗口执行 | [SensorCalibration.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/calibration/SensorCalibration.cpp) |
+| ekf2 | EKF2 输入打包 | 静止约束与地面 GNSS 检查 | [Ekf2Inputs.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/ekf2/Ekf2Inputs.cpp) |
+| parameters | 参数服务与持久化 | 多域存储 + 慢就绪恢复 | [ParameterServicePersistence.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/parameters/ParameterServicePersistence.cpp) |
+| rc | SBUS 遥控输入 | RC 是安全主链路 | [rc/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/rc/README.md) |
+
+## MotorOutput：执行链的枢轴
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant R as RoverDifferential
+  participant M as MotorOutput
+  participant F as ArmedFlash
+  participant P as PWM 后端
+  R->>M: actuator_motors
+  M->>F: ConfigurationUpdateLease 申请
+  F-->>M: 授予/拒绝（Arm 沿等窗口保护）
+  M->>P: 限幅后输出 + 停波确认
+  P-->>M: hard safe off 证据
+  M-->>R: actuator_output_status
+```
+<!-- Sources: Dima/modules/motor/MotorOutput.cpp:15, Dima/platform/api/Flash.hpp:59 -->
+
+参数更新在 Armed 或校准停波窗口的处理是本模块的核心难点：租约冲突只延迟（250ms 超时上限），**绝不演变为复位循环**（[MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) 的注释合同）。
+
+## Commander 安全状态机
+
+```mermaid
+stateDiagram-v2
+  [*] --> Disarmed
+  Disarmed --> Armed: 预检通过+解锁请求
+  Armed --> Disarmed: 解锁/故障
+  Armed --> Armed: failsafe 评估（RC loss→Disarm）
+  Disarmed --> 校准窗口: Level 校准受理
+  校准窗口 --> Disarmed: 收尾释放
+```
+<!-- Sources: Dima/modules/safety/Commander.cpp, Dima/modules/safety/CommanderSafety.cpp -->
+
+强制解锁（kill 类）带持续确认窗：RC/执行器判定在 20~50ms 粒度存在单帧瞬态，一帧即杀会误伤正常会话。
+
+## MAVLink 日志下载吞吐
+
+| 设计点 | 值 | 理由 |
+|--------|-----|------|
+| 批次大小 | 32 帧（3488 B） | 恰好一个 QGC chunk 的完整响应 |
+| 消费协议 | Confirmed/InFlight/Rejected 三态 | "提交即超时"的批次不能重发也不能丢 |
+| reader 复用 | 同 id 连续请求复用 | 避免每 2880B 重新打开 ULog |
+| 理想预算 | 288000 B/s | 实际速度由主机 CDC 轮询节奏决定 |
+
+见 [MavlinkLogHandler.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkLogHandler.cpp) 与模块 README。`MavlinkDriveDiagnostics`（手动模式 STATUSTEXT 诊断流）已退役删除。
+
+## 日志链路
+
+```mermaid
+flowchart LR
+  TOPICS[logger_topics.yaml] --> GEN[generate_logger_contract.py]
+  GEN --> CAP[格式缓存容量推导]
+  SD[SdLogWriter] --> CAP
+  SD --> SESS[sessNNN/月日时分.ulg<br>北京时间命名]
+  SD --> META[meta.bin CRC 记录]
+```
+<!-- Sources: Dima/modules/logging/SdLogWriter.cpp:558, tools/logging/generate_logger_contract.py -->
+
+格式缓存容量从 uORB 生成元数据推导（不再把上游 1600 字节当协议上限），长消息不再卡死 Definitions 阶段；`_FS_NORTC=0` + `f_utime` 补齐文件修改时间（北京时间 UTC+8）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [Capability 契约与组合根](../07-platform/platform.md) | ArmedFlash 协调器细节 |
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 停波窗口的最大用户 |
+| [驱动与传感器链路](../08-drivers/drivers.md) | 传感器数据来源 |
+</doc>
+
+<doc title="MotorOutput 输出链" path="05-modules\motor-output.md">
+# MotorOutput 输出链
+
+## 定位
+
+MotorOutput 是控制意图到物理 PWM 的最后一级，也是**停波证据的唯一产出者**——它说的"已经停了"就是安全链的事实。
+
+## 输出管线
+
+```mermaid
+flowchart TB
+  IN[actuator_motors] --> INH[motor_control_inhibit_valid<br>抑制判定]
+  INH --> SLEW[斜坡限幅]
+  SLEW --> FRM[帧构造 force_safe_off 路径]
+  FRM --> PWM[PWM 后端输出]
+  PWM --> EV{后端确认}
+  EV -->|Hard Safe Off| PROOF[calibration_output_stopped 证据]
+  EV -->|失败| EVT[事件上报 kEventPublishFailure]
+```
+<!-- Sources: Dima/modules/motor/MotorOutput.cpp:15, Dima/modules/motor/MotorOutputSafety.cpp:206, Dima/modules/motor/MotorOutputFrames.cpp:96 -->
+
+## 参数应用：租约与等待
+
+| 场景 | 行为 | Source |
+|------|------|--------|
+| Disarmed 快照新鲜 | 正常应用参数快照 | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+| 校准停波窗口（External1） | 允许应用（会话持有存储保护） | 同上 |
+| 租约冲突（Arm 沿等瞬态） | **defer 250ms**，不阻塞喂狗链；超时放弃并报 Error 事件 | 同上 |
+| 应用失败 | enter_parameter_safe_off（原路径保留） | 同上 |
+
+设计合同（源码注释）：**电机侧问题不得演变为复位循环**——BootHealth/USB/MAVLink 不能被未应用参数拖垮；放弃时限（250ms）远小于 IWDG 2048ms。
+
+## 校准过渡窗口
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AC as 校准
+  participant MS as MotorOutputSafety
+  participant F as ArmedFlash
+  AC->>MS: External1 + control_inhibited
+  MS->>F: calibration_output_transition 时间戳
+  MS->>MS: 停帧窗口内允许模式切换瞬态
+  MS-->>MS: 超窗即恢复严格判定
+```
+<!-- Sources: Dima/modules/motor/MotorOutputSafety.cpp:206, Dima/platform/api/Flash.hpp:59 -->
+
+`calibration_transition` 判定覆盖"进入停波"的模式切换瞬态：窗口内要求 stopped_frame 才放行，超窗恢复严格安全判定。
+
+## force_safe_off 与停波证据
+
+[MotorOutputFrames.cpp:96](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutputFrames.cpp#L96) 的 `force_safe_off` 是**后端级物理停波**：Kill、故障、校准停波窗口统一走这里；`calibration_output_stopped` 证据由 PWM owner 写入，校准链的停波确认全部以此为事实源。
+
+## 历史修复存档
+
+| 事件 | 修复 | Source |
+|------|------|--------|
+| 租约失败 pending 永挂 → IWDG 循环（USB 不枚举） | defer 250ms + 事件报告 | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+| 停止中位 vs 无信号差异 | CENT 输出/停脉冲分离（上车指南验证项） | [commissioning](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [Commander 安全链](./commander.md) | 请求停波的上游 |
+| [Capability 契约与组合根](../07-platform/platform.md) | ArmedFlash 协调器 |
+| [BootHealth 喂狗策略](./boot-health.md) | 喂狗链的约束来源 |
+</doc>
+
+<doc title="传感器校准" path="05-modules\sensor-calibration.md">
+# 传感器校准
+
+## 两种校准来源
+
+| 来源 | 反馈通道 | 停波要求 | Source |
+|------|----------|----------|--------|
+| 手动（QGC 发起） | `FEEDBACK_MANUAL` | 必须先 Disarmed（合同不变） | [SensorCalibration.cpp:249](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/calibration/SensorCalibration.cpp#L249) |
+| 自动（AUTO-owned Level） | `FEEDBACK_AUTO` | **可在 Armed 停波窗口执行** | 同上 |
+
+## Armed 停波窗口适配
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant AC as 自动校准会话
+  participant SC as SensorCalibration
+  participant F as ArmedFlash
+  participant PS as 参数存储
+  AC->>SC: begin(Type::Level, FEEDBACK_AUTO)
+  SC->>F: begin_maintenance(calibration=true)
+  Note over F: 仅 AUTO-owned Level 可用 Armed 停波窗口
+  SC->>PS: 会话持有存储保护（不独立 pause）
+  SC->>SC: safe = Disarmed 或 calibration_stopped
+  SC->>SC: restore_parameters（worker 自有写入）
+```
+<!-- Sources: Dima/modules/sensors/calibration/SensorCalibration.cpp:249, Dima/modules/sensors/calibration/SensorCalibrationParameters.cpp -->
+
+关键合同：
+- `safe = fresh(armed) && (!armed || calibration_stopped) && !kill`——**外部 QGC 校准仍要求 Disarmed**，只有 AUTO-owned Level 享受停波窗口。
+- 自动 Level 的存储保护由整场会话持有，worker 只拥有维护锁；手动校准保持独立事务。
+- 恢复参数时只累计本原子段增量（`level_owned_changes_`），不把外部修改吸收进计数，供会话收尾核对完整应用/回滚历史。
+
+## 参数恢复
+
+```mermaid
+flowchart LR
+  SNAP[parameter_snapshot] --> REST[restore_parameters]
+  REST --> LEASE[ConfigurationUpdateLease]
+  LEASE --> COUNT[level_owned_changes_ 增量]
+  COUNT --> AUDIT[会话收尾核对]
+```
+<!-- Sources: Dima/modules/sensors/calibration/SensorCalibrationParameters.cpp, Dima/platform/api/Flash.hpp:59 -->
+
+## 与 VehicleMagnetometer 的配合
+
+VehicleMagnetometer 同样经配置租约应用参数（Armed 校准必须已锁存并确认停波；普通行驶冻结）——[VehicleMagnetometer.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/magnetometer/VehicleMagnetometer.cpp)；磁场来源节点由首个合法广播推断（`MAG1_CAN_NODE` 已删）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [Capability 契约与组合根](../07-platform/platform.md) | 租约与维护锁 |
+| [磁校准](../04-auto-calibration/magnetic-calibration.md) | 校准会话的磁阶段 |
+| [MotorOutput 输出链](./motor-output.md) | 停波证据生产者 |
+</doc>
+
+<doc title="事件系统与性能计数器" path="06-middleware\events-perf.md">
+# 事件系统与性能计数器
+
+## events：结构化事件总线
+
+| 合同 | 内容 | Source |
+|------|------|--------|
+| 容量 | 128 条环形，参数最多 4 个 | [events.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/events/events.hpp) |
+| 级别 | Debug/Info/Warning/Error/**Critical**（CriticalFaultLatch 锁存首末事件） | 同上 |
+| 约束 | 不分配内存、不格式化字符串——**任务与 ISR 上下文都可调用** | 同上 |
+| 消费 | `pop` 取最旧；统计 published/consumed/overflow/dropped | 同上 |
+
+```mermaid
+flowchart LR
+  SRC[任意模块 report] --> RING[128 环形缓冲]
+  RING --> CONSUMER[消费方逐条 pop]
+  RING -.->|溢出| DROP[overflow/dropped 计数]
+  CRIT[Critical] --> LATCH[锁存 first/last 事件]
+```
+<!-- Sources: Dima/middleware/events/events.hpp:1, Dima/middleware/events/events.cpp:1 -->
+
+## 事件 ID 全表（按模块前缀）
+
+事件 ID 的 ASCII 前缀即来源模块段；下表为全库扫描结果：
+
+| 前缀 | 模块 | 事件 ID | Source |
+|------|------|---------|--------|
+| RCS | SbusRc（drivers/rc/sbus） | `ConfigInvalid` 0x52435301、`BackendFailure` …302、`Failsafe` …303、`PublishFailure` …304、`BackendLineError` …305 | [SbusRc.cpp:16](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/rc/sbus/SbusRc.cpp#L16) |
+| RSU | RCUpdate（modules/rc） | `InvalidCalibration` 0x52435501、`InvalidMapping` …502、`SignalState` …503 | [RCUpdate.cpp:18](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/rc/RCUpdate.cpp#L18) |
+| RDF | RoverDifferential（rover/control） | `ParameterInvalid` 0x52444601、`PublishFailure` …602、`ScheduleFailure` …603、`ClockRegression` …604 | [RoverDifferential.cpp:22](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/control/RoverDifferential.cpp#L22) |
+| RAU | AutoMode（rover/modes/auto） | `ParameterBindingFailure` 0x52415501、`ParameterInvalid` …502、`PublishFailure` …503、`ScheduleFailure` …504 | [AutoMode.cpp:19](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto/AutoMode.cpp#L19) |
+| RMA | ManualMode（rover/modes/manual） | `ParameterInvalid` 0x524D4101、`PublishFailure` …102、`ScheduleFailure` …103 | [ManualMode.cpp:13](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/manual/ManualMode.cpp#L13) |
+| RMO | MotorOutput（modules/motor） | `ParameterInvalid` 0x524D4F01、`BackendFault` …F02、`PublishFailure` …F03、`ScheduleFailure` …F04、`ParameterDeferred` …F05 | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+
+`kEventParameterDeferred`（RMO…F05）值得点名：参数应用租约冲突超时放弃时上报——**它证明"放弃"被记录了，而不是静默跳过**。
+
+## perf：固定池性能计数器
+
+```mermaid
+flowchart TB
+  A[perf_alloc 三类<br>COUNT/ELAPSED/INTERVAL] --> POOL[固定对象池<br>仅初始化/启动期分配]
+  POOL --> OPS[begin/end/count/set_elapsed<br>运行期零分配]
+  OPS --> SNAP[snapshot：count/min/max/total/last]
+```
+<!-- Sources: Dima/middleware/perf/perf_counter.h:1 -->
+
+合同（C 接口，`extern "C"`）：`perf_alloc` 只许在初始化或模块启动阶段调用；运行期操作零动态分配——与全仓库静态分配纪律一致。
+
+## 使用纪律
+
+1. 新事件**必须登记到本页表**并在模块 README 声明语义。
+2. 事件不替代日志：高频数据走 ULog，事件只承载"需要被看见的状态转移"。
+3. Critical 事件要求消费端有明确处置路径（如 FAILURE 锁存）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [MotorOutput 输出链](../05-modules/motor-output.md) | RMO 事件的语义 |
+| [日志系统](../05-modules/logging.md) | 高频数据的去向 |
+| [收尾与失败分类](../04-auto-calibration/finalize-failures.md) | Critical 的处置案例 |
+</doc>
+
+<doc title="参数 / uORB / 存储域" path="06-middleware\middleware.md">
+# 参数 / uORB / 存储域
+
+## 三条存储路径
+
+| 域 | 介质 | 内容 | Source |
+|----|------|------|--------|
+| 参数 FlashFS | 内部 Flash 分区（128 KiB 追加写） | 'parm' token 参数快照 | [flashfs.cpp:434](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/flashfs.cpp#L434) |
+| SD 原子文件域 | SD 卡三文件轮换（bin/bak/tmp） | Mission 数据、DroneCAN DNA 分配表 | [AtomicFileStore.hpp:14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/AtomicFileStore.hpp#L14) |
+| SD 日志 | sessNNN 目录 | ULog 飞行日志 | [SdLogWriter.cpp:558](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/logging/SdLogWriter.cpp#L558) |
+
+`AtomicFileDomain` 枚举现在有三个域：Parameters、Mission、**DroneCan**（第三域为 ADR 0006 新增）。
+
+## DNA 分配表迁移（ADR 0006）
+
+```mermaid
+flowchart TB
+  subgraph 迁移前
+    OLD[参数 FlashFS 分区<br>'parm' + 'dna0' 两 token] --> LOCK[整区擦除互锁<br>满区即永久不可回收]
+  end
+  subgraph 迁移后
+    P[参数分区 'parm' 独占] --> OK[满区可 SD 提交→整区擦除重建]
+    DNA[DNA 分配表 → SD DroneCan 域] --> OK
+    LEGACY[遗留 dna0 记录] --> INV[invalidate_records 软失效<br>只清位不擦除]
+  end
+```
+<!-- Sources: Dima/rover/ApplicationContext.cpp:285, docs/adr/0006-dna-allocation-storage-sd-domain.md -->
+
+一次性迁移在应用上下文调用 `FlashFS::invalidate_records(legacy_dna_token)`（[ApplicationContext.cpp:285](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/ApplicationContext.cpp#L285)）：把遗留记录 commit 字编程为全零，掉电中断后幂等续跑。无卡降级语义：`-ENODEV` 映射为合法空表 + 15s 宽限窗，RAM-only 提交并发有界 StorageFailure 事件。
+
+## 参数写入路径
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as 调用方（校准/手动）
+  participant PS as ParameterService
+  participant F as FlashFS
+  C->>PS: storage_save(enumerate_changed)
+  PS->>F: 写 'parm' 快照（追加）
+  F-->>PS: token 校验（独占：分区只许一个 token）
+  Note over F: 满区→SD 同代快照→整区擦除重建
+  PS-->>C: 结果 + metadata 变更
+```
+<!-- Sources: Dima/modules/parameters/ParameterServicePersistence.cpp, Dima/middleware/parameters/param_storage.cpp -->
+
+## autosave 与慢就绪
+
+`ParamAutosave` 的存储可用性恢复流程（[autosave.cpp:74](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/autosave.cpp#L74)）：SD 慢就绪期间挂起的保存不丢，`resume_after_storage_available` 在介质会话建立后补跑。
+
+## FlashFS 的排他擦除
+
+```mermaid
+flowchart LR
+  ERASE[begin_erase_all] --> TK{分区是否存在<br>其他 token 有效记录?}
+  TK -->|是| REJ[-ENOTEMPTY 拒绝]
+  TK -->|否| DO[整区擦除]
+```
+<!-- Sources: Dima/middleware/parameters/flashfs.cpp:434 -->
+
+排他门槛本身不放宽（ADR 0006 的明确决策）：多 token 联合重建需要跨模块事务协调，收益不抵复杂度；**单主人化**才是直接修复。
+
+## uORB 与消息契约
+
+| Topic 族 | 定义 | 说明 |
+|----------|------|------|
+| `auto_calibration_*` | [AutoCalibrationStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/AutoCalibrationStatus.msg) | 11 状态 + session_id + 围栏误差等 |
+| `rover_motion_request` | [RoverMotionRequest.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/RoverMotionRequest.msg) | 队列 8，归一化轴模式 |
+| `rover_control_status` | [RoverControlStatus.msg](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/messages/schemas/RoverControlStatus.msg) | speed_integral、采样时间戳 |
+
+消息契约演进规则：优先删减，MESSAGE_VERSION 机制 = 重新生成 hash/logger contract + 注释版本日期。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 事务机的最大用户 |
+| [模块全景](../05-modules/modules.md) | ParameterService 模块视角 |
+| [驱动与传感器链路](../08-drivers/drivers.md) | DroneCAN DNA 的产生方 |
+</doc>
+
+<doc title="参数系统" path="06-middleware\parameter-system.md">
+# 参数系统
+
+## 设计哲学
+
+最少参数、自动调整尽量多——能用校准/运行时推导的就不做成参数。参数定义 YAML 是唯一事实源，派生物（生成头、metadata、QGC 契约）全部由工具链生成。
+
+## 分层结构
+
+```mermaid
+flowchart TB
+  YAML[definitions/*.yaml<br>唯一事实源] --> GEN[生成器]
+  GEN --> DEF[默认值层 ConstLayer]
+  GEN --> META[metadata 校验 stamp]
+  YAML --> RUN[DynamicSparseLayer 运行变更]
+  DEF & RUN --> TX[AtomicTransaction 候选写入]
+  TX --> SAVE[param_storage 枚举变更]
+  SAVE --> FS[FlashFS 'parm' 快照]
+```
+<!-- Sources: Dima/middleware/parameters/param_storage.cpp, Dima/middleware/parameters/README.md, flashfs.cpp:434 -->
+
+| 层 | 文件 | 职责 |
+|----|------|------|
+| 定义 | `definitions/module_*_params.yaml` | 名称/类型/默认/范围/枚举/重启要求 |
+| 运行 | `param_storage.cpp` / `param.h` | 变更枚举、`param_storage_resume` |
+| 服务 | `ParameterService*`（modules/parameters） | 序列化快照、Flash 写、autosave 协作 |
+| 持久化 | `flashfs.cpp/.h` | 追加写、token 独占、擦除 |
+
+## 事务写入
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as 调用方（校准/服务）
+  participant TX as AtomicTransaction
+  participant FS as FlashFS
+  C->>TX: 候选（Provisional 生效）
+  TX->>TX: RAM 层生效（可回滚）
+  C->>TX: 确认 → commit
+  TX->>FS: enumerate_changed → 快照追加
+  Note over FS: 满区 → SD 同代快照 → 整区擦除重建
+```
+<!-- Sources: Dima/middleware/parameters/param_storage.cpp, Dima/modules/parameters/ParameterServicePersistence.cpp -->
+
+`enumerate_changed` 只枚举变更项；`param_save_default` 处理默认值回退；`param_storage_resume` 支持存储恢复（[param.h](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/param.h)）。
+
+## 生成链与校验
+
+```mermaid
+flowchart LR
+  YAML --> GEN[Make 正式入口生成]
+  GEN --> STAMP[META_VERIFY stamp 校验]
+  GEN --> QGC[QGC Metadata 同版提供]
+  GEN --> LOGC[logger contract 49 Topics/301 参数/8 Profile]
+```
+<!-- Sources: Dima/middleware/parameters/definitions, GNUmakefile:48 -->
+
+规则：改参数定义必须经正式 Make 入口重新生成并核对 Metadata；**禁止手写参数/消息派生列表**；参数名/范围/重启要求以生成目录为准（上车指南 §2.1）。
+
+## 参数治理记录
+
+| 事件 | 结果 |
+|------|------|
+| 双包络 THR/TURN_MAX 退役 | 冻结 MOT_THR_MAX 包络替代 |
+| RO_CAL_VMAX 删除 | 先核对 QGC 兼容契约 |
+| RD_REV_STEER 退役 | 手动倒车转向反转开关移除 |
+| MAG1_CAN_NODE 删除 | 来源节点由首个合法广播推断 |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [存储域](./storage-domains.md) | FlashFS 擦除合同细节 |
+| [事务与组调度](../04-auto-calibration/transactions-groups.md) | 校准候选的事务消费者 |
+| [工具链](../10-tooling/tooling.md) | 生成器实现 |
+</doc>
+
+<doc title="QGC 兼容契约" path="06-middleware\qgc-compat.md">
+# QGC 兼容契约
+
+## 设计原理
+
+QGC 对 PX4 系设备会显示一批 System 类参数；**固定值也可能是官方 QGC 的直接 Fact 依赖，不能仅按"无可选动作"删除**（[qgc_compat yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/definitions/module_qgc_compat_params.yaml) 头注释）。这组参数把"界面兼容"与"真实能力"显式分开：值锁死、描述如实标注当前行为。
+
+## 兼容参数表
+
+| 参数 | 锁定值 | 真实行为 | Source |
+|------|--------|----------|--------|
+| `NAV_RCL_ACT` | 6（Disarm）唯一可选 | RC 丢失 → Commander 上锁进安全态；其他 PX4 动作依赖未提供的导航/降落能力 | [yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/definitions/module_qgc_compat_params.yaml) |
+| `NAV_DLL_ACT` | 0（Disabled）唯一可选 | USB/地面站不是控制来源，断链不触发导航动作 | 同上 |
+| `COM_LOW_BAT_ACT` | 0（No action） | 界面兼容；**未实现电池检测/低电量动作** | 同上 |
+| `MAV_SYS_ID` | 1（min=max=1，重启生效） | 所有协议编码器/目标过滤固定 1/1 | 同上 |
+| `SYS_AUTOSTART` | 与 PX4 通用差速车机架一致的兼容值 | Dima 是固定差速车产品 | 同上 |
+
+```mermaid
+flowchart LR
+  QGC[QGC 界面] --> READ[读兼容参数]
+  READ --> LOCK{值锁死?}
+  LOCK -->|是| SAFE[行为由源码合同决定<br>写入其他值无效/被夹]
+  LOCK -->|否| REAL[真实功能参数<br>见 11 分区]
+```
+<!-- Sources: Dima/middleware/parameters/definitions/module_qgc_compat_params.yaml:1 -->
+
+## 为什么这样设计
+
+| 替代方案 | 弃用理由 |
+|----------|----------|
+| 删掉这些参数 | QGC Fact 依赖缺失会破坏界面/完成流程 |
+| 让它们真的可变 | 会暗示存在未实现的能力（低电量返航等）——违背"不冒充"原则 |
+| 隐藏 System 分类 | System 分类只整理展示；合法取值/消费者/故障关闭行为保持不变 |
+
+<!-- Sources: Dima/middleware/parameters/definitions/module_qgc_compat_params.yaml:1 -->
+
+## 与上车指南的呼应
+
+指南反复强调的边界在此落地：RC loss 处置是 Disarm（`NAV_RCL_ACT` 锁 6）、数据链断开无自动动作（`NAV_DLL_ACT` 锁 0）、低电量无自动处置（`COM_LOW_BAT_ACT` 锁 0）——**参数界面显示的选项范围 ≠ 产品能力**（[指南 §1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L9)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [参数基线与三类必设](../11-first-run/param-classes.md) | 真实功能参数 |
+| [参数系统](./parameter-system.md) | 生成链 |
+| [Commander 安全链](../05-modules/commander.md) | RC loss 的实际处置 |
+</doc>
+
+<doc title="存储域" path="06-middleware\storage-domains.md">
+# 存储域
+
+## 三域总览
+
+```mermaid
+graph TB
+  subgraph 内部 Flash
+    PARM[参数分区 0x081E0000<br>'parm' 单 token]
+  end
+  subgraph SD 卡
+    PDOM[Parameters 域]
+    MDOM[Mission 域]
+    DDOM[DroneCan 域<br>dnacan.bin/bak/tmp]
+    LOGD[日志 sessNNN]
+  end
+  PARM --> PDOM
+  APP[应用] --> MDOM
+  APP --> DDOM
+  APP --> LOGD
+```
+<!-- Sources: Dima/platform/api/AtomicFileStore.hpp:14, Dima/middleware/parameters/flashfs.cpp:434, docs/adr/0006-dna-allocation-storage-sd-domain.md -->
+
+`AtomicFileDomain{Parameters, Mission, DroneCan}` ——第三域是 ADR 0006 新增，参数/Mission/DroneCan 共享唯一 FatFs owner 但**绝不共用文件名或数据格式**。
+
+## FlashFS 排他擦除
+
+```mermaid
+flowchart TB
+  E[begin_erase_all(exclusive_token)] --> C{分区存在其他<br>token 有效记录?}
+  C -->|是| R[-ENOTEMPTY 拒绝]
+  C -->|否| GO[整区擦除]
+  FULL[写满] --> SD[SD 同代快照]
+  SD --> GO
+```
+<!-- Sources: Dima/middleware/parameters/flashfs.cpp:434 -->
+
+排他校验是"单 token 独占"的门——曾因 'parm'+'dna0' 双 token 互相锁死整区擦除引发 COMMIT_LEVEL 持久化超时（ADR 0006 的立项原因）。**门槛本身不放宽**（多 token 联合重建需跨模块事务协调，收益不抵复杂度），修法是单主人化。
+
+## DNA 迁移五决策
+
+| # | 决策 | 细节 |
+|---|------|------|
+| 1 | 分配表迁 SD DroneCan 域 | 三文件轮换（bin/bak/tmp），Mag2 不再注入 FlashFS |
+| 2 | 分配语义不变 | 已知 uid 复用不写介质；新 uid 先保存后承诺；加载短读 fail-closed |
+| 3 | 无卡降级 | -ENODEV=合法空表；保存遇无卡先等 15s 宽限窗（覆盖开机挂载竞态）；RAM-only 完成提交+有界 StorageFailure 事件 |
+| 4 | 一次性迁移 | `invalidate_records('dna0')`：commit 字清零、只清位不擦除；掉电幂等续跑 |
+| 5 | 排他门槛不放宽 | 见上 |
+
+<!-- Sources: docs/adr/0006-dna-allocation-storage-sd-domain.md, Dima/rover/ApplicationContext.cpp:285 -->
+
+## SD 原子文件域协议
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant W as 写方
+  participant FS as FatFsAtomicFileStore
+  W->>FS: save(domain, blob)
+  FS->>FS: 写 tmp → 回读校验 → 原子换名
+  Note over FS: bin/bak/tmp 轮换；介质会话失效处理
+  W->>FS: load(domain)
+  FS-->>W: blob / -ENODEV（按域语义降级）
+```
+<!-- Sources: Dima/platform/freertos/storage/FatFsAtomicFileStore.cpp:1087 -->
+
+换卡/无卡启动后的首次保存先重新发现 primary/backup/tmp（驱动自有缓冲承载读回）——这是参数与 Mission 域验证过的成熟基建，DNA 迁移只改适配层接线。
+
+## autosave 与慢就绪
+
+`ParamAutosave` 在存储可用性恢复后补跑挂起保存（[autosave.cpp:74](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/autosave.cpp#L74)）；满区挂起与擦除链路静默失败是历史事故组合，现均已结构化。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [参数系统](./parameter-system.md) | 参数写入的上层 |
+| [DroneCAN 链路](../08-drivers/dronecan.md) | DNA 分配的语义方 |
+| [日志系统](../05-modules/logging.md) | SD 的另一租户 |
+</doc>
+
+<doc title="ArmedFlash 协调器" path="07-platform\armed-flash.md">
+# ArmedFlash 协调器
+
+## 为什么存在
+
+Flash 写入时电机必须停、电机 Armed 时参数必须冻结——这两件事互相要求对方的状态，天然构成互斥矩阵。没有统一协调器时，每个模块各自检查 `armed` 再操作 Flash，检查与应用之间留有抢占窗口（TOCTOU）。`ArmedFlashCoordinator` 把它做成单一状态机 + 短租约。
+
+## 互斥矩阵
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> ARMED: try_arm()
+  IDLE --> MAINT: begin_maintenance(false)
+  ARMED --> IDLE: disarm
+  MAINT --> IDLE: end
+  IDLE --> CAL: try_arm(calibration=true)<br>锁存+后端停波确认
+  CAL --> ARMED: 校准收尾释放
+```
+<!-- Sources: Dima/platform/common/Flash.cpp:26, Dima/platform/api/Flash.hpp:59 -->
+
+合同（[Flash.hpp:59](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Flash.hpp#L59)）：普通 Armed 与 Flash/维护互斥；**自动校准单独锁住物理输出，不伪造 Disarmed**；停波确认只由 PWM owner 写入；临界区只保护状态转移，不包围实际 Flash 操作、不屏蔽长时间中断。
+
+## ConfigurationUpdateLease
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as 参数消费者
+  participant F as 协调器
+  participant A as Arm 流程
+  C->>F: lease 构造（RAII）
+  F-->>C: 授予=阻止校准恢复运动+普通 Arm
+  C->>C: 参数检查→应用（无抢占窗）
+  C-->>F: 析构释放
+  A->>F: try_arm
+  F-->>A: 持有期拒绝
+```
+<!-- Sources: Dima/platform/common/Flash.cpp, Dima/modules/motor/MotorOutput.cpp:15 -->
+
+覆盖"检查到应用之间"的抢占窗——传感器校准、磁参数、MotorOutput、UM982 偏置全部经此租约（[Um982Gps.cpp:532](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp#L532)）。
+
+## 校准停波窗口状态
+
+| 状态查询 | 语义 | Source |
+|----------|------|--------|
+| `calibration_output_inhibited()` | 停波锁存中 | [Flash.hpp:59](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Flash.hpp#L59) |
+| `calibration_output_stopped()` | 后端确认物理停波 | 同上 |
+| `calibration_output_transition()` | 停波沿时间戳（过渡窗判定用） | 同上 |
+| `calibration_maintenance_recent()` | 维护锁近期活动（20s 窗） | 同上 |
+| `configuration_allowed()` | 配置类操作许可 | 同上 |
+
+## 消费者一览
+
+```mermaid
+flowchart TB
+  F[ArmedFlashCoordinator] --> MO[MotorOutput<br>参数应用/过渡窗]
+  F --> SC[SensorCalibration<br>Armed 停波校准]
+  F --> VM[VehicleMagnetometer<br>参数冻结/租约]
+  F --> GPS[Um982Gps<br>偏置整组应用]
+  F --> BH[BootHealth<br>运行健康例外判定]
+  F --> AC[校准模式<br>停波锁存/收尾]
+```
+<!-- Sources: Dima/modules/motor/MotorOutput.cpp:15, Dima/modules/sensors/calibration/SensorCalibration.cpp:249, Dima/modules/boot_health/BootHealthService.cpp:305, Dima/drivers/gps/um982/Um982Gps.cpp:532 -->
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [Capability 契约与组合根](./platform.md) | 本页的上级 |
+| [MotorOutput 输出链](../05-modules/motor-output.md) | 停波证据的生产 |
+| [收尾与失败分类](../04-auto-calibration/finalize-failures.md) | 校准侧的状态机 |
+</doc>
+
+<doc title="Capability 契约与组合根" path="07-platform\platform.md">
+# Capability 契约与组合根
+
+## 设计原理
+
+上层（rover/modules/middleware）**永远不 include HAL**。硬件能力抽象为 `platform/api` 纯虚契约，具体后端在 `platform/stm32h7`（真实 MCU）与 `platform/freertos`（RTOS 服务），两者互不依赖；唯一的装配点是 `Boards/H743/Src/platform_composition.cpp`。
+
+| 契约 | 能力 | Source |
+|------|------|--------|
+| `Flash.hpp` | ArmedFlash 协调器（Armed/维护/校准互斥） | [Flash.hpp:59](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Flash.hpp#L59) |
+| `AtomicFileStore.hpp` | 原子文件三域（Parameters/Mission/DroneCan） | [AtomicFileStore.hpp:14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/AtomicFileStore.hpp#L14) |
+| `Console.hpp` | 控制台写（在途批次语义） | [Console.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Console.hpp) |
+| `LogFileStore.hpp` | 日志会话/回收 + UTC+8 偏移 | [LogFileStore.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/LogFileStore.hpp) |
+
+## ArmedFlash 协调器：安全链的枢轴
+
+三个互斥面：**普通 Armed**（电机活着）、**Flash 维护**（擦写中）、**校准停波窗口**（Level 校准持锁写参数，物理输出已停）。校准是第三态的来源——不伪造 Disarmed，停波确认只由 PWM owner 写入。
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> ARMED: try_arm()
+  ARMED --> IDLE: disarm
+  IDLE --> MAINT: begin_maintenance(false)
+  ARMED --> CAL_STOP: try_arm(calibration=true)<br>需锁存+后端停波确认
+  CAL_STOP --> ARMED: 校准收尾释放
+  MAINT --> IDLE: end
+```
+<!-- Sources: Dima/platform/api/Flash.hpp:59, Dima/platform/common/Flash.cpp -->
+
+### 配置更新租约
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as 参数消费者
+  participant F as ArmedFlashCoordinator
+  participant A as Arm 流程
+  C->>F: ConfigurationUpdateLease 构造
+  F-->>C: 授予（阻止校准恢复运动/普通 Arm）
+  C->>C: 检查到应用之间的抢占窗被关闭
+  C-->>F: 析构释放
+  A->>F: try_arm
+  F-->>A: 租约持有期拒绝
+```
+<!-- Sources: Dima/platform/common/Flash.cpp, Dima/modules/motor/MotorOutput.cpp:15 -->
+
+租约覆盖"检查到应用之间"的抢占窗口——这是传感器校准、磁参数写入、MotorOutput 参数应用共用的机制。
+
+## 双后端边界
+
+```mermaid
+graph LR
+  subgraph platform/freertos
+    WQ[WorkQueue 实现]
+    FS[FatFsAtomicFileStore]
+  end
+  subgraph platform/stm32h7
+    SYS[system/memory/flash/serial/io]
+  end
+  API[platform/api 契约] --> WQ
+  API --> FS
+  API --> SYS
+  WQ x--x STM2[platform/stm32h7]
+```
+<!-- Sources: Dima/platform/freertos/storage/FatFsAtomicFileStore.cpp, AGENTS.md:52 -->
+
+FatFs 原子文件域实现（三文件轮换、回读校验、介质会话失效处理）是参数与 Mission 域验证过的成熟基建——DNA 迁移只改适配层接线，不动协议（ADR 0006 决策 3）。
+
+## 校准停波窗口的消费者
+
+| 消费者 | 用途 | Source |
+|--------|------|--------|
+| SensorCalibration | AUTO-owned Level 校准在 Armed 停波窗执行 | [SensorCalibration.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/calibration/SensorCalibration.cpp) |
+| MotorOutput | 参数应用容忍校准窗口；过渡期停帧判定 | [MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15) |
+| BootHealthService | 校准回滚收尾维持 IWDG 健康判定 | [BootHealthService.cpp:305](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/boot_health/BootHealthService.cpp#L305) |
+| Um982Gps | 航向偏置整组应用经同一租约 | [Um982Gps.cpp:532](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp#L532) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [分层架构与依赖规则](../02-architecture/layered-architecture.md) | 组合根在合同中的位置 |
+| [自动校准状态机](../04-auto-calibration/state-machine.md) | 停波窗口的发起方 |
+| [模块全景](../05-modules/modules.md) | 各消费者的模块视角 |
+</doc>
+
+<doc title="USB Console" path="07-platform\usb-console.md">
+# USB Console
+
+## 在途批次语义（kWriteInProgress）
+
+Console 的 `transmit` 是等待 CDC 完成的同步接口。MAVLink 日志下载把它当批量通道用，于是产生了"提交即超时"的歧义批次——修复引入独立在途状态：
+
+| 返回 | 语义 | 消费规则 | Source |
+|------|------|----------|--------|
+| 完成 | 本批已提交 | 正常 | [UsbConsole.cpp:53](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/adapters/usb_console/UsbConsole.cpp#L53) |
+| `kWriteInProgress` | **本次 transmit 已接受**，完成 IRQ 可能紧随其后 | 等待 `tx_idle()` 确认后按 sequence 消费 | 同上 |
+| `ETIMEDOUT` | 抢锁/等上一笔/Busy 超时 | 本批**未提交**，可重试 | 同上 |
+
+```mermaid
+flowchart TB
+  W[transmit] --> LOCK{抢锁成功?}
+  LOCK -->|否| TO[ETIMEDOUT 未提交]
+  LOCK -->|是| BUSY{端点 Busy 超时?}
+  BUSY -->|是| TO
+  BUSY -->|否| ACC[接受 → kWriteInProgress]
+  ACC --> IRQ[完成 IRQ]
+  IRQ --> IDLE[tx_idle = true]
+  IDLE --> CONSUME[消费方按 sequence 弹出]
+```
+<!-- Sources: Dima/platform/api/Console.hpp, Dima/modules/mavlink/MavlinkLogHandler.cpp:730 -->
+
+关键判据（[Console.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/api/Console.hpp) 注释）：**批次是否已提交必须取自本次写入结果，不能用超时后的 `tx_idle()` 推断**——迟到 IRQ 会把已提交批次变为空闲，导致重复发送。
+
+## newlib 移植
+
+`_write` 只接收字节数或 -1；Console 的在途状态留在内部接口（`kWriteInProgress` 对 newlib 映射为 -1/EINPROGRESS），不通过共享 errno 传递提交状态——[UsbConsole.cpp:53](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/adapters/usb_console/UsbConsole.cpp#L53)。
+
+## 吞吐演进史
+
+```mermaid
+timeline
+  title 日志下载吞吐（软件预算）
+  逐帧发送 : ~36 KB/s（10ms 内 4 片）
+  16 帧批次 : 144 KB/s 预算，实测仍 ~10 KB/s
+  32 帧+三态 : 288 KB/s 预算，实测由主机 CDC 轮询决定
+```
+<!-- Sources: Dima/modules/mavlink/README.md, Dima/platform/api/Console.hpp -->
+
+16 片批次时代实测 ~10KB/s 的根因：一批 CDC 排空常超 5ms 截止，"提交即超时"批次既不能消费也不能立即重发，多数轮次空转。32 片 + 待确认协议让线路连续排空。
+
+## 边界
+
+- Console 与日志组包共用 4096-byte 静态容量（无动态分配）。
+- USB 响应复制到固定 Ring，不引用 FatFs 文件缓冲。
+- USB 物理断开只重置发送节拍；代次检查与样本复制仍由 uORB 保护。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [MAVLink 链路](../05-modules/mavlink.md) | 三态消费协议的对端 |
+| [日志系统](../05-modules/logging.md) | 被下载的数据 |
+| [Capability 契约与组合根](./platform.md) | Console 契约位置 |
+</doc>
+
+<doc title="UM982 与 DroneCAN 链路" path="08-drivers\drivers.md">
+# UM982 与 DroneCAN 链路
+
+## UM982 GNSS（定位 + 双天线定向）
+
+| 能力 | 实现 | Source |
+|------|------|--------|
+| 位置 | GGA 最低输入；quality=0/status=V 接受为"在线无定位" | [Um982Gps.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp) |
+| 速度 | AGRICA 完整 NED 速度；缺 AGRICA 用新鲜 RMC 水平速度 | [Um982Protocol.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Protocol.cpp) |
+| 定向 | UNIHEADINGA + `rtk_heading_status` 原始基线航向 | [Um982Gps.cpp:532](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp#L532) |
+| 授时 | RMC UTC + `timestamp_time_relative` 对齐日志授时 | [Um982Gps.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp) |
+
+### 航向/速度配对（制动观测的关键）
+
+```mermaid
+stateDiagram-v2
+  [*] --> 等待帧
+  等待帧 --> 配对: 同GPS周+历元差≤100ms+速度年龄≤200ms
+  等待帧 --> 无配对发布: 超窗/缺失
+  无配对发布 --> 等待帧: velocity_aligned=false 速度=NaN
+  配对 --> 等待帧: 航向缓存 300ms 内有效
+```
+<!-- Sources: Dima/drivers/gps/um982/Um982Gps.cpp:532, Dima/drivers/gps/um982/README.md -->
+
+不再等待两帧完全同历元：无配对照常发布航向；`timestamp_sample` 保留航向真实到达时间，速度重配不续航向年龄。**制动消费者只保守计龄，不把领先速度外推为未来时间**——这是 9/29 实车"急停振铃"误判的修复面。
+
+### 偏置应用
+
+航向偏置与期望基线经**配置租约**整组应用：普通 Armed 行驶冻结；组合校准持锁时必须已锁存并由 PWM 后端确认停波才允许更新（[Um982Gps.cpp:532](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp#L532)）。
+
+## DroneCAN 磁力计（RM3100）
+
+| 环节 | 行为 | Source |
+|------|------|--------|
+| 节点发现 | 动态节点 ID 分配（DNA） | [DroneCanDynamicNodeId.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/dronecan/DroneCanDynamicNodeId.cpp) |
+| 分配表存储 | SD DroneCan 原子文件域（ADR 0006） | [DroneCanNode.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/dronecan/DroneCanNode.hpp) |
+| 设备配置 | operating mode 支持性探测 | [DroneCanMag2Configuration.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/magnetometer/dronecan_mag2/DroneCanMag2Configuration.cpp) |
+| 磁场来源 | 来源节点号由首个合法磁场广播推断（`MAG1_CAN_NODE` 已删） | [middleware/parameters/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/README.md) |
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant MAG as RM3100 (DroneCAN)
+  participant N as DroneCanNode 分配
+  participant FS as SD DroneCan 域
+  participant MW as 磁场消费者
+  MAG->>N: 动态分配请求
+  N->>FS: 已知 uid→复用 node id；新 uid→先保存后承诺
+  FS-->>N: 三文件轮换 + 回读校验
+  MAG->>MW: 磁场广播
+  MW->>MW: 节点号由首个合法广播推断
+```
+<!-- Sources: Dima/lib/dronecan/DroneCanDynamicNodeId.cpp, docs/adr/0006-dna-allocation-storage-sd-domain.md -->
+
+分配语义（ADR 0006 决策 2）：已知 uid 直接复用不写介质；新 uid **先保存成功再对外承诺绑定**；加载短读/格式不符 fail-closed；无卡 `-ENODEV` 降级为合法空表（绑定不跨上电，由下次上电确定性重分配恢复）。
+
+## 磁场与电机的联合观测
+
+`MagMotorOutputHistory` 维护 32 条后端输出历史，供两个方向消费：磁油门补偿观测 + **制动反向冲量积分**（[MagMotorOutputHistory.hpp:17](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/sensors/magnetometer/MagMotorOutputHistory.hpp#L17)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [参数 / uORB / 存储域](../06-middleware/middleware.md) | DroneCan 存储域协议 |
+| [差速控制栈](../03-rover-domain/control-stack.md) | RTK 速度龄期与制动 |
+| [模块全景](../05-modules/modules.md) | EKF2/日志对 GNSS 的消费 |
+</doc>
+
+<doc title="DroneCAN 链路" path="08-drivers\dronecan.md">
+# DroneCAN 链路
+
+## DNA 分配语义
+
+```mermaid
+stateDiagram-v2
+  [*] --> 上电加载
+  上电加载 --> 表就绪: 短读/格式不符 → fail-closed 空表
+  表就绪 --> 已知uid: 直接复用 node id（不写介质）
+  表就绪 --> 新uid: 先保存成功 → 再对外承诺绑定
+  新uid --> 保存失败: 15s 宽限窗（无卡）
+  保存失败 --> RAMonly: 仍发有界 StorageFailure 事件
+```
+<!-- Sources: Dima/lib/dronecan/DroneCanDynamicNodeId.cpp, docs/adr/0006-dna-allocation-storage-sd-domain.md -->
+
+| 语义点 | 合同 | Source |
+|--------|------|--------|
+| 存储 | SD DroneCan 域三文件轮换（ADR 0006） | [DroneCanNode.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/dronecan/DroneCanNode.hpp) |
+| stage_commit | 分配提交原子化 | [DroneCanDynamicNodeId.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/dronecan/DroneCanDynamicNodeId.cpp) |
+| 服务分配 | `service_allocation_storage` 响应分配请求 | 同上 |
+| reset_allocation | 重新进入发现 | 同上 |
+
+## 无卡降级
+
+```mermaid
+flowchart TB
+  SAVE[保存遇 -ENODEV] --> WAIT[宽限窗 15s<br>覆盖开机 SD 慢就绪挂载竞态]
+  WAIT --> STILL{仍无介质?}
+  STILL -->|是| RAM[RAM-only 完成提交<br>+有界 StorageFailure 事件]
+  STILL -->|否| NORMAL[正常写 SD]
+  LOAD[加载 -ENODEV] --> EMPTY[映射为合法空表<br>Mission 域先例]
+```
+<!-- Sources: docs/adr/0006-dna-allocation-storage-sd-domain.md, Dima/platform/freertos/storage/FatFsAtomicFileStore.cpp:1087 -->
+
+绑定不跨上电——由下次上电的确定性重分配（preferred/max 向下选择）恢复；单 RM3100 总线上通常仍获得同一 node id。
+
+## RM3100 磁力计
+
+| 环节 | 实现 | Source |
+|------|------|--------|
+| 构造 | 不再注入 FlashFS（ADR 0006 后） | [DroneCanMag2.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/magnetometer/dronecan_mag2/DroneCanMag2.cpp) |
+| 协议启动 | `start_protocol` 分步 + operating mode 支持性探测 | [DroneCanMag2Configuration.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/magnetometer/dronecan_mag2/DroneCanMag2Configuration.cpp) |
+| 磁场消费 | 来源节点由首个合法磁场广播推断 | [middleware/parameters/README.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/README.md) |
+
+## 遗留迁移
+
+组合根在参数服务初始化后调用 `FlashFS::invalidate_records('dna0')` 把参数分区遗留记录软失效（commit 字清零、不擦除、掉电幂等）——[ApplicationContext.cpp:285](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/ApplicationContext.cpp#L285)。全部失效后为空操作。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [存储域](../06-middleware/storage-domains.md) | SD DroneCan 域协议 |
+| [磁校准](../04-auto-calibration/magnetic-calibration.md) | 磁场数据的下游 |
+| [UM982 链路](./um982.md) | 并行的定向来源 |
+</doc>
+
+<doc title="UM982 链路" path="08-drivers\um982.md">
+# UM982 链路
+
+## 协议解析
+
+| 帧 | 内容 | 解析要点 | Source |
+|----|------|----------|--------|
+| GGA | 位置（最低输入） | quality=0 仍作为"在线无定位"接受 | [Um982Protocol.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Protocol.cpp) |
+| AGRICA | 完整 NED 速度 | 分号后首字段为索引 0：速度幅值 22、N/E/U 23..25、σ 26..28，≥29 字段；与上游 `extractAgrica()` 对齐 | 同上 |
+| RMC | 时间/状态 | 有效日期时刻→UTC 微秒；status=V 接受 | 同上 |
+| UNIHEADINGA | 基线航向 | 航向缓存 300ms | [Um982Gps.cpp:532](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp#L532) |
+
+速度分量允许负数、标准差必须非负——与锁定上游实现逐字段核对过。
+
+## 航向/速度配对
+
+```mermaid
+stateDiagram-v2
+  [*] --> 收帧
+  收帧 --> 配对: 同GPS周 + 历元差≤100ms + 速度年龄≤200ms
+  收帧 --> 无配对: 条件不满足
+  无配对 --> 发布航向: velocity_aligned=false, 速度 NaN
+  配对 --> 发布配对速度: 航向缓存 300ms 内
+  发布航向 --> 收帧
+```
+<!-- Sources: Dima/drivers/gps/um982/Um982Gps.cpp:532 -->
+
+放宽配对的原因：等两帧完全同历元会让制动消费者拿不到速度龄期证据。合同：`timestamp_sample` 保留航向真实到达时间；速度重配不续航向年龄；**制动消费者只保守计龄，不把领先速度外推为未来时间**。
+
+## 偏置与基线配置
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as 校准/配置
+  participant U as Um982Gps
+  participant F as ArmedFlash
+  C->>U: 偏置+期望基线（整组）
+  U->>F: ConfigurationUpdateLease
+  Note over F: Armed 行驶冻结；停波确认后才可更新
+  U->>U: 应用成功 → parameter_update_instance++
+```
+<!-- Sources: Dima/drivers/gps/um982/Um982Gps.cpp:532, Dima/platform/api/Flash.hpp:59 -->
+
+整组应用（偏置+基线一起）避免半套配置生效；成功才推进 `rtk_heading_status.parameter_update_instance`，供 RTK 提交/回滚确认。
+
+## NO_FIX 在线状态
+
+```mermaid
+flowchart TB
+  GGA{新鲜 GGA?} -->|有| POS[正常位置发布]
+  GGA -->|无| RMC{RMC/AGRICA/UNIHEADINGA 有效?}
+  RMC -->|是| NOFIX[≤2Hz 发布位置未知 NO_FIX<br>不伪造经纬度]
+  RMC -->|否| OFF[离线]
+  BAD[声称有效却缺坐标] --> REJ[拒绝]
+```
+<!-- Sources: Dima/drivers/gps/um982/README.md -->
+
+## 授时合同
+
+`timestamp_time_relative` = RMC 接收时刻 − 合成消息发布时间，使日志授时不受缓存重用与 GGA 延迟影响；中国时区只在日志文件名与 ULog 时区说明转换，**原始 `time_utc_usec` 保持 UTC**（[um982 README](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/README.md)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [RTK 与校准导航](../04-auto-calibration/rtk-navigation.md) | 最大消费者 |
+| [制动接管](../03-rover-domain/braking-takeover.md) | 速度龄期消费 |
+| [日志系统](../05-modules/logging.md) | 授时下游 |
+</doc>
+
+<doc title="构建、签名与 OTA" path="09-build-release\build-release.md">
+# 构建、签名与 OTA
+
+## 发布产物链
+
+```mermaid
+flowchart TB
+  ELF[H743_FreeRTOS.elf] --> BIN[.bin 原始镜像]
+  BIN --> SIGN[签名 signed.bin<br>MCUboot 格式]
+  ELF --> HEX[hex]
+  SIGN --> FHEX[factory.hex<br>bootloader+diag+app 合并]
+  BOOT[MCUboot 引导 48928B @0x08000000] --> FHEX
+  FHEX --> V1[镜像摘要验证]
+  FHEX --> V2[布局/向量验证 0x08040400]
+  FHEX --> V3[符号合同验证<br>application/mcuboot 无未解析符号]
+```
+<!-- Sources: make/release.mk:57, tools/elf_support/layout.py -->
+
+当前基线：signed app 587,703 B @ `0x08040000`；Flash 总占用 75.0%。
+
+## Flash 布局
+
+| 区域 | 地址 | 用途 |
+|------|------|------|
+| 0x08000000 | MCUboot 引导 | 48,928 B |
+| 0x08020000–0x0803FFFF | boot diagnostics | 引导诊断区 |
+| 0x08040000 | signed application | 向量在 +0x400 |
+| 0x081E0000 | 参数 FlashFS 分区 | 128 KiB 单扇区追加写 |
+
+## 安全启动链
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant B as MCUboot
+  participant A as Application
+  participant W as IWDG
+  B->>B: 验证镜像签名/摘要
+  B->>A: 跳转 app（向量 0x08040400）
+  A->>A: BootHealth 判定运行时健康
+  A->>W: 分级喂狗（校准回滚窗口有例外判定）
+  W-->>A: 持续运行
+```
+<!-- Sources: make/release.mk:57, Dima/modules/boot_health/BootHealthService.cpp:305 -->
+
+mcuboot watchdog prepare/feed 链在 ELF 验证中有符号级检查（`mcuboot watchdog prepare/feed chain: linked`）。
+
+## OTA 上传
+
+| 参数 | 值 | Source |
+|------|-----|--------|
+| 协议 | mcumgr（SMP） | [make/release.mk](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/release.mk) |
+| 窗口 | `MCUMGR_MAX_WINDOW=3` | [release.mk:57](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/release.mk#L57) |
+| 入口 | `make upload` | [GNUmakefile](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile) |
+| 恢复 | USB DFU 流程 | [docs/MCUBOOT_USB_RECOVERY_ZH.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/MCUBOOT_USB_RECOVERY_ZH.md) |
+
+上传 HOST 阶段三段拆分（pinned upload tools / MAVLink codec / mcumgr runtime），工具全部锁版本。
+
+## 构建性能工具链
+
+| 组件 | 作用 | Source |
+|------|------|--------|
+| bootstrap_ccache.py | ccache 解析与版本锁定；`on` 失败即终止 | [tools/bootstrap_ccache.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/bootstrap_ccache.py) |
+| build_support/session.py | 构建会话状态（HOST_TOOLS_ID 复用） | [tools/build_support/session.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/build_support/session.py) |
+| project.mk LTO | `-flto` 全量启用，`DIMA_LTO=off` 逃生门 | [make/project.mk:1141](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/project.mk#L1141) |
+| elf_support/layout.py | LTO 下符号合同（lto_priv 匹配、used 属性） | [tools/elf_support/layout.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/elf_support/layout.py) |
+
+## 升级注意事项
+
+1. 参数分区（0x081E0000）不在 OTA 镜像内——升级保留参数，但 `parm` 快照格式演进需前向兼容。
+2. 升级失败恢复走 USB DFU（无 BOOT0 拆机要求）。
+3. 首次烧录用 `factory.hex`（含引导 + 诊断 + 应用）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [构建与验证](../01-getting-started/build-and-verify.md) | 日常构建入口 |
+| [参数 / uORB / 存储域](../06-middleware/middleware.md) | 参数分区的擦除合同 |
+| [模块全景](../05-modules/modules.md) | BootHealth 喂狗策略 |
+</doc>
+
+<doc title="MCUboot 与恢复" path="09-build-release\mcuboot-recovery.md">
+# MCUboot 与恢复
+
+## 启动链
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant R as 复位
+  participant B as MCUboot (0x08000000)
+  participant D as 引导诊断区 (0x08020000)
+  participant A as Application (0x08040000)
+  R->>B: 上电
+  B->>B: 验证签名/摘要（Bootloader 48,928B）
+  B->>D: 写启动原因/健康记录
+  B->>A: 跳转（向量 0x08040400）
+  A->>A: BootHealth 初始化 → IWDG 喂狗链
+```
+<!-- Sources: make/release.mk:57, docs/MCUBOOT_USB_RECOVERY_ZH.md:1, Dima/modules/boot_health/BootHealthService.cpp:78 -->
+
+`verify` 的镜像验证输出逐项核对：bootloader 字节数、诊断区、signed app 位置、**application/mcuboot 无未解析符号**、mcuboot watchdog prepare/feed 链已链接。
+
+## Bootloader 构建
+
+| 项 | 说明 | Source |
+|----|------|--------|
+| 独立固件 | `make mcuboot`（Bootloader/ 目录） | [Bootloader/Makefile](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Bootloader/Makefile) |
+| ccache 继承 | 官方入口继承应用同一缓存会话；仅 C 对象过 ccache | [Bootloader/Makefile](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Bootloader/Makefile) |
+| 缓存键 | 包含 MCUboot 自己的编译选项与头文件 | 同上 |
+
+## OTA 与回滚
+
+```mermaid
+flowchart LR
+  UP[make upload<br>mcumgr SMP] --> SLOT[确认镜像]
+  SLOT --> SWAP[重启切换]
+  SWAP --> FAIL{新镜像健康?}
+  FAIL -->|是| OK[正常运行]
+  FAIL -->|否| REC[恢复路径]
+  REC --> DFU[USB DFU]
+```
+<!-- Sources: make/release.mk:57, docs/MCUBOOT_USB_RECOVERY_ZH.md:1 -->
+
+`MCUMGR_MAX_WINDOW=3` 为生产默认（板测未完可回退 1）；上传 HOST 三段解析（mcumgr runtime / MAVLink codec / pinned tools）全部锁版本。
+
+## USB DFU 恢复
+
+| 场景 | 动作 | Source |
+|------|------|--------|
+| 应用无法启动/变砖 | BOOT0 或引导诊断进入 DFU | [MCUBOOT_USB_RECOVERY_ZH.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/MCUBOOT_USB_RECOVERY_ZH.md) |
+| 刷 factory.hex | bootloader+诊断+应用一体 | [release.mk:17](https://github.com/a1600778959/H743_FreeRTOS/blob/main/make/release.mk#L17) |
+
+历史案例：USB 不枚举 = MotorOutput 租约失败 pending 永挂 → IWDG 循环；修复后 defer 250ms + 事件上报（[MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15)），实车恢复。
+
+## FatFs 层的相关约束
+
+日志/存储对文件时间的合同由 FatFs 配置支撑：`_USE_CHMOD=1`、`_FS_NORTC=0`（get_fattime 生成北京时间）——[ffconf.h](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Middlewares/Third_Party/FatFs/src/ffconf.h)、[fatfs_diskio.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/fatfs_diskio.cpp)。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [构建、签名与 OTA](./build-release.md) | 产物链与上传 |
+| [BootHealth 喂狗策略](../05-modules/boot-health.md) | 应用侧健康 |
+| [日志系统](../05-modules/logging.md) | FatFs 合同细节 |
+</doc>
+
+<doc title="生成链与会话工具" path="10-tooling\generator-chain.md">
+# 生成链与会话工具
+
+## logger contract 生成
+
+```mermaid
+flowchart LR
+  YAML[logger_topics.yaml] --> GEN[generate_logger_contract.py]
+  GEN --> META[uORB 生成元数据]
+  META --> CAP[最大压缩/展开字段长度<br>+ Topic 名推导缓存容量]
+  CAP --> V{超 ULog uint16 边界?}
+  V -->|是| FAIL[生成期失败]
+  V -->|否| OUT[logger_generated 契约]
+  OUT --> LOGV[LOG_VERIFY 校验<br>49 Topics/301 参数/8 Profile]
+```
+<!-- Sources: tools/logging/generate_logger_contract.py, Dima/modules/logging/SdLogWriter.cpp:558 -->
+
+原则：**不把上游 `format[1600]` 当 ULog 协议上限**；容量不足在构建期失败而不是运行期丢日志。
+
+## 参数生成链
+
+| 步骤 | 工具 | Source |
+|------|------|--------|
+| YAML → 头/表 | 参数生成器（Make 正式入口） | [definitions](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/definitions) |
+| metadata | stamp 校验（META_VERIFY） | [GNUmakefile:48](https://github.com/a1600778959/H743_FreeRTOS/blob/main/GNUmakefile#L48) |
+| QGC | 同版 Metadata 提供 | [calibration_suggest.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/calibration_suggest.py) 配套 |
+
+`calibration_suggest.py`：从 QGC 导出生成**只读**校准建议——建议工具不回写参数。
+
+## 构建会话
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as 用户 make
+  participant O as 外层调度 Make
+  participant S as build_support/session.py
+  participant I as 内层 Make
+  U->>O: verify
+  O->>S: 解析 jobs/内存/ccache/HOST_TOOLS_ID
+  S-->>O: 会话状态（内容哈希复用）
+  O->>I: 合并 summary 目标一次求值
+  I-->>U: [N/M] 进度 + 水位汇总
+```
+<!-- Sources: tools/build_support/session.py, tools/build_support/state.py, GNUmakefile:48 -->
+
+要点：`HOST_TOOLS_ID` 已求值则导出复用，避免每个嵌套 Make 重复启动 Python 做同一份内容哈希；`firmware/dima_rover/verify` 的汇总并入同次内层 Make（`__dima_summary` 以发布产物为前置，保证汇总在镜像落盘后执行）。
+
+## ccache 门控
+
+| 档 | 行为 | Source |
+|----|------|--------|
+| `on`（默认） | 缓存不可用**立即终止**并提示 | [bootstrap_ccache.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/bootstrap_ccache.py) |
+| `auto` | 明确允许降级 | 同上 |
+| `off` | 完全关闭 | 同上 |
+
+二进制可运行 + 缓存目录可写才算启用；无编译调用时如实报告"Make 复用既有对象"（不虚报命中率）。
+
+## ELF/上传工具
+
+| 工具 | 职责 | Source |
+|------|------|--------|
+| `elf_support/layout.py` | 向量/DMA/符号合同（含 LTO lto_priv 匹配、used 属性） | [layout.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/elf_support/layout.py) |
+| `upload/cli.py` + `models.py` | pinned 工具解析、SMP 上传 | [upload/cli.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/upload/cli.py) |
+| `build_support/cli.py` | 子命令入口（--ccache on/auto/off） | [cli.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/build_support/cli.py) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [架构门禁与验证工具](./tooling.md) | 检查项本体 |
+| [构建与验证](../01-getting-started/build-and-verify.md) | 用户视角的构建 |
+| [参数系统](../06-middleware/parameter-system.md) | 参数生成链的下游 |
+</doc>
+
+<doc title="架构门禁与验证工具" path="10-tooling\tooling.md">
+# 架构门禁与验证工具
+
+## 工具清单
+
+| 工具 | 职责 | Source |
+|------|------|--------|
+| `tools/check_architecture.py` | 架构门禁入口，`--profile fast/full` 两档 | [check_architecture.py:4](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/check_architecture.py#L4) |
+| `tools/architecture/dependency.py` | 依赖方向图检查 | [dependency.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/architecture/dependency.py) |
+| `tools/elf_support/layout.py` | ELF 布局/符号合同（DMA 区、向量、used 属性） | [layout.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/elf_support/layout.py) |
+| `tools/logging/generate_logger_contract.py` | logger_topics.yaml → 格式缓存容量推导 | [generate_logger_contract.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/logging/generate_logger_contract.py) |
+| `tools/calibration_suggest.py` | QGC 导出生成只读校准建议 | [calibration_suggest.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/calibration_suggest.py) |
+| `tools/upload/` | 上传工具解析与模型 | [upload/cli.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/upload/cli.py) |
+| `tools/build_support/` | 构建会话状态（jobs/ccache/会话哈希） | [build_support/session.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/build_support/session.py) |
+
+## 门禁两档
+
+```mermaid
+flowchart LR
+  G{入口} --> V[verify / app-check]
+  G --> CA[check-architecture]
+  V -->|fast ~5s| F[关键 4 项]
+  CA -->|full ~15s| A[全部扩展审计]
+  F --> F1[依赖方向]
+  F --> F2[include 所有权]
+  F --> F3[硬件操作边界]
+  A --> A1[构建隔离]
+  A --> A2[目录/生成合同]
+  A --> A3[命名空间]
+  A --> A4[组合根唯一性]
+```
+<!-- Sources: tools/check_architecture.py:4, GNUmakefile:48 -->
+
+fast 档内嵌在 `verify` 里每次都跑（~5 秒，504 个第一方源文件）；full 档只在显式请求时跑（~15 秒）。**修改模块边界或构建规则后必须显式跑 full**。
+
+## 三层验证哲学
+
+```mermaid
+flowchart TB
+  SRC[源码级<br>架构门禁] --> ELF[产物级<br>ELF 符号合同]
+  ELF --> IMG[镜像级<br>签名/摘要/布局]
+  SRC --> |依赖规则违规即失败| FAIL1[编译失败]
+  ELF --> |lto_priv/used/向量| FAIL2[ELF 验证失败]
+  IMG --> |摘要不匹配| FAIL3[拒绝启动]
+```
+<!-- Sources: tools/elf_support/layout.py, make/release.mk:57 -->
+
+源码门禁防"写错"，ELF 验证防"链接错"（尤其 LTO 时代的符号内部化），镜像验证防"传输/烧写错"。三层各自独立，任何一层绿都不代表其他层可跳过。
+
+## 参数与日志生成链
+
+```mermaid
+flowchart LR
+  Y[definitions/*.yaml] --> GEN[参数生成器]
+  GEN --> META[metadata 校验 stamp]
+  LT[logger_topics.yaml] --> LC[logger contract 生成]
+  LC --> CAPV[容量验证：49 Topics/301 参数/8 Profile]
+```
+<!-- Sources: tools/logging/generate_logger_contract.py, GNUmakefile:48 -->
+
+参数定义是唯一事实源：改 YAML → 经正式 Make 入口生成 → metadata stamp 校验 → QGC Metadata 同版提供。**禁止手写参数/消息派生列表**。
+
+## 已知边界
+
+- Git Bash 直跑检查器会有 `make -pn` 伪违规 → 走 `make.cmd`。
+- 架构白名单是显式登记制（如 `FatFsAtomicFileStore.cpp` 因 `get_fattime` 的全局 C ABI 例外）。
+- 工具全部锁定在仓库内，随构建自动解析，无全局安装。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [构建与验证](../01-getting-started/build-and-verify.md) | 门禁在构建中的位置 |
+| [构建、签名与 OTA](../09-build-release/build-release.md) | 产物级验证的延续 |
+| [分层架构与依赖规则](../02-architecture/layered-architecture.md) | 被检查的规则本体 |
+</doc>
+
+<doc title="自动校准现场指南" path="11-first-run\autocal-field-guide.md">
+# 自动校准现场指南
+
+权威出处：[部署指南 §9](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L254)；机制细节见[自动校准状态机](../04-auto-calibration/state-machine.md)。
+
+## 前置：定义本轮实验范围
+
+| 参数 | 首次运行建议 | Source |
+|------|--------------|--------|
+| `RO_SPEED_LIM` | 已完成手动验证的低巡航速度；必须有限正值（0 无效） | [指南 §9.1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L256) |
+| `MOT_THR_MAX` | 再核全输出车速与停车空间 | 同上 |
+| `RO_CAL_DIST` / `RO_CAL_RADIUS` | 场地容纳直线往返+掉头+顺逆转动+二维路径 | 同上 |
+| `RO_DECEL_LIM` | 首次可 -1/0 由流程探测，不填未测量的大值 | [指南 §9.1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L262) |
+
+**场地铁律**：正式制动观测去程/返程两次证据、含 >3s 全输出过程，需要比低速直行更长的场地；软件几何约束只覆盖定位参考点，不替代围挡与人员隔离——无制动模型时"允许开始"≠"证明能刹停"。
+
+## 启动操作序列
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant O as 操作员
+  participant V as 车辆
+  O->>V: 最终负载+水平场地+RTK Fixed
+  O->>V: 日志覆盖解锁前 + 保存标定前备份
+  O->>V: Disarmed 选 Auto Calibration
+  O->>V: 观察静态 Level/基线（车辆真实静止）
+  O->>V: 两杆回中 → 明确人工 Arm 一次
+  Note over V: Armed 但静态/提交停波窗口<br>不能趁暂时不动进入车前
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:266 -->
+
+要点：进入模式**不会自行解锁**；流程推进不要求反复上锁/解锁；之后可能自动继续运动，Arm 后操作员持续准备 Kill/Disarm。
+
+## 执行中看什么
+
+- 实际动作合理性、是否在预留区域、前进方向、停止后是否漂移、定位/航向跳变、`[autocal]` 当前原因与最终结果。
+- 详细核对用 ULog——**不存在专用完整标定面板**，QGC 不一定展示全部内部字段。
+- **中途禁改**：PWM、RC、轮距、安装姿态、巡航限速、输出上限、增益；不同时开 QGC Sensors/Radio 校准——会话冻结入口配置并核对参数代次，外部写入可能使候选失效并触发回滚。
+
+## 中止与失败
+
+```mermaid
+flowchart TB
+  DANGER[方向不符/偏离/跳变/危险加速/机械异常] --> STOP[立即 Disarm/Kill，必要时断动力]
+  NORMAL[真实 Disarm/切出/安全故障] --> CANCEL[取消或终止会话<br>不是暂停后继续]
+  CANCEL --> RESTART[再次进入从 Preflight/Level 重新执行<br>不继承完成位]
+  PARTIAL[普通组失败] --> KEEP[可能保留已确认成果<br>硬故障/取消按会话策略回滚]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:284 -->
+
+不能简单断言"失败必定一个参数没改"或"做过的都保存了"——**等待收尾后导出实际参数与前一份比较**。
+
+## 成功/部分/失败判定
+
+| 结果 | 判定与后续 | Source |
+|------|------------|--------|
+| `SUCCESS` | 仍需检查哪些导航项被明确跳过；不等于通过全部 Mission 工况 | [指南 §9.5](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L291) |
+| `PARTIAL` | 核查已保存组与缺失组，**不直接投入自动任务** | 同上 |
+| `FAILED`/`CANCELLED` | 结合原因、回滚状态、参数回读判断；存储/确认/回滚故障保持上锁，不用强制解锁绕过锁存 | 同上 |
+
+## 重启复查（保存判定的最后一步）
+
+```mermaid
+flowchart LR
+  FIN[等待 FINALIZE 完成<br>Disarmed 且会话退出] --> EXP1[导出标定后参数]
+  EXP1 --> REBOOT[正常重启]
+  REBOOT --> EXP2[再次导出比对]
+  EXP2 --> NEED{需要保留的<br>结果确已恢复?}
+  NEED -->|是| CHECK[短距手动检查+低速自动验证]
+  NEED -->|否| STORE[查存储/前端确认/回滚故障]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:291 -->
+
+provisional/RAM 候选、进度条、单阶段成功**都不是已持久化**；最终保存成功才登记 completed——不能在 FINALIZE 中拔电当正常结束。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [分阶段验收标准](./stage-standard.md) | 前置阶段判据 |
+| [状态机与调度合同](../04-auto-calibration/state-machine.md) | 机制视角 |
+| [收尾与失败分类](../04-auto-calibration/finalize-failures.md) | FINALIZE 机制细节 |
+</doc>
+
+<doc title="现场速查与清单" path="11-first-run\field-checklists.md">
+# 现场速查与清单
+
+出处：[部署指南 §12–§14](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L343)。
+
+## 常见现象速查（节选）
+
+| 现象 | 优先核对与下一步 |
+|------|------------------|
+| 参数缺失/描述陈旧 | 核对固件身份，等 Metadata 下载重连；不补写旧参数名 |
+| 解锁后立即上锁/没动力 | RC 新鲜度、接收机 failsafe、Kill、PWM 合法配置、维护/存储忙原因 |
+| 松杆慢慢爬行 | RC 回中值 vs 死区 → PWM CENT → 电调停止区；不先加大电机零阈值 |
+| 前进变旋转/左右相反 | 车尾视角核 FUNC；RC 符号与每侧 REV 分别验证再组合 |
+| 单轮只抖不转 | 查堵转/传动/电调/供电，测最小起步输出；避免长时间维持抖动 |
+| GPS 有卫星但校准不动 | 区分 RTK Fixed、双天线固定航向、同历元速度、EKF 融合——不凭卫星数判断 |
+| 正式制动前就报空间不足 | 全输出观测需要更长场地；降低本轮输出或换场地，**不降质量门槛** |
+| braking observations=0 / decel=NaN | 无有效制动证据；对齐运动阶段、后端输出、速度历元、停车确认 |
+| 校准 Armed 但轮子不动 | 先判断是否静态/提交停波窗口及就绪条件，**不绕过停波锁** |
+| Mission 切入成功但不动 | 已应用控制参数、请求有效性、执行器状态——模式门与控制有效性是两回事 |
+| 一直原地转难切直行 | 真实方向、航向/角速度、转向滞回与死区关系式 |
+| 参数回显正确重启恢复旧值 | 最终保存结果、unsaved/存储错误、SD 可用性；不重复写同一值替代定位 |
+| 数据链断开车仍走 | 当前无 GCS loss 自动导航动作；RC 接管或 Disarm/Kill |
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:343 -->
+
+排查总法：按 **物理现象 → 输入 → 运动请求 → 后端接受输出 → 传感器测量 → 状态/原因** 对齐时间；后端已接受 PWM ≠ 引脚实测。
+
+## 出车前清单
+
+```mermaid
+flowchart TB
+  PRE[出车前] --> HW[电源/线束/轮胎/传动/天线固定<br>负载与标定条件相符]
+  PRE --> FW[固件身份/参数版本/车内任务核对<br>上轮故障已处理]
+  PRE --> RC[RC 有效 + Arm/Kill/Manual 位置明确<br>急停与断动力可用]
+  PRE --> PWM[电调中位无爬行<br>改过接线则重做架空方向检查]
+  PRE --> RTK[RTK/航向/估计器健康稳定]
+  PRE --> SD[SD 可用有空间<br>日志模式覆盖计划动作]
+  PRE --> FIELD[场地/人员站位/停车空间<br>自动校准另核全输出制动风险]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:365 -->
+
+## 收车时清单
+
+- 确认实际停车、Disarmed，关电机动力。
+- 刚结束自动校准：已看到 FINALIZE 最终结果且无保存/回滚故障。
+- 等日志与存储操作完成再关控制器；**不带电拔正在写入的 SD**。
+- 保存 ULog、参数导出、任务、现场记录，标注"通过/未通过/未执行"。
+- 未解决的方向/制动/定位/存储/失联问题 → **登记为禁止自动运行**。
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:377 -->
+
+## 首车验收记录模板
+
+| 阶段 | 通过依据 | 结果/日期/证据 |
+|------|----------|----------------|
+| 部署 | 目标固件启动、身份正确、参数可下载 | |
+| 参数持久化 | 正常重启后关键配置回读一致 | |
+| 通信 | USB、SBUS、GNSS、可选数传/CAN 分别正常 | |
+| 架空中位/方向 | 侧别、前后/转向、零输入与实测波形正确 | |
+| 故障动作 | Disarm/Kill/RC 丢失恢复/重启无非预期动力 | |
+| 传感器 | 安装轴向、六面/水平标定、双天线与融合 | |
+| 手动落地 | 起步/直行/转向/倒车/实际停车距离 | |
+| 自动校准 | 最终结果、各组完成/跳过、保存及重启回读 | |
+| 简单 Mission | 任务回读、跟踪、转弯、末端停车、人工接管 | |
+| 工况扩展 | 实际负载/供电/路面下重复验证 | |
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:385 -->
+
+规则：每项填日期、操作员、证据文件和实测结果；**未执行写"未执行"**——不能用源码支持替代通过证据。更新影响车辆行为的源码/参数/硬件后，重新核对对应章节及现场记录。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [首次运行总流程](./first-run-flow.md) | 十阶段总图 |
+| [分阶段验收标准](./stage-standard.md) | 每阶段判据 |
+| [自动校准现场指南](./autocal-field-guide.md) | 校准阶段细则 |
+</doc>
+
+<doc title="首次运行总流程" path="11-first-run\first-run-flow.md">
+# 首次运行总流程
+
+权威出处：[上车部署与操作指南](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md)（核对日期 2026-09-28，基线 HEAD=8ccfc4e + 当时尚未提交的修改）。本页是其结构化摘要，冲突处以原文为准。
+
+## 十阶段顺序（前一阶段未通过，不进入下一阶段）
+
+```mermaid
+flowchart LR
+  S1[硬件与断动力检查] --> S2[固件身份与参数备份]
+  S2 --> S3[通信与 RC 配置]
+  S3 --> S4[PWM 中位/侧别/方向验收]
+  S4 --> S5[传感器安装与基础校准]
+  S5 --> S6[低速手动路试]
+  S6 --> S7[自动校准]
+  S7 --> S8[保存及重启回读]
+  S8 --> S9[简单 Mission]
+  S9 --> S10[扩大工况]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:11 -->
+
+## "必须设置"的三种含义
+
+| 类别 | 含义 | 例子 | 详见 |
+|------|------|------|------|
+| 人工必配/必核对 | 涉及本车接线、方向、几何、实验范围，逐项核对 | `PWM_Sx_FUNC`、`RD_WHEEL_TRACK`、`RC_MAP_*` | [参数基线](./param-classes.md) |
+| 由校准产生 | 不可手填非零值消除提示 | 传感器 offset/scale、动力学与控制增益、设备 ID | [参数基线](./param-classes.md) |
+| 有默认值但须验证效果 | 是否适合本车由实测决定 | 超时、换向等待、输出斜率、航点半径 | [分阶段验收标准](./stage-standard.md) |
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:41 -->
+
+## 参数修改纪律（每轮）
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant O as 操作员
+  participant V as 车辆
+  O->>V: 确认 Disarmed
+  O->>V: 修改参数
+  O->>V: 重新读取确认
+  O->>V: 等待存储完成
+  O->>V: 按 Metadata 重启
+  O->>V: 再读取
+  O->>V: 做对应动作检查
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:49 -->
+
+两条红线：**MAVLink 回显只证明 RAM 已接受，不证明掉电持久化**；车辆 Armed 或校准过程中不要批量修改参数。
+
+## 关键边界（开始前必须明确）
+
+1. **自动校准会真实开车**：正式制动观测达到 `MOT_THR_MAX` 全输出（含 >3s 全输出观测），允许超过 `RO_SPEED_LIM`——把巡航设低不等于整场低速。
+2. 直线与转圈空间约束不同：`RO_CAL_DIST` 管直线，`RO_CAL_RADIUS` 管转圈/二维路径，均参考入场固定 GNSS 点；**半径不是全程物理围栏**。
+3. Manual 解锁不替代上车检查；运行期 RC loss 处置是 **Disarm**（无自动返航）。
+4. 上锁 ≠ 急停：普通 Disarmed 输出 CENT 中位；Kill/故障/停波窗口停止脉冲——电调须分别验证"中位停止"和"无信号停止"。
+5. 默认参数不是调校结果：轮距、若干速度/转向增益为零，可能保持停波。
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:9 -->
+
+## 固件部署与首连
+
+| 步骤 | 要点 | Source |
+|------|------|--------|
+| 构建 | `make.cmd NO_COLOR=1 dima_rover`（发布验收另跑 `verify`） | [指南 §4.1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L72) |
+| OTA 部署 | `upload MCUMGR_PORT=COMx`（先核实端口）；上锁+断动力 | [指南 §4.2](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L91) |
+| 空板/恢复 | `factory.hex` 走 USB DFU（HEX 自带地址；全片擦除先备份） | [MCUboot 与恢复](../09-build-release/mcuboot-recovery.md) |
+| QGC 首连 | 等参数/Metadata 下载完成 → **先导出现有参数** → 确认 Manual/Disarmed → 核对模式目录 | [指南 §4.3](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L104) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [参数基线与三类必设](./param-classes.md) | 每阶段要设什么 |
+| [分阶段验收标准](./stage-standard.md) | 每阶段过不过的判据 |
+| [自动校准现场指南](./autocal-field-guide.md) | 第 7 阶段的展开 |
+| [现场速查与清单](./field-checklists.md) | 现象速查/出车收车/验收模板 |
+</doc>
+
+<doc title="参数基线与三类必设" path="11-first-run\param-classes.md">
+# 参数基线与三类必设
+
+参数名称/类型/默认/范围/枚举/重启要求以**正式生成的参数目录**为准（QGC Metadata 同版提供）；本页给首次运行的设置建议与语义边界。来源：[部署指南 §2/§5/§6/§7](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L41) 与[参数定义目录](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/parameters/README.md)。
+
+## ① 人工必配/必核对（接线与几何——不能照抄）
+
+| 参数 | 设置建议 | 语义边界 |
+|------|----------|----------|
+| `PWM_Sx_FUNC` | 按真实接线设 Motor right(101)/left(102)，至少各一路；未用通道 Disabled | 例：仅当 S1=左、S3=右 才设 `PWM_S1_FUNC=102`、`PWM_S3_FUNC=101` |
+| `PWM_Sx_MIN/CENT/MAX` | 依电调资料+实测，严格 MIN<CENT<MAX；默认 1000/1500/2000 | 500–2500us 合法 ≠ 电调接受全范围；**CENT 必须真实停止中位** |
+| `RC_MAP_THROTTLE/YAW` | 指向实际前后/转向杆（默认 1、2，仅接线匹配时保留） | RC 域先修正符号，不动 PWM 侧别 |
+| `RC_MAP_ARM_SW` + `RC_ARMSWITCH_TH` | 二段解锁开关；先 OFF 再明确 ON 才是解锁请求 | 首次稳定状态只建基线 |
+| `RC_MAP_KILL_SW` + `RC_KILLSWITCH_TH` | 易触及不误拨的独立开关 | 填参数≠急停有效，必须过 6.4 架空检查 |
+| `RC_MAP_FLTMODE` + `COM_FLTMODE1..6` | 三段开关逐位置验证；首轮保留清晰 Manual 槽 | Auto Calibration 槽位值 23；同帧安全动作可抑制模式请求 |
+| `SERIALx_FUNCTION/BAUD` | SBUS/GPS/MAVLink 唯一 owner；按真实接线核对（默认 SBUS=SERIAL6 不可照抄） | **不存在 SERIAL5**；SBUS 固定 100000 8E2 RX 反相；GPS 460800 |
+| `RD_WHEEL_TRACK` | 实测左右轮中心间距（米）：560mm→0.560 | 不是轮胎外缘宽/轮周长；校准要求 >0 且 ≤5 m |
+| `SENS_BOARD_ROT` / `CAL_MAG0_ROT` | 按实际安装姿态 | 不能用微调掩盖 90°/180° 装反 |
+| `EKF2_GPS_POS_X/Y/Z`、`EKF2_IMU_POS_X/Y/Z` | 一致车体参考点实测（米，FRD） | 天线间距不是杆臂 |
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:115, docs/H743_VEHICLE_COMMISSIONING_ZH.md:155, docs/H743_VEHICLE_COMMISSIONING_ZH.md:200, Dima/middleware/parameters/definitions/module_rover_actuator_params.yaml -->
+
+## ② 由校准产生（不可手编）
+
+```mermaid
+flowchart TB
+  G[陀螺静止校准] --> A[加速度六面]
+  A --> L[水平校准<br>最终安装位]
+  L --> M[磁力计基础校准]
+  M --> AUTO[自动校准<br>动力学/增益/磁补偿]
+  AUTO --> P[参数持久化 + 重启回读]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:210, docs/H743_VEHICLE_COMMISSIONING_ZH.md:254 -->
+
+| 域 | 产生方式 | 禁止 |
+|----|----------|------|
+| `CAL_GYRO0_*` / `CAL_ACC0_*` / `CAL_MAG0_*` | QGC 校准流程 / 自动校准优化 | 手工编造结果绕过检查 |
+| `RO_SPEED_P/I`、`RO_YAW_RATE_P/I`、`RO_YAW_P` | 自动校准增益组（有证据的人工整定可补足） | 设任意正数只为 parameters_valid |
+| `GPS_YAW_BASELINE/OFFSET` | 本轮 RTK 标定或核对已验证值 | 照搬另一台车 |
+| 设备 ID / 安装旋转 / scale | 校准/装机事实 | 随意改写 |
+
+## ③ 有默认值但必须验证（语义要点）
+
+| 参数 | 默认/建议 | 语义边界 |
+|------|-----------|----------|
+| `MOT_THR_MAX` | 未知车辆**没有通用安全值**，架空验证后按轮设 | 归一化输出（0.2=20%），不是 m/s；自动校准制动观测会到全输出 |
+| `MOT_THR_MIN` | 本车可稳定起步的最小正向输出 | ≤ MOT_THR_MAX；只影响非零轮端命令，精确零仍是零；不是遥控死区，不能修摇杆回中偏差 |
+| `MOT_REV_DELAY` | 0.2s 换向中立等待 | 原地左右互换的短暂停顿可能是它 |
+| `MOT_SLEW_RATE` / `MOT_ARM_RAMP` | 按电调要求保留/配置 | 0=禁用；启用后 Manual 回中也遵守斜率 |
+| `SDLOG_MODE` | 首轮建议 2（启动到关闭） | 默认 0 只记录 Armed——无解锁无新日志≠SD 故障 |
+| `SDLOG_PROFILE` | General Rover + Rover system identification（=5；需 EKF2 replay 用 7） | 修改后重启；高数据量先确认 SD 写入能力 |
+| `EKF2_GPS_CTRL` | 默认 7（无双天线航向位）；自动 RTK 事务会保留现位打开 bit3 | 偏置方向未知时不要强行改 15 让状态变绿 |
+| `UAVCAN1_*` | 默认自动分配/500k/本机 1 | 逐项核对本车总线 |
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:163, docs/H743_VEHICLE_COMMISSIONING_ZH.md:145, docs/H743_VEHICLE_COMMISSIONING_ZH.md:231, docs/H743_VEHICLE_COMMISSIONING_ZH.md:235 -->
+
+## 自动校准实验范围四参数
+
+```mermaid
+flowchart LR
+  RANGE[本轮实验范围] --> LIM[RO_SPEED_LIM<br>必须有限正值]
+  RANGE --> THR[MOT_THR_MAX<br>全输出车速/停车空间]
+  RANGE --> DIST[RO_CAL_DIST<br>直线目标]
+  RANGE --> RAD[RO_CAL_RADIUS<br>转圈/二维路径]
+  RANGE --> XTE[RO_CAL_XTE_MAX<br>有限正值，零=无效配置]
+  RANGE --> DECEL[RO_DECEL_LIM<br>首次可 -1/0 由流程探测]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:256, docs/H743_VEHICLE_COMMISSIONING_ZH.md:262 -->
+
+`RO_DECEL_LIM` 形成模型后按 `d = v²/(2a)` 估算停车距离——**速度翻倍距离四倍**；不要填未经测量的较大减速度换取更短估算距离。变更电调/供电/传动/轮径/载荷或显著修改输出整形后，原动力学结果不再自动适用。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [首次运行总流程](./first-run-flow.md) | 这些参数在各阶段的位置 |
+| [分阶段验收标准](./stage-standard.md) | 设置之后怎么验 |
+| [参数系统](../06-middleware/parameter-system.md) | 生成链与持久化机制 |
+</doc>
+
+<doc title="分阶段验收标准" path="11-first-run\stage-standard.md">
+# 分阶段验收标准
+
+每阶段"过不过"的判据。全部出处：[部署指南 §5–§11](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L113)。
+
+## RC 校准与方向（阶段 3）
+
+**通过标准**：原始 RC 数据持续更新；中心稳定、端点可达；向前杆=正纵向、向右杆=正转向；两杆回中输入稳定为零（默认 RC1/RC2 死区 30us）；接收机自身 failsafe 时不得继续发布"健康的旧杆位"。
+
+| 检查 | 不满足时 | Source |
+|------|----------|--------|
+| Radio 校准覆盖两端/中位/开关 | 重做校准 | [指南 §5.2](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L125) |
+| `RCn_MIN/TRIM/MAX/REV/DZ` 回读 | 在 RC 域修正，不动 PWM 侧别 | 同上 |
+| `RC_MAP_PITCH/ROLL` | 仅 QGC 兼容标记，不为点亮页面虚构运动轴 | 同上 |
+
+## 架空方向检查（阶段 4）
+
+```mermaid
+flowchart TB
+  ARM[Manual Disarmed 动力接通] --> Z0{两杆回中两轮停?}
+  Z0 -->|否| C0[查 RC 中位/死区/PWM CENT/电调停止区]
+  Z0 -->|是| T1[小正油门: 双轮前进]
+  T1 --> T2[小负油门: 双轮后退]
+  T2 --> T3[小正转向: 左前右后=车头右]
+  T3 --> T4[小负转向: 右前左后=车头左]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:171 -->
+
+方向约定：`right = T − S`、`left = T + S`，正转向=车头俯视顺时针；**倒车保持同一转向符号**（不按汽车方向盘习惯推断）。三层各管各的：`RCn_REV` 修输入方向、`PWM_Sx_FUNC` 定真实侧别、`PWM_Sx_REV` 匹配电机正反——**不能靠同时互换左右与反转遥控掩盖错误**。
+
+## 故障动作（阶段 4）
+
+| 检查 | 通过条件 |
+|------|----------|
+| 普通上锁 | 小输出请求 Disarm → 有效通道回 CENT、两轮停止 |
+| Kill | PWM 停波、电调撤力；恢复后重新人工授权，**不以恢复开关为可开车证明** |
+| RC 失联 | 关发射机 → 接收机 failsafe/超时 → 固件 Disarm |
+| RC 恢复 | 不会自动解锁；Arm 开关回 OFF 后重新产生 ON 边沿 |
+| 数据链断开 | 车辆继续运行是当前设计；操作员须知它≠RC 失联、无自动返航 |
+| 重新上电 | 无非预期转动；参数和侧别正确恢复 |
+
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:187 -->
+
+## 传感器与 RTK（阶段 5）
+
+校准顺序：安装方向 → 陀螺静止 → 加速度六面（重车在总装前规划可翻转组件）→ 最终位置水平校准 → 磁力计基础校准（手动六面采样）→ 每项明确成功后再下一项。
+
+**RTK 运动质量准入**（源码准入条件，非长期精度承诺）：
+
+| 门 | 要求 | Source |
+|----|------|--------|
+| 位置 | RTK Fixed、EPH ≤ 0.15 m、样本新鲜、入场圆心 EPH > 0 | [指南 §7.3](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L220) |
+| 航向 | 双天线解算+整周固定、基线 0.1–10 m、航向精度 ≤ 1° | 同上 |
+| 速度 | 同历元配对 | 同上 |
+| 融合 | RTK 参数应用后：GNSS yaw 实际融合、新息通过、基线一致 | 同上 |
+
+注意：**QGC 的 NTRIP 配好≠差分已进接收机**——当前接收处理目录没有 `GPS_RTCM_DATA` 转发入口，用已验证的接收机差分链路。
+
+## Mission 前控制配置（阶段 9 前置）
+
+```mermaid
+flowchart TB
+  V[运行校验] --> SP[速度环: RO_MAX_THR_SPEED>0<br>RO_SPEED_P/I 非负不同时零<br>RO_ACCEL_LIM/RO_DECEL_LIM>0]
+  V --> YAW[转向环: 有效轮距 + RO_YAW_RATE_CORR>0<br>RO_YAW_RATE_P/I 非负不同时零<br>RO_YAW_RATE_LIM/ACCEL/DECEL>0]
+  V --> NAV[RO_JERK_LIM>0 + NAV_ACC_RAD 合理<br>RO_SPEED_LIM>0 且 RO_SPEED_TH<RO_SPEED_LIM]
+  V --> HYS[转向滞回: RD_TRANS_DRV_TRN > RD_TRANS_TRN_DRV > 0<br>且 RO_YAW_RATE_TH×π/180 < RO_YAW_P×RD_TRANS_TRN_DRV]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:302 -->
+
+两个易错点：`RO_MAX_THR_SPEED` 是等效前馈系数不是物理极速；滞回阈值是 rad 而 `RO_YAW_RATE_TH/LIM` 是 deg/s——**死区先归零退出角请求会让车辆停在退出角之外**（原地转不回直行先查这个组合）。
+
+## Mission 任务（阶段 9）
+
+| 项 | 标准 | Source |
+|----|------|--------|
+| 容量 | 64 项，仅普通 `NAV_WAYPOINT`；禁起飞/降落/RTL/DO_CHANGE_SPEED 等 | [指南 §11](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L322) |
+| 回读 | 上传成功后再下载逐点比较数量/位置/顺序 | 同上 |
+| 存储 | 无 SD 的上传可能只在 RAM；每次启动重新核对车内任务 | 同上 |
+| 进入 | 需 Armed + 已提交任务 + 估计器就绪；被拒先处理原因再重试 | 同上 |
+| 接管 | 切 Manual 确认反馈后手动控制；急停用 Disarm/Kill | 同上 |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [首次运行总流程](./first-run-flow.md) | 阶段顺序 |
+| [自动校准现场指南](./autocal-field-guide.md) | 阶段 7 展开 |
+| [现场速查与清单](./field-checklists.md) | 不过时怎么查 |
+</doc>
+
+<doc title="板级层（Boards/H743）" path="12-startup-board\boards-h743.md">
+# 板级层（Boards/H743）
+
+## 职责边界
+
+`Boards/H743` 承接：板级初始化、Flash 布局、外设适配与**唯一组合根**。它不依赖上层控制模块；上层经 capability 契约访问它装配的后端。
+
+## 文件清单
+
+| 文件 | 职责 | Source |
+|------|------|--------|
+| `Src/board_init.c` | 板级早期初始化 | [board_init.c](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/board_init.c) |
+| `Src/motor_pwm.c` | PWM 后端（50Hz、CENT/停波、Hard Safe Off 证据） | [motor_pwm.c](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/motor_pwm.c) |
+| `Src/fatfs_diskio.cpp` | SD MMC 磁盘 IO + `get_fattime`（北京时间）+ io_stats（used 属性） | [fatfs_diskio.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/fatfs_diskio.cpp) |
+| `Src/boot_diagnostics*.c` | 引导诊断区读写 | [boot_diagnostics.c](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/boot_diagnostics.c) |
+| `Inc/board_bus_resources.h` | 总线资源分配（DMA/中断/引脚映射） | [board_bus_resources.h](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Inc/board_bus_resources.h) |
+| `Inc/boot_layout.h` | Flash 布局常量 | [boot_layout.h](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Inc/boot_layout.h) |
+
+## PWM 后端合同
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant MO as MotorOutput
+  participant PWM as motor_pwm.c
+  MO->>PWM: 归一化输出（限幅后）
+  PWM->>PWM: CENT 中位 / 停波窗口处理
+  PWM-->>MO: Hard Safe Off / stopped 证据
+  Note over PWM: 停波确认只由 PWM owner 写入<br>（ ArmedFlash 合同）
+```
+<!-- Sources: Boards/H743/Src/motor_pwm.c:1, Dima/platform/api/Flash.hpp:59 -->
+
+电调兼容边界（部署指南 §3.1/§6.1）：必须支持双向中位控制；单向油门电调不能靠参数冒充可逆后端；脉宽/频率/中位以实测为准（默认 50Hz、1000/1500/2000us）。
+
+## 总线资源与引脚
+
+`board_bus_resources.h` 集中声明 DMA 通道、中断优先级与外设引脚映射；ELF 验证器强制 DMA 区边界（`0x30040000, 32768 B`）——DMA 缓冲放错段直接构建失败（[layout.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/elf_support/layout.py)）。
+
+## Flash 布局
+
+| 区域 | 地址 | 内容 |
+|------|------|------|
+| 0x08000000 | MCUboot | 48,928 B |
+| 0x08020000–0x0803FFFF | 引导诊断 | boot_diagnostics |
+| 0x08040000 | 签名应用（向量 +0x400） | signed bin |
+| 0x081E0000 | 参数 FlashFS | 128 KiB 单扇区 |
+
+<!-- Sources: Boards/H743/Inc/boot_layout.h:1, make/release.mk:17 -->
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [启动链](./startup-chain.md) | board_init 的调用位置 |
+| [CubeMX 生成层](./core-hal.md) | Core/ 与板级层的分工 |
+| [Capability 契约与组合根](../07-platform/platform.md) | 装配关系 |
+</doc>
+
+<doc title="CubeMX 生成层（Core/）" path="12-startup-board\core-hal.md">
+# CubeMX 生成层（Core/）
+
+## 合同
+
+`H743_FreeRTOS.ioc` 是外设配置的**唯一事实源**；`Core/` 全部由 CubeMX 生成——**禁止写任何业务逻辑**（[AGENTS.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L67)）。
+
+```mermaid
+flowchart LR
+  IOC[H743_FreeRTOS.ioc] -->|CubeMX 生成| CORE[Core/<br>main.c / 外设 Init / 中断 / 时钟]
+  CORE --> HAL[Drivers/STM32H7xx HAL]
+  BOARD[Boards/H743] -->|消费外设句柄| CORE
+  APP[Dima/*] x--x CORE
+```
+<!-- Sources: AGENTS.md:67, Boards/H743/Src/board_init.c:1 -->
+
+| 层 | 允许 | 禁止 |
+|----|------|------|
+| Core/ | CubeMX 重新生成覆盖 | 手改（会被覆盖丢失） |
+| Boards/H743 | 调用 HAL 句柄、板级适配 | 业务逻辑 |
+| Dima/* | 只经 capability 契约 | include HAL/CMSIS/Core 头（门禁拦截） |
+
+## 生成内容
+
+| 生成物 | 用途 |
+|--------|------|
+| 时钟树初始化 | 480 MHz Cortex-M7 / 总线时钟 |
+| GPIO/USART/SDMMC/USB/CAN/FMC 外设初始化 | 板级外设基础 |
+| 中断向量与 NVIC 配置 | `stm32h7xx_it.c` |
+| FreeRTOS 集成（Middlewares/FreeRTOS） | 内核与堆 |
+| ST USB 协议栈（Middlewares/ST） | CDC 设备 |
+| FatFs（Middlewares/Third_Party/FatFs） | 文件系统（本项目改过 ffconf：`_USE_CHMOD=1`、`_FS_NORTC=0`） |
+
+<!-- Sources: Middlewares/Third_Party/FatFs/src/ffconf.h, Boards/H743/Src/board_init.c:1 -->
+
+## Middlewares 层
+
+| 中间件 | 本项目角色 |
+|--------|-----------|
+| FreeRTOS | 内核（`platform/freertos/FreeRTOSConfig.h` 侧配置） |
+| MCUboot | 引导与镜像验证（独立 Bootloader 构建） |
+| ST USB | CDC 底层（UsbConsole 的硬件面） |
+| FatFs | SD 文件系统（日志/原子文件域/任务存储共用 owner） |
+
+## 与门禁的关系
+
+依赖门禁的"硬件操作边界"检查确保：Dima 上层对 HAL 的任何直接使用都会构建失败——所有硬件访问必须落在 Boards/H743 或 platform/stm32h7 的后端实现里（[check_architecture.py:4](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/check_architecture.py#L4)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [板级层](./boards-h743.md) | 消费生成层的适配层 |
+| [架构门禁与验证工具](../10-tooling/tooling.md) | include 所有权检查 |
+| [分层架构与依赖规则](../02-architecture/layered-architecture.md) | 依赖合同 |
+</doc>
+
+<doc title="启动链" path="12-startup-board\startup-chain.md">
+# 启动链
+
+## 路径总览
+
+```mermaid
+flowchart TB
+  R[复位向量] --> MB[MCUboot 验证签名]
+  MB --> APP[application/app_bootstrap]
+  APP --> HAL[Core/HAL 外设初始化]
+  HAL --> BOARD[Boards/H743 board_init]
+  BOARD --> COMP[platform_composition 组合根]
+  COMP --> RT[FreeRTOS 调度器启动]
+  RT --> MAIN[app_main C ABI 入口]
+  MAIN --> CTX[ApplicationContext 装配模块]
+  CTX --> RUN[各 WorkQueue 模块周期运行]
+```
+<!-- Sources: Dima/application/app_main.cpp:1, Dima/application/app_bootstrap.cpp:1, Boards/H743/Src/board_init.c:1, Boards/H743/Src/platform_composition.cpp:1 -->
+
+## 关键文件
+
+| 文件 | 职责 | Source |
+|------|------|--------|
+| `Dima/application/app_main.cpp` | C ABI 入口 `app_main`，启动 FreeRTOS 世界 | [app_main.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/application/app_main.cpp) |
+| `Dima/application/app_bootstrap.cpp` | 早期引导：C 运行时前置准备 | [app_bootstrap.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/application/app_bootstrap.cpp) |
+| `Boards/H743/Src/board_init.c` | 板级早期初始化（时钟/总线/诊断区） | [board_init.c](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/board_init.c) |
+| `Boards/H743/Src/boot_diagnostics.c` + `boot_diagnostics_store.c` | 引导诊断记录（0x08020000 区） | [boot_diagnostics.c](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/boot_diagnostics.c) |
+| `Boards/H743/Src/dima_boot_request.c` | 固件侧引导请求（配合 MCUboot） | [dima_boot_request.c](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Boards/H743/Src/dima_boot_request.c) |
+| `Dima/rover/ApplicationContext.cpp` | 模块装配、生命周期与一次性迁移 | [ApplicationContext.cpp:285](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/ApplicationContext.cpp#L285) |
+
+## 启动期的一次性迁移
+
+组合根/应用上下文在参数服务初始化后执行 DNA 遗留记录软失效（`invalidate_records('dna0')`）——**只清位不擦除、掉电幂等续跑**，全部失效后为空操作（[ApplicationContext.cpp:285](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/ApplicationContext.cpp#L285)，ADR 0006 决策 4）。
+
+## 启动失败语义
+
+```mermaid
+flowchart LR
+  FAIL[启动期故障] --> DIAG[boot_diagnostics 落诊断区]
+  FAIL --> SAFE[进入安全态而非复位循环]
+  SAFE --> RECOV[USB DFU 恢复路径可用]
+```
+<!-- Sources: Boards/H743/Src/boot_diagnostics_store.c:1, docs/MCUBOOT_USB_RECOVERY_ZH.md:1 -->
+
+模块侧合同呼应：MotorOutput 参数应用冲突走 defer 放弃而非复位（[MotorOutput.cpp:15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/motor/MotorOutput.cpp#L15)）；BootHealth 启动健康检查决定喂狗起点（[BootHealthService.cpp:78](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/boot_health/BootHealthService.cpp#L78)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [板级层](./boards-h743.md) | board_init 细节 |
+| [MCUboot 与恢复](../09-build-release/mcuboot-recovery.md) | 引导与诊断区 |
+| [Capability 契约与组合根](../07-platform/platform.md) | 装配点合同 |
+</doc>
+
+<doc title="驱动全量清单" path="13-drivers-peripherals\drivers-inventory.md">
+# 驱动全量清单
+
+## 驱动矩阵
+
+| 驱动 | 目录 | 设备 | 总线 | 输出 Topic | Source |
+|------|------|------|------|------------|--------|
+| UM982 | `drivers/gps/um982` | 双天线 GNSS/RTK | UART 460800 | `sensor_gps` + `rtk_heading_status` | [Um982Gps.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/gps/um982/Um982Gps.cpp) |
+| ICM42688P | `drivers/imu/icm42688p` | 6 轴 IMU | SPI | IMU 数据（经 sensors 模块） | [ICM42688P.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/imu/icm42688p/ICM42688P.cpp) |
+| DroneCAN Mag2 | `drivers/magnetometer/dronecan_mag2` | RM3100 磁力计 | CAN 500k | 磁场（经 VehicleMagnetometer） | [DroneCanMag2.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/magnetometer/dronecan_mag2/DroneCanMag2.cpp) |
+| SBUS | `drivers/rc/sbus` | 遥控接收机 | UART 100000 8E2 RX 反相 | RC 输入（经 rc 模块） | [SbusRc.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/rc/sbus/SbusRc.cpp) |
+
+## ICM42688P（唯一未展开过的驱动）
+
+```mermaid
+flowchart LR
+  SPI[SPI 总线] --> REG[ICM42688PRegisters<br>寄存器定义]
+  REG --> DRV[ICM42688P 主驱动]
+  DRV --> FIFO[ICM42688PFifo<br>+ FifoAlgorithms 批量解析]
+  FIFO --> PUB[IMU 样本发布]
+```
+<!-- Sources: Dima/drivers/imu/icm42688p/ICM42688P.cpp:1, Dima/drivers/imu/icm42688p/ICM42688PFifoAlgorithms.cpp:1 -->
+
+结构：寄存器层（`ICM42688PRegisters`）+ 主驱动 + **FIFO 批量算法**（传感器以 FIFO 批量上抛、算法逐样本解析，减少 SPI 事务数——高频 IMU 的标准做法）。
+
+## SBUS 驱动
+
+| 文件 | 职责 | Source |
+|------|------|--------|
+| `SbusRc.cpp` | 串口帧接收与生命周期 | [SbusRc.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/rc/sbus/SbusRc.cpp) |
+| `SbusProtocol.cpp` | SBUS 帧解码（25B/16ch/flags） | [SbusProtocol.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/drivers/rc/sbus/SbusProtocol.cpp) |
+
+电气合同（不可用普通波特率修复）：固定 100000 bit/s、8E2、RX 反相（[部署指南 §5.1](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L115)）。
+
+## middleware/drivers
+
+`Dima/middleware/drivers` 提供驱动与 modules 之间的桥接层（设备中断/总线分发），驱动本体不感知业务模块（[middleware/drivers](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/drivers)）。
+
+## 驱动通用合同
+
+```mermaid
+flowchart TB
+  DRV[任一驱动] --> FRESH[时间戳真实到达时刻]
+  DRV --> ERR[明确无解/离线语义<br>不伪造数据]
+  DRV --> LEASE[配置修改经 ConfigurationUpdateLease]
+  DRV --> README[目录 README 声明边界]
+```
+<!-- Sources: Dima/drivers/gps/um982/Um982Gps.cpp:532, Dima/platform/api/Flash.hpp:59 -->
+
+示例：UM982 无配对时照常发布航向但 `velocity_aligned=false`、速度 NaN；NO_FIX 在线状态不伪造经纬度——"宁可明确缺失，不冒充有效"。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [UM982 链路](../08-drivers/um982.md) | GPS 驱动深页 |
+| [DroneCAN 链路](../08-drivers/dronecan.md) | 磁力计驱动深页 |
+| [串口与 RC 模块](./serial-rc.md) | 驱动的模块侧消费者 |
+</doc>
+
+<doc title="Mission 任务模块" path="13-drivers-peripherals\mission.md">
+# Mission 任务模块
+
+## 结构
+
+| 文件 | 职责 | Source |
+|------|------|--------|
+| `MissionService.cpp` | 任务服务：上传/下载/当前项推进 | [MissionService.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mission/MissionService.cpp) |
+| `MissionCodec.cpp` | MAVLink 任务项编解码 | [MissionCodec.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mission/MissionCodec.cpp) |
+| `MissionRepository.cpp` | 任务存储（SD 原子文件域 / RAM） | [MissionRepository.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mission/MissionRepository.cpp) |
+| `MissionSnapshot.cpp` | 当前任务快照（供消费方一致性读取） | [MissionSnapshot.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mission/MissionSnapshot.cpp) |
+
+## 能力边界（部署指南 §11 合同）
+
+```mermaid
+flowchart TB
+  CAP[任务能力] --> N[容量 64 项]
+  CAP --> T[仅普通 NAV_WAYPOINT]
+  CAP --> R[航点到达半径可单独设置<br>未给用 NAV_ACC_RAD]
+  NO[不支持] --> X1[起飞/降落/RTL]
+  NO --> X2[DO_CHANGE_SPEED/复杂动作]
+  NO --> X3[指定航点朝向/悬停等待]
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md:322, Dima/modules/mission/README.md -->
+
+高度字段协议有效即可（地面车不做越障规划接口）；等待时间/穿越半径默认零；yaw 未指定；autocontinue 开启。
+
+## 存储与回读
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Q as QGC
+  participant MS as MissionService
+  participant RE as MissionRepository
+  participant SD as SD Mission 域
+  Q->>MS: Disarmed 上传
+  MS->>RE: 校验（容量/类型）
+  RE->>SD: SD 可用→落盘；无 SD→RAM（重启丢失）
+  Q->>MS: 下载回读
+  MS-->>Q: 逐点比较数量/位置/顺序
+```
+<!-- Sources: Dima/modules/mission/MissionRepository.cpp:1, Dima/modules/mission/MissionService.cpp:1 -->
+
+**每次启动重新核对车内任务**——换 SD 卡可能恢复那张卡的旧任务；地图上画好路径不等于车辆已收到。
+
+## 执行与 AutoMode 的关系
+
+任务就绪后由 [AutoMode](../03-rover-domain/auto-mode.md) 消费快照推进航段（段装载 → PurePursuit/SegmentGuidance 跟踪 → 到达切换）；进入 Mission 需要 Armed + 已提交任务 + 估计器就绪。任务结束停在最后航点，**不自动返回出发点**（[AutoMode.cpp:328](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/rover/modes/auto/AutoMode.cpp#L328)，[部署指南 §11.2](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L332)）。
+
+## MAVLink 侧
+
+任务上传/下载走 MAVLink 任务协议（`MavlinkMission`，[modules/mavlink](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink)），编解码集中在 MissionCodec——协议与存储解耦。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [AutoMode 航段任务](../03-rover-domain/auto-mode.md) | 执行层 |
+| [存储域](../06-middleware/storage-domains.md) | Mission 域协议 |
+| [MAVLink 链路](../05-modules/mavlink.md) | 传输通道 |
+</doc>
+
+<doc title="串口与 RC 模块" path="13-drivers-peripherals\serial-rc.md">
+# 串口与 RC 模块
+
+## serial 模块：SERIALx 功能分配
+
+`modules/serial/SerialConfig.cpp` 维护 `SERIALx_FUNCTION/BAUD` 的解析与 owner 管理：
+
+| 合同 | 内容 | Source |
+|------|------|--------|
+| 编号语义 | SERIALx 编号对应物理 UART/USART 尾号；**不存在 SERIAL5** | [SerialConfig.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/serial/SerialConfig.cpp) |
+| 唯一 owner | SBUS/GPS/MAVLink 各自唯一 owner；功能迁移关闭旧 owner | 同上 |
+| 生效 | FUNCTION/BAUD 改动需重启；SBUS 速率不走普通 BAUD（固定 100000 8E2 反相） | 同上 |
+| USB | 自身链路，不占 UART 分配 | 同上 |
+
+```mermaid
+flowchart TB
+  CFG[SERIALx_FUNCTION] --> OWN{每功能唯一 owner}
+  OWN --> SBUS[SBUS → rc 模块]
+  OWN --> GPS[GPS → Um982 驱动]
+  OWN --> MAV[MAVLink → mavlink 模块]
+  USB[USB CDC] --> CONSOLE[Console/MAVLink 共享]
+```
+<!-- Sources: Dima/modules/serial/SerialConfig.cpp:1, Dima/modules/serial/README.md -->
+
+## rc 模块：SBUS 到运动输入
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant SB as SbusRc 驱动
+  participant RU as RCUpdate
+  participant RM as RcManualInput
+  participant CMD as Commander
+  SB->>RU: 解码帧（周期发布）
+  RU->>RU: RC_MAP_*/RCn_MIN/TRIM/MAX/REV/DZ 归一化
+  RU->>CMD: 手动输入 + 新鲜度
+  CMD->>CMD: failsafe 判定（失联→Disarm）
+  CMD->>CMD: Arm/Kill/模式开关边沿判定
+```
+<!-- Sources: Dima/modules/rc/RcManualInput.cpp:1, Dima/modules/rc/RCUpdate.cpp:1, Dima/modules/safety/Commander.cpp:143 -->
+
+| 合同 | 内容 | Source |
+|------|------|--------|
+| 双向轴 | 油门/转向均中心双向；回中稳定为零（默认死区 30us，旧车零死区不自动变 30） | [rc README](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/rc/README.md) |
+| 兼容标记 | `RC_MAP_PITCH/ROLL` 仅 QGC 流程标记，不承担运动控制 | 同上 |
+| Failsafe | 接收机 failsafe 不得继续发布"健康旧杆位"；固件侧 RC loss=Disarm | [CommanderSafety.cpp:137](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderSafety.cpp#L137) |
+| 模式槽 | `COM_FLTMODE1..6`；Auto Calibration 槽值 23，仍要求 Disarmed | [CommanderAutoCalibration.cpp:34](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/CommanderAutoCalibration.cpp#L34) |
+
+## 边沿与同帧抑制
+
+解锁开关"启动/恢复后第一次稳定状态只建基线；先 OFF 再明确 ON 才形成解锁请求"；**避免同帧拨模式+Arm+Kill**——同帧安全动作可抑制模式请求，被拒的模式请求不会自动重试（[部署指南 §5.3](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L135)）。
+
+## 强制解锁的持续确认
+
+RC/执行器判定在 20~50ms 粒度存在单帧瞬态（SBUS 坏帧/EMI），Commander 对强制解锁维持持续确认窗——一帧即杀的历史问题已修（[Commander.cpp:143](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/safety/Commander.cpp#L143)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [手动模式语义](../03-rover-domain/manual-mode.md) | 输入的下游语义 |
+| [驱动全量清单](./drivers-inventory.md) | SBUS 驱动本体 |
+| [Commander 安全链](../05-modules/commander.md) | 开关边沿的最终判定 |
+</doc>
+
+<doc title="FreeRTOS 平台内幕" path="14-platform-internals\freertos-internals.md">
+# FreeRTOS 平台内幕
+
+## 后端组成
+
+| 组件 | 文件 | 职责 | Source |
+|------|------|------|--------|
+| Backend | `Backend.cpp/.hpp` | capability 契约的 FreeRTOS 侧实现装配 | [Backend.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/freertos/Backend.cpp) |
+| BackendTimeout | `BackendTimeout.cpp` | 超时语义统一 | [BackendTimeout.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/freertos/BackendTimeout.cpp) |
+| FreeRTOSConfig.h | 内核配置 | 优先级/堆/tick | [FreeRTOSConfig.h](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/freertos/FreeRTOSConfig.h) |
+| HeapOperators | `HeapOperators.cpp` | 堆算子（受限堆策略） | [HeapOperators.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/freertos/HeapOperators.cpp) |
+
+`platform/freertos` 与 `platform/stm32h7` **互不依赖**——二者只共同实现 `platform/api` 契约（依赖门禁强制）。
+
+## uORB 实现
+
+```mermaid
+flowchart LR
+  PUB[Publication.hpp 发布] --> Q[Topic 队列/代次]
+  Q --> SUB[Subscription 拷贝最新]
+  Q --> SD[SubscriptionData 带回调拷贝]
+  F[uORBMessageFields] --> GEN[从 .msg 生成字段元数据]
+```
+<!-- Sources: Dima/middleware/uORB/Publication.hpp:1, Dima/middleware/uORB/SubscriptionData.hpp:1, Dima/middleware/uORB/uORBMessageFields.cpp:1 -->
+
+要点：订阅侧 `copy()` 更新最新值并核对代次；`SubscriptionData` 用于需要"取到即处理"的场景；字段元数据由消息 schema 生成，供日志格式缓存推导复用（[generate_logger_contract.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/logging/generate_logger_contract.py) 的输入）。
+
+## WorkQueue 实现
+
+```mermaid
+flowchart TB
+  WI[ScheduledWorkItem] --> Q1[实时队列]
+  WI --> Q2[传感器队列]
+  WI --> Q3[通信队列]
+  WI --> Q4[存储队列]
+  WI --> Q5[低优先级队列]
+  NOTE["单队列内串行执行 → 队列内无锁；<br>跨队列靠时间戳新鲜度合同"]
+  Q1 -.-> NOTE
+```
+<!-- Sources: Dima/middleware/work_queue/WorkQueue.cpp:1, Dima/middleware/work_queue/ScheduledWorkItem.hpp:1, Dima/02-architecture 线程与调度 -->
+
+## 支撑服务
+
+| 服务 | 目录 | 用途 | Source |
+|------|------|------|--------|
+| events | `middleware/events` | 有界事件报告（Severity 分级，StorageFailure 等） | [events.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/events/events.cpp) |
+| perf | `middleware/perf` | 性能计数器 | [perf_counter.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/perf/perf_counter.cpp) |
+| lifecycle | `middleware/lifecycle` | module_manager：模块启停与状态 | [module_manager.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/lifecycle/module_manager.cpp) |
+| maintenance | `middleware/maintenance` | 维护锁语义（与 ArmedFlash 协作） | [maintenance](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/maintenance) |
+| px4_platform_common | `middleware/px4_platform_common` | PX4 平台兼容层（ScheduledWorkItem 基类等） | [px4_platform_common](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/px4_platform_common) |
+| rover | `middleware/rover` | RoverModeContract 等模式契约 | [RoverModeContract.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/middleware/rover/RoverModeContract.cpp) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [线程与调度](../02-architecture/threading-scheduling.md) | 调度合同的用户视角 |
+| [STM32H7 后端](./stm32h7-backends.md) | 姊妹后端 |
+| [Capability 契约与组合根](../07-platform/platform.md) | 装配的契约面 |
+</doc>
+
+<doc title="STM32H7 后端" path="14-platform-internals\stm32h7-backends.md">
+# STM32H7 后端
+
+## 目录构成
+
+| 子目录 | 后端能力 | Source |
+|--------|----------|--------|
+| `system/` | 时钟/复位/系统服务 | [system](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/system) |
+| `memory/` | 内存布局/段管理（DMA 区等） | [memory](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/memory) |
+| `flash/` | 内部 Flash 读写/擦除（参数分区载体） | [flash](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/flash) |
+| `serial/` | UART 驱动后端（SBUS/GPS/MAVLink 串口） | [serial](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/serial) |
+| `pwm/` | PWM 输出后端（与 Boards motor_pwm 协作） | [pwm](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/pwm) |
+| `can/` | CAN 后端（DroneCAN 总线） | [can](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/can) |
+| `interrupts/` | 中断管理 | [interrupts](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/interrupts) |
+| `HardwareServices.hpp` | 硬件服务聚合入口 | [HardwareServices.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/HardwareServices.hpp) |
+
+## 与 FreeRTOS 后端的边界
+
+```mermaid
+graph TB
+  API[platform/api 契约] --> FR[platform/freertos<br>调度/队列/uORB/事件]
+  API --> H7[platform/stm32h7<br>时钟/Flash/串口/PWM/CAN]
+  FR x--x H7
+  H7 --> HAL[Drivers/STM32H7xx HAL]
+  FR --> MW[FreeRTOS 内核]
+```
+<!-- Sources: AGENTS.md:52, Dima/platform/stm32h7/HardwareServices.hpp:1 -->
+
+两后端互不 include（fast 门禁检查项）；唯一把两者接到一起的是 `Boards/H743/Src/platform_composition.cpp` 组合根。
+
+## Flash 后端与参数分区
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant FS as FlashFS(middleware)
+  participant FB as stm32h7/flash 后端
+  participant HW as 内部 Flash 硬件
+  FS->>FB: 追加写/读回/擦除请求
+  FB->>HW: 扇区编程（只清位）
+  HW-->>FB: 校验
+  FB-->>FS: 结果（token 独占语义在 middleware 层）
+```
+<!-- Sources: Dima/platform/stm32h7/flash, Dima/middleware/parameters/flashfs.cpp:434 -->
+
+分层：**token/记录/擦除互斥语义在 middleware**，物理编程在后端——换 MCU 只换后端层。
+
+## 内存后端
+
+DMA 区域（`0x30040000, 32768 B`）由 memory 后端与 ELF 验证器共同把关：DMA 可达缓冲必须在专属段，放错即构建失败（[layout.py](https://github.com/a1600778959/H743_FreeRTOS/blob/main/tools/elf_support/layout.py)）。
+
+## 串口后端
+
+serial 后端实现 UART 收发与 DMA/中断；SBUS 的电气特例（100000 8E2 RX 反相）在驱动配置中固定，不经普通 BAUD 参数（[serial](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/platform/stm32h7/serial)，[SerialConfig.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/serial/SerialConfig.cpp)）。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [FreeRTOS 平台内幕](./freertos-internals.md) | 姊妹后端 |
+| [板级层](../12-startup-board/boards-h743.md) | 板级适配 |
+| [存储域](../06-middleware/storage-domains.md) | Flash 后端的最大用户 |
+</doc>
+
+<doc title="MAVLink 运行配置" path="15-mavlink-runtime\mavlink-runtime.md">
+# MAVLink 运行配置
+
+## 权威输入：mavlink_runtime.yaml
+
+模式编号的**唯一权威输入**是 [mavlink_runtime.yaml](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/mavlink_runtime.yaml)——PX4 v1.17.0 `px4_custom_mode.h` 的产品投影，收发端共同消费生成常量，编号只在此定义：
+
+| 模式 | main/sub | nav_state | 备注 |
+|------|----------|-----------|------|
+| Manual | 1/0 | `NAVIGATION_STATE_MANUAL` | 用户可选 |
+| Mission | 4/4 | `NAVIGATION_STATE_AUTO_MISSION` | MAV_STANDARD_MODE_MISSION |
+| Hold | 4/3 | `NAVIGATION_STATE_AUTO_LOITER` | `MAV_MODE_PROPERTY_NOT_USER_SELECTABLE`（内部态，不进模式菜单） |
+| Auto Calibration | 4/11 | `NAVIGATION_STATE_EXTERNAL1` | 值 23 槽位可选；仍要求 Disarmed |
+
+<!-- Sources: Dima/modules/mavlink/mavlink_runtime.yaml:1 -->
+
+## 双链路
+
+```mermaid
+flowchart TB
+  USB[USB CDC] --> SHARED[Console/MAVLink 共享链路<br>心跳/遥测/参数/日志]
+  UART[串口 MAVLink<br>SERIALx_FUNCTION] --> TELEMETRY[数传遥测]
+  BOTH[两端明确同波特率 8N1<br>Auto 可探测但首配用已知速率]
+  USB -.-> BOTH
+  UART -.-> BOTH
+```
+<!-- Sources: Dima/modules/mavlink/README.md, docs/H743_VEHICLE_COMMISSIONING_ZH.md#L115 -->
+
+`MAV_0_RATE` 是发送预算，不能把低速链路变高速链路；串口功能迁移会关闭旧 owner，改完统一保存/重启/回读。
+
+## 心跳与模式目录
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Q as QGC
+  participant E as MavlinkEndpoint
+  Q->>E: 连接
+  E-->>Q: 心跳 + Component Metadata（参数目录）
+  Q->>E: 请求模式列表
+  E-->>Q: runtime yaml 投影的模式目录
+  Note over Q: Unknown/混入外模式 → 断开重连等目录下载<br>名称未确认前不启动运动
+```
+<!-- Sources: docs/H743_VEHICLE_COMMISSIONING_ZH.md#L104, Dima/modules/mavlink/mavlink_runtime.yaml:1 -->
+
+Hold/Termination 是内部状态——不能照搬通用 PX4 飞行模式菜单操作。
+
+## 遥测流与裁剪
+
+| 项 | 合同 | Source |
+|----|------|--------|
+| 传感器流 | 13 路订阅 latest 值；无新代次保留最近值 | [MavlinkSensorStreams.cpp:481](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkSensorStreams.cpp#L481) |
+| GPS_RAW_INT 航向 | `rtk_heading_status` 新鲜快照；300ms 窗；NaN=本拍无新观测 | [MavlinkSensorStreams.cpp:481](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mavlink/MavlinkSensorStreams.cpp#L481) |
+| 方言 | 按实际能力裁剪生成，禁止全量 | [AGENTS.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/AGENTS.md#L63) |
+| 任务协议 | MavlinkMission + MissionCodec（64 项 NAV_WAYPOINT） | [MissionCodec.cpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/modules/mission/MissionCodec.cpp) |
+
+## 与 USB Console 的耦合
+
+日志下载的 32 帧批次、`kWriteInProgress` 在途语义、4096B 静态组包容量都建立在 Console 契约上——详见 [USB Console](../07-platform/usb-console.md) 与 [MAVLink 链路](../05-modules/mavlink.md)。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [MAVLink 链路](../05-modules/mavlink.md) | 端点与协议细节 |
+| [串口与 RC 模块](../13-drivers-peripherals/serial-rc.md) | 串口分配 |
+| [Mission 任务模块](../13-drivers-peripherals/mission.md) | 任务协议消费方 |
+</doc>
+
+<doc title="支撑库（lib/）" path="16-support-libs\support-libs.md">
+# 支撑库（lib/）
+
+`Dima/lib/` 全部为平台无关库——不依赖 FreeRTOS/HAL（依赖门禁强制），可独立测试。
+
+## 库清单
+
+| 库 | 用途 | 主要消费方 | Source |
+|----|------|------------|--------|
+| `mathlib` / `matrix` | 数学基础与矩阵运算 | EKF2、校准、控制 | [mathlib](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/mathlib) |
+| `geo` / `lat_lon_alt` | 大地坐标：displacement、圆均值地理计算 | 校准围栏、返场 | [geo](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/geo) |
+| `world_magnetic_model` | 世界地磁模型 | 磁校准参考 | [world_magnetic_model](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/world_magnetic_model) |
+| `timesync` | 时间同步 | 授时链 | [timesync](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/timesync) |
+| `hysteresis` | 迟滞状态机（顶部/底部事件） | 各类判定去抖 | [hysteresis](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/hysteresis) |
+| `containers` | 容器（环形队列等，无动态分配） | 全仓库 | [containers](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/containers) |
+| `format` | 格式化（Format.hpp，校准诊断三短行等） | 诊断、日志 | [format](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/format) |
+| `tinybson` | 小型 BSON 序列化 | 参数/存储 | [tinybson](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/tinybson) |
+| `serial` | 串口协议公共件 | 驱动层 | [serial](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/serial) |
+| `sensors` | 传感器公共算法 | 校准/传感器模块 | [sensors](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/sensors) |
+| `ekf2` | EKF2 数学件 | modules/ekf2 | [ekf2](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/ekf2) |
+| `dronecan` | DroneCAN 节点/DNA | 磁力计驱动 | [dronecan](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/dronecan) |
+| `rover` | 校准/控制领域算法（本 wiki 多页展开） | rover 域 | [rover](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/README.md) |
+
+## rover 子库（领域算法）
+
+```mermaid
+graph TB
+  subgraph lib/rover
+    MATH[CalibrationMath<br>圆均值/位移]
+    BRAKE[CalibrationBraking<br>停距/比例律]
+    ID[CalibrationIdentification<br>ARX-RLS + Skogestad PI]
+    RESP[CalibrationResponse<br>响应统计/平台/下界]
+    FENCE[CalibrationFence<br>圆围栏]
+    GUID[PurePursuit / SegmentGuidance]
+    CTRL[RoverControl<br>速度/偏航率 PI]
+    DD[DifferentialDrive<br>混控整形]
+  end
+```
+<!-- Sources: Dima/lib/rover/README.md:1 -->
+
+`rover/` 目录规则（AGENTS.md）：**只放纯算法**——任何硬件上下文/调度依赖都在 rover 模块层。
+
+## 使用纪律
+
+| 纪律 | 理由 | Source |
+|------|------|--------|
+| 新增数学优先复用本层 | 单位与判据全仓库一致（如圆均值浓度判据防野点） | [CalibrationMath.hpp](https://github.com/a1600778959/H743_FreeRTOS/blob/main/Dima/lib/rover/CalibrationMath.hpp) |
+| 容器禁止动态分配 | RAM 纪律（D2 82.6% 告警区） | [resource budget](../02-architecture/resource-budget.md) |
+| 上游导入记 Source Manifest | 版权头保留 + 来源记录 | [DIMA_SOURCE_MANIFEST.md](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DIMA_SOURCE_MANIFEST.md) |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [差速控制栈](../03-rover-domain/control-stack.md) | rover 子库详解 |
+| [辨识与 PI 公式](../04-auto-calibration/identification-pi.md) | Skogestad 来源 |
+| [FreeRTOS 平台内幕](../14-platform-internals/freertos-internals.md) | 上层运行环境 |
+</doc>
+
+<doc title="ADR 索引" path="17-docs-map\adr-index.md">
+# ADR 索引
+
+架构决策记录（ADR）记录"为什么这样设计"；全文在 [docs/adr/](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/adr/README.md)，新增决策用 template.md。
+
+| ADR | 决策 | 一句话理由 | 全文 |
+|-----|------|------------|------|
+| 0001 | 采用 FreeRTOS 构建 Dima Rover | 调度模型与生态成熟度（vs 裸机/其他 RTOS） | [0001](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/adr/0001-use-freertos-for-dima-rover.md) |
+| 0002 | 优先复用上游模块 + Dima 目录命名 | PX4 模块直接移植 + 命名空间 `dima`，不重写已有功能 | [0002](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/adr/0002-upstream-reuse-and-dima-directory-naming.md) |
+| 0003 | 采用 PX4 EKF2 单实例估计器 | 估计器不重造；输入打包在 Ekf2Inputs | [0003](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/adr/0003-use-ekf2-estimator.md) |
+| 0004 | 当前阶段传感器自动化参数边界 | 哪些自动化参数进入产品、哪些留给校准 | [0004](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/adr/0004-stage-sensor-automation.md) |
+| 0005 | 自动校准冻结包络 + 磁油门补偿只读参数化 | 包络=冻结 MOT_THR_MAX；磁补偿事务只读化 | [0005](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/adr/0005-auto-calibration-manual-parity-envelope.md) |
+| 0006 | DNA 分配表迁出参数 FlashFS，改存 SD 原子文件域 | 双 token 互锁整区擦除→满区永久不可回收；单主人化 | [0006](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/adr/0006-dna-allocation-storage-sd-domain.md) |
+
+```mermaid
+timeline
+  title ADR 演进主线
+  0001-0003 : 平台与估计器选型
+  0004-0005 : 校准自动化边界与包络
+  0006 : 存储域单主人化
+```
+<!-- Sources: docs/adr/README.md:1 -->
+
+## ADR 使用规则
+
+1. 影响"跨模块边界/数据所有权/外部协议"的变更**应先有 ADR**（0006 即 DNA 迁移的全过程记录）。
+2. ADR 状态字段标注实施/验收状态（如 0006 "源码实施；板端验收待执行"）。
+3. 旧 ADR 不修改结论——新决策新编号，冲突处以新为准。
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [权威文档导读](./docs-map.md) | 全部文档地图 |
+| [存储域](../06-middleware/storage-domains.md) | ADR 0006 的实现 |
+| [Capability 契约与组合根](../07-platform/platform.md) | 架构合同的执行面 |
+</doc>
+
+<doc title="权威文档导读" path="17-docs-map\docs-map.md">
+# 权威文档导读
+
+`docs/` 是方案与审计的沉淀地。**冲突规则**：当旧 README、方案文档与现实有差异时，先按目标固件版本核对权威输入与当前消费者，不把旧方案当作已实现行为（[部署指南 §15](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md#L402)）。
+
+## 方案与规格（设计时读）
+
+| 文档 | 内容 | 何时读 |
+|------|------|--------|
+| [AUTO_CALIBRATION_PLAN_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_PLAN_ZH.md) | 自动校准权威方案 | 改校准前 |
+| [AUTO_CALIBRATION_STATE_MACHINE_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_STATE_MACHINE_ZH.md) | 状态机细节（11 状态↔旧能力映射） | 改校准状态机前 |
+| [AUTO_CALIBRATION_OFFICIAL_TUNING_PLAN_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_OFFICIAL_TUNING_PLAN_ZH.md) | PX4 官方三项导航参数标定法（PP/jerk/RED） | 改导航实验前 |
+| [AUTO_CALIBRATION_FORMULA_REMOVAL_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/AUTO_CALIBRATION_FORMULA_REMOVAL_ZH.md) | 问题代码删减清单 + Skogestad PI 公式来源 | 动校准数学前（防回潮） |
+| [DIMA_ROVER_PORTING_PLAN_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DIMA_ROVER_PORTING_PLAN_ZH.md) | PX4→Dima 移植计划 | 追溯移植决策 |
+| [PX4_GENERATION_PIPELINE_REFACTOR_SPEC_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/PX4_GENERATION_PIPELINE_REFACTOR_SPEC_ZH.md) | 生成管线重构规格 | 动生成链前 |
+| [PX4_GPS_IMU_DIAGNOSTICS_SPEC_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/PX4_GPS_IMU_DIAGNOSTICS_SPEC_ZH.md) | GPS/IMU 诊断规格 | 动传感器诊断前 |
+
+## 审计与教训（防回潮读）
+
+| 文档 | 内容 |
+|------|------|
+| [MANUAL_DRIVE_DIRECTION_AUDIT_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/MANUAL_DRIVE_DIRECTION_AUDIT_ZH.md) | 手动方向语义审计（侧别/REV/四处分叉合并） |
+| [IMU_TELEMETRY_STALL_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/IMU_TELEMETRY_STALL_ZH.md) | IMU 遥测停摆事件复盘 |
+| [SD_LOG_SPACE_DIAGNOSIS_20260910_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/SD_LOG_SPACE_DIAGNOSIS_20260910_ZH.md) | SD 日志空间策略诊断 |
+| [SDMMC_IDMA_CPU_ACCEPTANCE_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/SDMMC_IDMA_CPU_ACCEPTANCE_ZH.md) | SDMMC IDMA 的 CPU 占用验收 |
+| [PARAMETER_SIMPLIFICATION_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/PARAMETER_SIMPLIFICATION_ZH.md) | 参数精简记录 |
+| [HEADER_IMPLEMENTATION_SPLIT_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/HEADER_IMPLEMENTATION_SPLIT_ZH.md) | 头/实现分离约定 |
+
+## 资源与基线（预算时读）
+
+| 文档 | 内容 |
+|------|------|
+| [DIMA_RESOURCE_BASELINE_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DIMA_RESOURCE_BASELINE_ZH.md) | 构建产物/镜像版本总览 |
+| [DIMA_PHASE3/4/5_RESOURCE_BASELINE_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DIMA_PHASE3_RESOURCE_BASELINE_ZH.md) | 各阶段 Flash/RAM 增量验收 |
+| [DTCM_MIGRATION_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DTCM_MIGRATION_ZH.md) | DTCM 迁移记录 |
+| [CODE_SIZE_REDUCTION / _FOUR_OPTIMIZATIONS / _NEXT_OPTIMIZATIONS](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/CODE_SIZE_REDUCTION_ZH.md) | Flash 瘦身三战役 |
+| [BUILD_SPEED_OPTIMIZATION_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/BUILD_SPEED_OPTIMIZATION_ZH.md) | 构建提速（进度计划化/ccache） |
+
+## 操作与恢复（现场读）
+
+| 文档 | 内容 |
+|------|------|
+| [H743_VEHICLE_COMMISSIONING_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/H743_VEHICLE_COMMISSIONING_ZH.md) | 上车部署与操作指南（wiki 11 分区的权威源） |
+| [MCUBOOT_USB_RECOVERY_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/MCUBOOT_USB_RECOVERY_ZH.md) | USB DFU 恢复手册 |
+| [MAVLINK_UART_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/MAVLINK_UART_ZH.md) | MAVLink 双链路说明 |
+| [DIMA_SOURCE_MANIFEST](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/DIMA_SOURCE_MANIFEST.md) | 上游来源/commit/许可证 |
+| [ARCHITECTURE_ZH](https://github.com/a1600778959/H743_FreeRTOS/blob/main/docs/ARCHITECTURE_ZH.md) | 架构与依赖规则（AGENTS.md 的展开） |
+| [adr/](./adr-index.md) | 6 篇架构决策记录（另有索引页） |
+
+## Related Pages
+
+| Page | Relationship |
+|------|-------------|
+| [快速参考](../01-getting-started/quick-reference.md) | 文档路由速查 |
+| [ADR 索引](./adr-index.md) | 决策记录 |
+| [首次运行总流程](../11-first-run/first-run-flow.md) | 操作类文档的使用场景 |
+</doc>
+

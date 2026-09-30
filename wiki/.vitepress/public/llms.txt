@@ -1,0 +1,69 @@
+# Dima H743 FreeRTOS Rover
+
+> STM32H743VIT6（Cortex-M7, 480 MHz）+ FreeRTOS 差速漫游车固件。PX4 v1.17.0 为代码基线，ArduPilot Rover 为行为参考。核心特色：capability 依赖倒置架构、事务化校准参数提交、机器强制的架构门禁。
+
+## Onboarding
+
+- [使用指南](./onboarding/index.md): 按角色选择导读路径
+- [贡献者指南](./onboarding/contributor-guide.md): 渐进式上手（技术栈基础 → 架构 → 合入）
+- [资深工程师指南](./onboarding/staff-engineer-guide.md): 核心架构洞察、设计权衡与决策日志
+- [管理层指南](./onboarding/executive-guide.md): 能力地图、风险评估与投资建议
+- [产品经理指南](./onboarding/product-manager-guide.md): 能力边界与 FAQ（零工程术语）
+
+## Getting Started
+
+- [项目总览](./01-getting-started/overview.md): 系统组成、数据流、技术血缘、资源水位
+- [构建与验证](./01-getting-started/build-and-verify.md): make 目标体系、双层 Make、构建性能特性
+- [快速参考](./01-getting-started/quick-reference.md): 命令/目录/文档路由/uORB Topic/排障速查
+
+## Architecture
+
+- [分层架构与依赖规则](./02-architecture/layered-architecture.md): 依赖方向硬合同、目录职责、组合根、门禁两档
+
+## Rover Domain
+
+- [差速控制栈](./03-rover-domain/control-stack.md): 控制管线、制动接管、公共算法、制动输入测量闭环
+
+## Auto Calibration
+
+- [自动校准状态机](./04-auto-calibration/state-machine.md): SessionController、事务机、组调度、两类门公理
+
+## Modules
+
+- [模块全景](./05-modules/modules.md): MotorOutput/Commander/MAVLink/日志/传感器各模块合同
+
+## Middleware
+
+- [参数 / uORB / 存储域](./06-middleware/middleware.md): FlashFS、SD 原子文件域、DNA 迁移（ADR 0006）
+- [QGC 兼容契约](./06-middleware/qgc-compat.md): 界面兼容参数 vs 真实能力
+- [事件系统与性能计数器](./06-middleware/events-perf.md): 事件 ID 全表与固定池 Perf
+
+## Platform
+
+- [Capability 契约与组合根](./07-platform/platform.md): ArmedFlash 协调器、配置租约、双后端边界
+
+## Drivers
+
+- [UM982 与 DroneCAN 链路](./08-drivers/drivers.md): GNSS 配对、偏置租约、DNA 分配、磁力计
+
+## Build & Release
+
+- [构建、签名与 OTA](./09-build-release/build-release.md): 发布产物链、Flash 布局、安全启动、mcumgr
+
+## Tooling
+
+- [架构门禁与验证工具](./10-tooling/tooling.md): fast/full 两档、三层验证哲学、生成链
+- [生成链与会话工具](./10-tooling/generator-chain.md): logger contract、构建会话、ccache 门控、ELF/上传工具
+
+## First Run
+
+- [首次运行总流程](./11-first-run/first-run-flow.md): 十阶段顺序、"必须设置"三分类、参数修改纪律
+- [参数基线与三类必设](./11-first-run/param-classes.md): 人工必配/校准产生/默认验证三分类与关键参数语义
+- [分阶段验收标准](./11-first-run/stage-standard.md): RC/架空/故障动作/RTK/Mission 前置各阶段通过判据
+- [自动校准现场指南](./11-first-run/autocal-field-guide.md): 场地、启动、观察、中止与成功判定
+- [现场速查与清单](./11-first-run/field-checklists.md): 现象速查表、出车收车清单、首车验收模板
+
+## Docs Map
+
+- [权威文档导读](./17-docs-map/docs-map.md): 27 篇方案/审计/基线/操作文档的分类地图
+- [ADR 索引](./17-docs-map/adr-index.md): 0001-0006 决策记录摘要
