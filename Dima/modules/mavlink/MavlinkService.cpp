@@ -64,7 +64,10 @@ MavlinkEndpoint::MavlinkEndpoint(
     dima::platform::LogFileStore &log_files) noexcept
     : channel_(channel), shared_(shared), transport_(transport), boot_control_(boot_control),
       mission_(mission_service, &MavlinkEndpoint::send_frame, this, channel),
-      log_handler_(log_files, shared.log_lease, &MavlinkEndpoint::send_log_batch, this, channel)
+      log_handler_(log_files, shared.log_lease, &MavlinkEndpoint::send_log_batch,
+                   channel == MAVLINK_COMM_0 ? &MavlinkEndpoint::confirm_log_batch
+                                             : nullptr,
+                   this, channel)
 {
     metadata_ftp_.init(kMetadataFiles, static_cast<std::uint8_t>(
         sizeof(kMetadataFiles) / sizeof(kMetadataFiles[0])));
@@ -245,7 +248,8 @@ void MavlinkEndpoint::Run()
     stream_configured_messages(now, stream_contract::TxStage::PostMetadata);
     flush_tx();
     tx_class_ = TxClass::Bulk;
-    if (background_space()) log_handler_.send(channel_ == MAVLINK_COMM_0 ? 16U : 1U);
+    if (background_space()) log_handler_.send(channel_ == MAVLINK_COMM_0
+        ? MavlinkLogHandler::kMaximumResponsesPerSend : 1U);
     if (background_space()) parameters_.send();
     // 一条诊断记录可能含多个片，给整条记录预留回复队列容量。
     if (tx_count_ == 0U && transport_.tx_free_bytes() != 0U) {
@@ -360,16 +364,43 @@ bool MavlinkEndpoint::send_frame(void *ctx, mavlink_message_t &msg) noexcept
     return ctx != nullptr && static_cast<MavlinkEndpoint *>(ctx)->send_message(msg);
 }
 
-bool MavlinkEndpoint::send_log_batch(void *ctx, const std::uint8_t *data, std::size_t length) noexcept
+MavlinkLogHandler::SendResult MavlinkEndpoint::send_log_batch(
+    void *ctx, const std::uint8_t *data, std::size_t length) noexcept
 {
+    if (ctx == nullptr) return MavlinkLogHandler::SendResult::Rejected;
+    auto &self = *static_cast<MavlinkEndpoint *>(ctx);
+    if (self.channel_ != MAVLINK_COMM_0) {
+        return self.enqueue_frame(data, length)
+                   ? MavlinkLogHandler::SendResult::Confirmed
+                   : MavlinkLogHandler::SendResult::Rejected;
+    }
+    // USB 仍保留整批日志聚合；它与其他写共享本轮 5 ms 总等待预算。
+    // 队列被遥测占用或预算耗尽时明确返回 Rejected：本批没有提交任何字节，
+    // 调用方必须保留分片重试，不能记为在途批次。
+    if (self.tx_count_ != 0U || self.usb_timeout_remaining() == 0U) {
+        return MavlinkLogHandler::SendResult::Rejected;
+    }
+    const int result = self.transport_.write(
+        data, length, self.usb_timeout_remaining());
+    if (result == static_cast<int>(length)) {
+        self.transaction_bytes_ += length;
+        return MavlinkLogHandler::SendResult::Confirmed;
+    }
+    /* Console 在本次 transmit 已接受、等待完成超时时明确返回 kWriteInProgress。
+     * 不再查询 tx_idle 推断批次归属：迟到 IRQ 会让已提交批次瞬间变为空闲，
+     * 而其他写入占用端点也不代表本批已提交；这两种误判分别导致重发和丢片。
+     * 已提交批次统一交给 confirmer 收尾，提交前超时保留原分片重试。 */
+    return result == dima::platform::Console::kWriteInProgress
+               ? MavlinkLogHandler::SendResult::InFlight
+               : MavlinkLogHandler::SendResult::Rejected;
+}
+
+bool MavlinkEndpoint::confirm_log_batch(void *ctx) noexcept
+{
+    // 非阻塞：tx_idle 内部吸收迟到完成；false 表示上一批仍在 USB 排空。
     if (ctx == nullptr) return false;
     auto &self = *static_cast<MavlinkEndpoint *>(ctx);
-    if (self.channel_ != MAVLINK_COMM_0) return self.enqueue_frame(data, length);
-    // USB 仍保留 16 帧完整日志聚合；它与其他写共享本轮 5 ms 总等待预算。
-    if (self.tx_count_ != 0U || self.usb_timeout_remaining() == 0U) { errno = EAGAIN; return false; }
-    const bool sent = self.transport_.write(data, length, self.usb_timeout_remaining()) == static_cast<int>(length);
-    if (sent) self.transaction_bytes_ += length;
-    return sent;
+    return self.transport_.tx_idle();
 }
 
 void MavlinkEndpoint::send_frame_void(void *ctx, mavlink_message_t &msg) noexcept

@@ -11,6 +11,8 @@ namespace dima::modules::mavlink {
 // write 成功表示完整字节已被传输层接收；tx_idle 仅表示可复用缓冲。
 // 完成代数与发送失败代数共同区分正常发送、在途等待和中止后的空闲。
 // UART 绝不等待线路发送，USB 保留原有受统一截止时间约束的 Console 写入。
+// USB 原样传递 Console::kWriteInProgress，表明本次已提交、尚未确认；
+// 调用者只把完整长度当作完成，不能依赖共享 errno 推断本次是否提交。
 class MavlinkTransport {
 public:
     virtual ~MavlinkTransport() = default;

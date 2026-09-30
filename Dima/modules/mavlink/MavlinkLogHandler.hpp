@@ -68,18 +68,33 @@ private:
  */
 class MavlinkLogHandler final : public px4::ScheduledWorkItem {
 public:
-    using SendCallback = bool (*)(void *context, const std::uint8_t *data,
-                                  std::size_t length) noexcept;
+    // 批量提交的三态结果：Confirmed=整批已完成物理发送，可立即消费；
+    // InFlight=字节已被端点接受、正在排空，完成由 ConfirmCallback 收尾；
+    // Rejected=本轮没有任何字节上线（发送队列被遥测占用/预算耗尽/断链），
+    // 分片必须原样保留重试——绝不能把 Rejected 当成在途批次消费。
+    enum class SendResult : std::uint8_t {
+        Confirmed,
+        InFlight,
+        Rejected,
+    };
+    using SendCallback = SendResult (*)(void *context, const std::uint8_t *data,
+                                        std::size_t length) noexcept;
+    // 非阻塞探测“上一次提交的批次是否已完成物理发送”；USB CDC 排空一批
+    // 往往超过调用方的毫秒级等待预算，send() 用它收尾上一批后才提交下一批。
+    using ConfirmCallback = bool (*)(void *context) noexcept;
 
     MavlinkLogHandler(dima::platform::LogFileStore &store, MavlinkLogLease &lease,
-                      SendCallback sender, void *sender_context, std::uint8_t channel = MAVLINK_COMM_0) noexcept;
+                      SendCallback sender, ConfirmCallback confirmer,
+                      void *sender_context, std::uint8_t channel = MAVLINK_COMM_0) noexcept;
 
     bool start() noexcept;
     void stop() noexcept;
     void reset_link() noexcept;
     bool handle_message(const mavlink_message_t &message) noexcept;
     bool request_storage_information(std::uint8_t storage_id) noexcept;
-    void send(std::size_t maximum_responses = 16U) noexcept;
+    // 单次 USB 写合并的最大 LOG_DATA 帧数 = 一个 QGC chunk（32 × 90 B）。
+    static constexpr std::size_t kMaximumResponsesPerSend = 32U;
+    void send(std::size_t maximum_responses = kMaximumResponsesPerSend) noexcept;
 
 protected:
     void Run() override;
@@ -88,6 +103,7 @@ private:
     std::uint8_t channel_{MAVLINK_COMM_0};
     MavlinkLogLease &lease_;
     std::uint64_t last_busy_warning_us_{0U};
+    std::uint64_t last_open_warning_us_{0U};
     enum class RequestType : std::uint8_t {
         List,
         Data,
@@ -140,6 +156,7 @@ private:
     bool work_pending() noexcept;
 
     void reset_worker_state() noexcept;
+    void warn_data_failed() noexcept;
     void set_worker_state(WorkerState state) noexcept;
     void process_request(const Request &request) noexcept;
     void process_list_preparation() noexcept;
@@ -152,19 +169,24 @@ private:
 
     static constexpr std::size_t kRequestQueueCapacity = 4U;
     static constexpr std::uint32_t kReaderIdleTimeoutUs = 5000000U;
-    // 双批预取吸收 storage/USB 调度相位差；每轮最多合并 16 帧，只等待一次
-    // USB 完成。100 Hz 下满 LOG_DATA 的载荷预算为 16 * 90 * 100 = 144000 B/s。
-    static constexpr std::size_t kMaximumResponsesPerSend = 16U;
+    /* Ring 深度与批大小一致即可——chunk 内 storage 一次 Run 就能读满，chunk
+     * 边界由 QGC 收齐后发下一请求驱动，更深的预取窗口没有生产者。 */
     static constexpr std::size_t kResponseQueueCapacity =
-        2U * kMaximumResponsesPerSend;
+        kMaximumResponsesPerSend;
 
     dima::platform::LogFileStore &store_;
     SendCallback sender_{nullptr};
+    ConfirmCallback confirmer_{nullptr};
     void *sender_context_{nullptr};
 
     Request request_queue_[kRequestQueueCapacity]{};
     Response response_queue_[kResponseQueueCapacity]{};
     std::uint8_t tx_batch_[dima::platform::Console::kWriteCapacity]{};
+    /* 上一批已提交但未在等待预算内确认的 sequences；仍在 Ring 中未弹出，
+     * 下一轮先经 confirmer 非阻塞确认后再消费。跨线程只经临界区访问。 */
+    std::uint32_t pending_sequences_[kMaximumResponsesPerSend]{};
+    std::size_t pending_count_{0U};
+    bool pending_confirm_{false};
     std::uint8_t request_head_{0U};
     std::uint8_t request_tail_{0U};
     std::uint8_t request_count_{0U};
@@ -187,6 +209,9 @@ private:
     std::uint32_t data_offset_{0U};
     std::uint32_t data_end_offset_{0U};
     std::uint64_t last_data_activity_us_{0U};
+    /* storage worker 独占：同 id 的连续 LOG_REQUEST_DATA 复用已打开 reader，
+     * 免去每 chunk 重读 logdata.bin 索引并重开 ULog 文件。 */
+    bool reader_open_{false};
     bool logs_listed_{false};
     bool storage_initialized_{false};
 };

@@ -16,6 +16,7 @@
 - `SCALED_IMU`：这是 PX4 注册的原始传感器 MAVLink 流，按 USB 默认 25 Hz 发布第 1 套 `vehicle_imu`、`vehicle_imu_status` 温度与最近一次合法 raw `sensor_mag`；accel、gyro、mag 分别转换为 mG、mrad/s、milliGauss，温度使用 cdegC。当前产品只有实例 0，不伪造 `SCALED_IMU2/3` 或 PX4 未注册的 `RAW_IMU`。
 - `MESSAGE_INTERVAL`：响应 PX4/QGC 的 `MAV_CMD_GET_MESSAGE_INTERVAL`，并与 `MAV_CMD_SET_MESSAGE_INTERVAL`、`MAV_CMD_REQUEST_MESSAGE` 共用同一固定流表；负间隔停流、零恢复固件默认频率、正值保留请求的微秒间隔。100 Hz worker 只形成实际调度上限，不改写协议保存或 GET 回报的请求值。
 - `GPS_RAW_INT`：5 Hz，包含原始 GPS fix、位置、速度、精度、卫星数和双天线 yaw；接收机在线但未定位时仍发送 `NO_FIX`，检测证据不依赖经纬度有效；数据真正超时后发送 `NO_GPS`。
+- `GPS_RAW_INT.yaw/hdg_acc` 使用同设备的 `rtk_heading_status` 新鲜快照，航向按 `array_heading_rad-configured_yaw_offset_rad` 编码；真实航向样本和发布时间均须在 300 ms 内，解算或基线失效即清零。`sensor_gps.heading` 的 NaN 表示本次位置发布没有新航向观测，不能用来决定低频遥测是否显示航向；其 EKF 一次性观测语义保持不变。RTK 速度重配不延长航向寿命，正北仍编码为 36000，0 保留为不可用。
 - `SYS_STATUS`：1 Hz，持久保留曾探测设备的 present/enabled 位，数据超时仅清 health 位。GPS health 还要求 EKF2 `estimator_gps_status.checks_passed`，但该位不反向遮蔽原始 `GPS_RAW_INT`。IMU 从健康转为异常时，由本非实时 owner 输出两路原始数据年龄、前端输出年龄及累计错误，恢复时报告一次，USB 重连重报尚未恢复的故障；不改变健康判断、发布门限或消息定义。
 - `ATTITUDE`：50 Hz，从 `vehicle_attitude` 按 PX4 Hamilton quaternion 转 roll/pitch/yaw；机体系角速度来自同一 EKF2 的 `vehicle_odometry`，过期时仅将 rate 置零。
 - `LOCAL_POSITION_NED`：30 Hz，直接映射 `vehicle_local_position` 的 NED position/velocity。
@@ -50,17 +51,19 @@
 - `MavlinkLogHandler` 对照 PX4 v1.17.0 同名实现处理 `LOG_REQUEST_LIST/DATA/END/ERASE`，并复用同一 storage worker/Ring 生成 `STORAGE_INFORMATION`；日志 ID 从 0 开始，`LOG_DATA` 长度直接由 mavgen 字段容量派生。
 - PX4 的文件扫描、稳定列表、按 offset 读取和整树擦除语义保留；平台适配只把 POSIX 调用换成 `LogFileStore`，实际 FatFs/SDMMC 工作固定在 `wq:storage`，通信队列仅消费固定 32 槽响应 Ring。预取每轮最多补 32 片，再让出 storage 队列。
 - 无卡或无文件按 `common.xml` 强制回一条 `id=0,num_logs=0`，使 QGC 结束 Refresh；板上无 RTC，`LOG_ENTRY.time_utc=0`，避免用 FatFs 固定日期伪装真实采集时间。
-- 日志列表、下载与擦除由来源链路独占；非 owner 收到限速 busy 文本且不能用 END/ERASE 取消 owner。请求区间读完后保留 5 s reader 空闲窗口供后续区间/补传；窗口结束由 storage worker 关闭，避免 QGC 正常下载未发送 END 时永久阻止旧日志回收。新的 DATA 请求继续按稳定列表打开文件；物理断开、END/ERASE、无效 ID/offset 则及时释放 reader。USB 响应已复制到固定 Ring，不引用 FatFs 文件缓冲。
+- 日志列表、下载与擦除由来源链路独占；非 owner 收到限速 busy 文本且不能用 END/ERASE 取消 owner。请求区间读完后保留 5 s reader 空闲窗口供后续区间/补传；窗口结束由 storage worker 关闭，避免 QGC 正常下载未发送 END 时永久阻止旧日志回收。新的 DATA 请求对相同 id 复用已打开 reader，id 变化才按稳定列表重新打开；物理断开、END/ERASE、无效 ID/offset 则及时释放 reader。USB 响应已复制到固定 Ring，不引用 FatFs 文件缓冲。
 
 ### USB 下载批量传输
 
-对照固定 PX4 v1.17.0 的 `mavlink_log_handler.cpp::state_sending_data()`：上游根据 `get_free_tx_buf()` 连续发送，达到缓冲或 burst 上限才让出。Dima 的 Console 是等待 CDC 完成的同步接口，因此将最多 16 个官方 codec 编码的完整帧合并为一次写入，以适配同一批量发送原则。协议仍为标准 `LOG_DATA`，没有私有大包、参数或消息定义变化。
+对照固定 PX4 v1.17.0 的 `mavlink_log_handler.cpp::state_sending_data()`：上游根据 `get_free_tx_buf()` 连续发送，达到缓冲或 burst 上限才让出。Dima 的 Console 是等待 CDC 完成的同步接口，因此将最多 32 个官方 codec 编码的完整帧（恰好一个 QGC chunk 请求的完整响应）合并为一次写入，以适配同一批量发送原则。协议仍为标准 `LOG_DATA`，没有私有大包、参数或消息定义变化。
 
-此前每 10 ms 最多发送 4 个 90-byte 分片，理想载荷上限为 `4 * 90 / 0.01 = 36000 B/s`；每帧单独等待 USB 完成，以及遥测和错过周期，会进一步降低吞吐，这与 QGC 约 27 KB/s 的现象相符。现在每轮上限为 16 片，理想载荷预算为 `144000 B/s`，它是软件调度预算，不是实测或保证速度。
+此前每 10 ms 最多发送 4 个 90-byte 分片，理想载荷上限为 `4 * 90 / 0.01 = 36000 B/s`；每帧单独等待 USB 完成，以及遥测和错过周期，会进一步降低吞吐，这与 QGC 约 27 KB/s 的现象相符。16 片批次把软件预算提高到 `144000 B/s`，但实测仍只有约 10 KB/s：一批 109-byte 帧的 CDC 排空时间经常超过共享的 5 ms 截止，“提交即超时”的批次既不能消费也不能立即重发，多数 10 ms 轮次在超时与吸收迟到完成之间空转，线路长时间空闲。当前实现为 32 片批次加待确认协议：提交失败但端点仍在排空时记为 pending，下一轮先经非阻塞 `tx_idle()` 确认上一批完成、按 sequence 消费后再衔接提交下一批，让线路尽量连续排空；软件预算为 `288000 B/s`，实际速度由主机对 CDC bulk IN 的轮询节奏决定。
 
-- Console 与日志组包共用 2048-byte 静态容量；普通 MAVLink v2 满 `LOG_DATA` 帧为 109 bytes，16 帧为 1744 bytes。组包空间检查使用生成库的 `MAVLINK_MAX_PACKET_LEN`，wire 长度和 CRC 全部由 mavgen 生成接口处理。
+- Console 与日志组包共用 4096-byte 静态容量；普通 MAVLink v2 满 `LOG_DATA` 帧为 109 bytes，32 帧为 3488 bytes。组包空间检查使用生成库的 `MAVLINK_MAX_PACKET_LEN`，wire 长度和 CRC 全部由 mavgen 生成接口处理。
 - 单次日志批量写与本轮其他 USB 写共用 5 ms 总截止，ACK/心跳/遥测仍先发送。发送缓冲属于对象，USB staging 在超时后继续保持，直到迟到完成或连接 epoch 失效，不能复用在途字节。
-- 只有整批完成才逐项按 sequence 消费响应；请求切换、END/ERASE、USB 断开仍使旧分片失效，并保留独立的 `STORAGE_INFORMATION` 回复。失败可能重发相同 offset，接收方仍按标准日志 offset 补洞/去重。
+- 整批按三态结果消费：`Confirmed` 立即按入队顺序、逐项匹配 sequence 弹出；`InFlight` 保留待确认序号，后续由 `tx_idle()` 确认缓冲释放再弹出；`Rejected` 保留分片重试。Console 仅在本次 `transmit` 已接受且等待完成超时时返回独立的 `Console::kWriteInProgress`，不通过共享 `errno` 传递提交状态；抢锁、等待上一笔或 Busy 超时仍返回 `ETIMEDOUT`。批次是否已提交必须取自本次写入结果，不能用超时后的 `tx_idle()` 推断：迟到 IRQ 会把已提交批次变为空闲，导致重复发送；其他写入占用端点也不能证明本批已提交。请求切换、END/ERASE、USB 断开仍使旧分片失效，并保留独立的 `STORAGE_INFORMATION` 回复。
+- QGC v5.0.8 参考源码的下载状态使用累计写入量，相同 offset 的重传仍累加 `written`，但文件通过 seek 覆盖原位置。因此状态栏超过 `LOG_ENTRY.size` 不能单独证明落盘文件变大；应同时核对实际文件长度、完整性与重复 offset。修正上述提交误判可消除由该路径制造的重复批次，正常链路补传仍可能使累计量超过文件大小。
+- 同 id 的连续 `LOG_REQUEST_DATA` 复用已打开 reader，不再每个 2880-byte chunk 重读 `logdata.bin` 索引并重开 ULog；读取失败或介质失效清除复用标记，后续请求回到完整 open 路径。
 - 当前物理控制器仍是 PA11/PA12 上的 OTG FS、12 Mbit/s、64-byte bulk endpoint；ST USB 栈自动切分整批数据并处理必要的 ZLP。FS HAL 会清除 `dma_enable`，此修复使用现有 FS 硬件能力。
 
 板端验收应使用同一个已关闭、足够大的日志比较下载速度与总耗时，并核对完整下载后的文件大小和 SHA-256；同时观察心跳/ACK、取消后重下、指定 offset 补传和拔插 USB 后重新下载。主机源码/构建检查无法替代这些 QGC/SD/USB 动态结果。
@@ -95,15 +98,4 @@ MavlinkBridge 的非模板 channel getter 由独立 C ABI 实现提供，Mavlink
 
 ## 传感器缓存所有权
 
-13 路传感器/估计器订阅使用普通 `uORB::Subscription`，直接通过已有 `copy()` 更新 `latest_*`，每路只保存一份消息载荷。没有新代次或读取失败时保留最近值；有队列的 Topic 仍按原 `orb_copy` 逐代消费，不切换成 latest 读取。Runtime start/stop 继续清缓存，USB 物理断开只重置发送节拍；代次检查和完整样本复制仍由 uORB 保护。RC、参数更新和模式订阅维持各自原有缓存合同。
-
-## Manual 电机诊断
-
-`MavlinkDriveDiagnostics.cpp` 在低优先级通信队列每秒读取最新既有 uORB 快照，仅 Manual Armed 时发布四条同 n 的 RAW STATUSTEXT。`mavlink_log.text` 的真实容量为 127 B（含 NUL），此前长行会在进入 MAVLink 分片前被截断；现在拆分短记录，不扩大消息，也不改变实时控制路径。
-
-- `[drive in]`：RC 校准后的 T/Y、差速器 req、输入/控制有效位 v 和软件杆位 dir。F/FR/R/BR/B/BL/L/FL/N 分别表示前/右前/右/右后/后/左后/左/左前/中立；NA 表示未知。dir 只由输入计算，不表示实测车体运动。
-- `[drive out]`：实际 actuator_motors 的 cmdR/L、后端确认的 ackR/L 和 S1..S6 左右映射掩码。
-- `[drive pwm]`：六路命令脉宽、输出状态、mix/slew/hold/ramp 四项限制和已应用参数代次 cfg。
-- `[drive src]`：由运行期 RC 功能映射选择的两个原始通道值（SBUS 标准换算后的 us）、raw_match、RC/控制/输出时龄 ages、同 RC 样本证据 same 及估计器状态 est。
-
-`raw_match=1` 表示原始通道值与规范化输入对应同一 RC 样本；`same=1` 只证明输入、控制命令和后端输出引用同一新鲜 RC 样本，不能代替逐控制周期或引脚波形证明。Manual 无定位仍显示真实电机命令，未知时间使用 UINT32_MAX。记录不改变参数/输出，双链路共享一次发布；应使用同 n 的四条记录分析，不能拼接不同 n 的结果。
+传感器/估计器订阅使用普通 `uORB::Subscription`，直接通过已有 `copy()` 更新 `latest_*`，每路只保存一份消息载荷。没有新代次或读取失败时保留最近值；有队列的 Topic 仍按原 `orb_copy` 逐代消费。双天线航向每轮最多消费四份快照，及时覆盖晚到速度重配及无解状态。Runtime start/stop 继续清缓存，USB 物理断开只重置发送节拍；代次检查和完整样本复制仍由 uORB 保护。RC、参数更新和模式订阅维持各自原有缓存合同。

@@ -100,9 +100,10 @@ void MavlinkLogLease::release(std::uint8_t channel) noexcept
 
 MavlinkLogHandler::MavlinkLogHandler(
     dima::platform::LogFileStore &store, MavlinkLogLease &lease, SendCallback sender,
-    void *sender_context, std::uint8_t channel) noexcept
+    ConfirmCallback confirmer, void *sender_context, std::uint8_t channel) noexcept
     : ScheduledWorkItem("mav_log", px4::wq_configurations::storage),
-      channel_(channel), lease_(lease), store_(store), sender_(sender), sender_context_(sender_context)
+      channel_(channel), lease_(lease), store_(store), sender_(sender),
+      confirmer_(confirmer), sender_context_(sender_context)
 {
 }
 
@@ -120,6 +121,8 @@ bool MavlinkLogHandler::start() noexcept
         request_head_ = request_tail_ = request_count_ = 0U;
         response_head_ = response_tail_ = response_count_ = 0U;
         next_response_sequence_ = 0U;
+        pending_confirm_ = false;
+        pending_count_ = 0U;
         reset_requested_ = false;
         release_on_reset_ = false;
         stop_requested_ = false;
@@ -182,6 +185,8 @@ void MavlinkLogHandler::reset_link() noexcept
         dima::platform::CriticalGuard guard;
         request_head_ = request_tail_ = request_count_ = 0U;
         response_head_ = response_tail_ = response_count_ = 0U;
+        pending_confirm_ = false;
+        pending_count_ = 0U;
         reset_requested_ = true;
         release_on_reset_ = true;
     }
@@ -416,6 +421,10 @@ void MavlinkLogHandler::clear_log_responses_locked() noexcept
     if (response_count_ == 0U) {
         response_head_ = response_tail_ = 0U;
     }
+    /* Ring 被清空后，待确认批次的 sequences 已无对应分片；stale pop 按
+     * sequence 匹配本身是 no-op，这里同步撤销标志避免多余确认轮次。 */
+    pending_confirm_ = false;
+    pending_count_ = 0U;
 }
 
 bool MavlinkLogHandler::response_space_available() noexcept
@@ -451,6 +460,7 @@ void MavlinkLogHandler::reset_worker_state() noexcept
     data_offset_ = 0U;
     data_end_offset_ = 0U;
     last_data_activity_us_ = 0U;
+    reader_open_ = false;
     logs_listed_ = false;
     storage_initialized_ = false;
 }
@@ -481,6 +491,7 @@ void MavlinkLogHandler::process_request(const Request &request) noexcept
     case RequestType::End:
         clear_responses();
         store_.close_log_transfer();
+        reader_open_ = false;
         set_worker_state(WorkerState::Idle);
         current_log_id_ = 0xffffU;
         logs_listed_ = false;
@@ -502,6 +513,7 @@ void MavlinkLogHandler::process_request(const Request &request) noexcept
     case RequestType::List: {
         clear_responses();
         store_.close_log_transfer();
+        reader_open_ = false;
         current_log_id_ = 0xffffU;
         number_of_logs_ = 0U;
         list_first_id_ = request.first_id;
@@ -515,19 +527,42 @@ void MavlinkLogHandler::process_request(const Request &request) noexcept
 
     case RequestType::Data: {
         clear_responses();
-        if (!logs_listed_ || request.id >= number_of_logs_) {
-            store_.close_log_transfer();
-            current_log_id_ = 0xffffU;
-            set_worker_state(WorkerState::Idle);
-            return;
+        // LOG_REQUEST_DATA 是独立请求，不依赖先前的 LIST：空闲回收会在
+        // 5 秒后清掉列表状态，人手从刷新列表到点下载几乎必然跨过该窗口，
+        // 此前请求在这里被静默丢弃，表现为 QGC 端 0 B/s 卡死。直接按 id
+        // 打开，失败经限频 STATUSTEXT 报告。
+        if (!storage_initialized_) {
+            if (store_.initialize() != 0) {
+                store_.close_log_transfer();
+                reader_open_ = false;
+                set_worker_state(WorkerState::Idle);
+                current_log_id_ = 0xffffU;
+                warn_data_failed();
+                return;
+            }
+            storage_initialized_ = true;
         }
         dima::platform::LogFileEntry entry{};
-        const int opened = store_.open_log(request.id, entry);
+        int opened = 0;
+        if (reader_open_ && current_log_id_ == request.id) {
+            /* QGC 按 chunk 顺序请求同一文件：复用已打开 reader，免去每个
+             * 2880 B chunk 重读 logdata.bin 索引并重开 ULog 的 4-6 次 SDMMC
+             * 事务。介质失效由下方读取失败清除标记后走完整重开。 */
+            entry.size_bytes = current_log_size_;
+        } else {
+            opened = store_.open_log(request.id, entry);
+            reader_open_ = opened == 0;
+        }
         if (opened != 0 || request.offset >= entry.size_bytes) {
             // open 成功但 offset 越界也必须关闭，否则没有有效 ID 可供空闲回收。
             store_.close_log_transfer();
+            reader_open_ = false;
             set_worker_state(WorkerState::Idle);
             current_log_id_ = 0xffffU;
+            // 越界属于正常 burst 收尾，不报。
+            if (opened != 0) {
+                warn_data_failed();
+            }
             return;
         }
         current_log_id_ = request.id;
@@ -717,6 +752,9 @@ void MavlinkLogHandler::process_data() noexcept
         if (store_.read_log(data_offset_, response.data.data,
                             requested, read_size) != 0 ||
             read_size == 0U || read_size > UINT8_MAX) {
+            /* 介质视图可能已撤销（后端 invalidate 会关闭 reader）；清除复用
+             * 标记，让 QGC 的重试请求走完整 open 而不是继续撞已失效句柄。 */
+            reader_open_ = false;
             set_worker_state(WorkerState::Idle);
             return;
         }
@@ -728,6 +766,29 @@ void MavlinkLogHandler::process_data() noexcept
         last_data_activity_us_ = hrt_absolute_time();
         lease_.touch(channel_, last_data_activity_us_);
     }
+}
+
+void MavlinkLogHandler::warn_data_failed() noexcept
+{
+    // LOG 协议没有 NACK：限频向请求链路报告数据打开失败，不让 QGC
+    // 停留在无提示的 0 B/s 下载状态。
+    const std::uint64_t now_us = hrt_absolute_time();
+    if (last_open_warning_us_ != 0U &&
+        now_us - last_open_warning_us_ < 1000000U) {
+        return;
+    }
+    last_open_warning_us_ = now_us;
+    mavlink_statustext_t text{};
+    text.severity = MAV_SEVERITY_WARNING;
+    constexpr char open_failed[] = "Log download failed";
+    std::memcpy(text.text, open_failed, sizeof(open_failed));
+    mavlink_message_t notice{};
+    mavlink_msg_statustext_encode_chan(
+        MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, channel_, &notice, &text);
+    std::uint8_t notice_frame[MAVLINK_MAX_PACKET_LEN]{};
+    const auto notice_size =
+        mavlink_msg_to_send_buffer(notice_frame, &notice);
+    (void)sender_(sender_context_, notice_frame, notice_size);
 }
 
 void MavlinkLogHandler::release_idle_reader() noexcept
@@ -811,6 +872,42 @@ void MavlinkLogHandler::send(std::size_t maximum_responses) noexcept
     std::size_t response_count = 0U;
     std::size_t batch_size = 0U;
     bool log_progress = false;
+
+    /* 上一批可能已提交进 USB 排空但未在毫秒级等待预算内确认。先经 confirmer
+     * 非阻塞收尾：完成后弹出其 sequences 并在本轮继续提交下一批；未完成则
+     * 本轮不再提交，让线路继续排空。否则“提交即超时”的批次会在后续轮次被
+     * 反复重发/长期滞留，实测把 USB 下载压到 ~10 KB/s。 */
+    bool pending_active = false;
+    {
+        dima::platform::CriticalGuard guard;
+        pending_active = pending_confirm_;
+    }
+    if (pending_active) {
+        if (confirmer_ == nullptr || !confirmer_(sender_context_)) {
+            if (work_pending()) {
+                (void)ScheduleNow();
+            }
+            return;
+        }
+        /* 必须按入队正序（队头最先）逐个弹出：pop_response 只接受与 Ring
+         * 队头匹配的 sequence。此前的倒序实现每轮只弹出 1/32 帧，其余
+         * 已发送分片滞留 Ring 并被当作下一批重复上线，表现为 QGC 下载量
+         * 超过文件大小且永不完成（2.8 MB 日志收了 4 MB）。 */
+        for (std::size_t index = 0U;; ++index) {
+            std::uint32_t sequence = 0U;
+            {
+                dima::platform::CriticalGuard guard;
+                if (index >= pending_count_) {
+                    pending_confirm_ = false;
+                    pending_count_ = 0U;
+                    break;
+                }
+                sequence = pending_sequences_[index];
+            }
+            pop_response(sequence);
+        }
+    }
+
     // PX4 按 TX 可用空间连续发 LOG_DATA；本地 Console 是有完成确认的同步接口，
     // 因此先用官方 codec 合并完整帧，再一次提交。预留生成库的最大帧空间，
     // 不手写 payload/CRC/消息列表，也不在 lp_default 的任务栈上放大块缓冲。
@@ -840,13 +937,30 @@ void MavlinkLogHandler::send(std::size_t maximum_responses) noexcept
         sequences[response_count++] = response.sequence;
     }
 
-    // 整批 USB 完成才消费响应；超时/断线保留分片供协议重试，Console staging
-    // 继续保护尚在传输的字节。逐项核对 sequence，禁止误弹 storage 新事务的响应。
-    if (batch_size != 0U && sender_(sender_context_, tx_batch_, batch_size)) {
-        if (log_progress) lease_.touch(channel_, hrt_absolute_time());
-        for (std::size_t index = 0U; index < response_count; ++index) {
-            pop_response(sequences[index]);
+    if (batch_size != 0U) {
+        const SendResult result =
+            sender_(sender_context_, tx_batch_, batch_size);
+        if (result == SendResult::Confirmed) {
+            if (log_progress) lease_.touch(channel_, hrt_absolute_time());
+            for (std::size_t index = 0U; index < response_count; ++index) {
+                pop_response(sequences[index]);
+            }
+        } else if (result == SendResult::InFlight) {
+            /* 本批已被端点接受、完成尚未确认：记为待确认，由后续轮次的
+             * confirmer 收尾后消费；批次归属由本次 write 的返回结果保证。 */
+            dima::platform::CriticalGuard guard;
+            if (!reset_requested_ && response_count_ != 0U) {
+                pending_confirm_ = true;
+                pending_count_ = response_count;
+                for (std::size_t index = 0U; index < response_count; ++index) {
+                    pending_sequences_[index] = sequences[index];
+                }
+            }
         }
+        // Rejected：本轮无任何字节上线（队列占用/预算耗尽/断链），分片原样
+        // 保留，下一轮重新组批重试。历史上曾用“tx_idle 为假”把这种轮次
+        // 误判为在途批次，导致主机轮询退避后每 chunk 丢 2880 B 分片、QGC
+        // 陷入重传停顿，下载速率从 ~100 KB/s 塌缩到 ~35 KB/s。
     }
 
     // TX Ring 腾出空间后唤醒 storage worker，继续按 PX4 burst 语义预取下一批。

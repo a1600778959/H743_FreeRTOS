@@ -155,6 +155,7 @@ void MavlinkEndpoint::reset_sensor_streams() noexcept
     latest_vehicle_imu_status_ = vehicle_imu_status_s{};
     latest_vehicle_magnetometer_ = vehicle_magnetometer_s{};
     latest_vehicle_gps_ = sensor_gps_s{};
+    latest_rtk_heading_ = rtk_heading_status_s{};
     latest_estimator_gps_status_ = estimator_gps_status_s{};
     latest_vehicle_attitude_ = vehicle_attitude_s{};
     latest_vehicle_local_position_ = vehicle_local_position_s{};
@@ -196,6 +197,9 @@ void MavlinkEndpoint::update_sensor_topics() noexcept
     (void)vehicle_imu_status_subscription_.copy(&latest_vehicle_imu_status_);
     (void)vehicle_magnetometer_subscription_.copy(&latest_vehicle_magnetometer_);
     (void)vehicle_gps_subscription_.copy(&latest_vehicle_gps_);
+    // 航向/速度重配可能短时连发；固定最多四次读取取得最近快照，使新收到的
+    // 无解状态尽快撤销遥测航向，不继续显示队列中较早的有效值。
+    for (unsigned count = 0U; count < 4U && rtk_heading_subscription_.copy(&latest_rtk_heading_); ++count) {}
     (void)estimator_gps_status_subscription_.copy(&latest_estimator_gps_status_);
     (void)vehicle_attitude_subscription_.copy(&latest_vehicle_attitude_);
     (void)vehicle_local_position_subscription_.copy(&latest_vehicle_local_position_);
@@ -478,6 +482,17 @@ bool MavlinkEndpoint::send_gps_raw_int(std::uint64_t now) noexcept
 {
     if (!gps_seen_) return false;
     const auto &gps = latest_vehicle_gps_;
+    const auto &heading = latest_rtk_heading_;
+    // sensor_gps.heading 是 EKF 的一次性新观测标记，后续 GGA 可合法带 NaN；
+    // 5 Hz 遥测不能把这个标记当作持续航向快照。复用原始双天线 Topic，
+    // body_yaw=array_heading-configured_offset，只扣一次安装偏置。
+    // 独立限制真实航向样本年龄为 300 ms；速度重配的发布时间不能续期。
+    // 同设备、解算和基线任一失效立即回到 yaw=0，不缓存最后有效数值冒充当前值。
+    const bool heading_valid = gps_streamable_ && heading.device_id == gps.device_id &&
+        fresh(now, heading.timestamp, 300000ULL) && fresh(now, heading.timestamp_sample, 300000ULL) &&
+        heading.timestamp_sample <= heading.timestamp && heading.solution_computed && heading.baseline_consistent &&
+        std::isfinite(heading.array_heading_rad) && std::isfinite(heading.configured_yaw_offset_rad) &&
+        std::isfinite(heading.heading_accuracy_rad) && heading.heading_accuracy_rad > 0.0F;
     mavlink_gps_raw_int_t raw{};
     raw.time_usec = gps_streamable_
         ? (gps.time_utc_usec != 0U ? gps.time_utc_usec
@@ -505,12 +520,13 @@ bool MavlinkEndpoint::send_gps_raw_int(std::uint64_t now) noexcept
         static_cast<double>(gps.epv) * 1000.0) : 0U;
     raw.vel_acc = gps_streamable_ ? saturating_u32(
         static_cast<double>(gps.s_variance_m_s) * 1000.0) : 0U;
-    raw.hdg_acc = gps_streamable_ && std::isfinite(gps.heading_accuracy)
-        ? saturating_u32(static_cast<double>(gps.heading_accuracy) *
+    raw.hdg_acc = heading_valid
+        ? saturating_u32(static_cast<double>(heading.heading_accuracy_rad) *
                          (180.0 / 3.1415926535897932384626433832795) *
                          100000.0)
         : 0U;
-    raw.yaw = gps_streamable_ ? heading_cdeg(gps.heading) : 0U;
+    raw.yaw = heading_valid
+        ? heading_cdeg(heading.array_heading_rad - heading.configured_yaw_offset_rad) : 0U;
 
     mavlink_message_t message{};
     mavlink_msg_gps_raw_int_encode_chan(MAVLINK_SYSTEM_ID, MAVLINK_COMPONENT_ID, channel_,

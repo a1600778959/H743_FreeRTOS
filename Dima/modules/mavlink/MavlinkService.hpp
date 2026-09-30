@@ -18,6 +18,7 @@
 #include "vehicle_command.hpp"
 #include "vehicle_command_ack.hpp"
 #include "sensor_gps.hpp"
+#include "rtk_heading_status.hpp"
 #include "vehicle_imu.hpp"
 #include "vehicle_imu_status.hpp"
 #include "vehicle_attitude.hpp"
@@ -86,8 +87,11 @@ private:
 
     // 协议处理器只通过这些 trampoline 回到唯一链路所有者，不能直接操作 USB。
     static bool send_frame(void *ctx, mavlink_message_t &msg) noexcept;
-    static bool send_log_batch(void *ctx, const std::uint8_t *data,
-                               std::size_t length) noexcept;
+    static MavlinkLogHandler::SendResult send_log_batch(
+        void *ctx, const std::uint8_t *data, std::size_t length) noexcept;
+    // 日志批次的非阻塞完成探测：USB CDC 排空常超过单轮等待预算，LogHandler
+    // 先经它收尾上一批再提交下一批（仅 USB 链路接线，UART 传 nullptr）。
+    static bool confirm_log_batch(void *ctx) noexcept;
     static void send_frame_void(void *ctx, mavlink_message_t &msg) noexcept;
     static std::uint8_t request_message(void *ctx,
                                         std::uint16_t message_id,
@@ -211,6 +215,8 @@ private:
     uORB::Subscription
         vehicle_gps_subscription_{ORB_ID(vehicle_gps_position)};
     uORB::Subscription
+        rtk_heading_subscription_{ORB_ID(rtk_heading_status)};
+    uORB::Subscription
         estimator_gps_status_subscription_{ORB_ID(estimator_gps_status)};
     uORB::Subscription
         vehicle_attitude_subscription_{ORB_ID(vehicle_attitude)};
@@ -272,6 +278,7 @@ private:
     vehicle_imu_status_s latest_vehicle_imu_status_{};
     vehicle_magnetometer_s latest_vehicle_magnetometer_{};
     sensor_gps_s latest_vehicle_gps_{};
+    rtk_heading_status_s latest_rtk_heading_{};
     estimator_gps_status_s latest_estimator_gps_status_{};
     vehicle_attitude_s latest_vehicle_attitude_{};
     vehicle_local_position_s latest_vehicle_local_position_{};
@@ -328,9 +335,6 @@ private:
     static bool deliver_ack(void *, std::uint8_t, std::uint32_t,
                             const vehicle_command_ack_s &) noexcept;
     void service_uart_scan(std::uint64_t now) noexcept;
-    void report_drive_diagnostics() noexcept;
-    std::uint64_t last_drive_diagnostic_us_{0U};
-    std::uint32_t drive_diagnostic_sequence_{0U};
     MavlinkSharedState shared_{};
     UsbMavlinkTransport usb_transport_;
     SerialMavlinkTransport uart_transport_;
