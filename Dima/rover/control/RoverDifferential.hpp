@@ -6,6 +6,7 @@
 
 #include "actuator_armed.hpp"
 #include "actuator_motors.hpp"
+#include "actuator_output_status.hpp"
 #include "auto_calibration_status.hpp"
 #include "rtk_heading_status.hpp"
 #include "rover_control_status.hpp"
@@ -43,7 +44,9 @@ public:
     bool calibration_gains_applied(std::uint32_t instance,
                                    const float (&gains)[4]) const noexcept;
     bool calibration_control_ready(std::uint32_t instance) const noexcept;
-    bool calibration_generation_applied(std::uint32_t instance) const noexcept;
+    bool calibration_yaw_control_ready(float minimum_target_rate) const noexcept;
+    bool calibration_deceleration_applied(std::uint32_t instance, float deceleration) const noexcept;
+    bool calibration_braking_model_applied(std::uint32_t session, std::uint8_t generation, float deceleration) const noexcept;
 
 private:
     static constexpr std::uint32_t kRunIntervalUs = 10000U;
@@ -54,7 +57,7 @@ private:
     struct ParameterSnapshot {
         float command_timeout_s;
         float calibration_radius_m;
-        float calibration_stop_distance_m;
+        float calibration_straight_distance_m;
         float calibration_entry_cruise;
         dima::lib::rover::DifferentialDriveConfig drive;
         dima::lib::rover::SpeedControlConfig speed;
@@ -106,14 +109,17 @@ private:
                        std::uint64_t now_us,
                        bool navigation_source) const noexcept;
     bool navigation_estimator_valid(std::uint64_t now_us) const noexcept;
-    bool calibration_input_valid(std::uint64_t now_us) const noexcept;
     float calibration_motor_limit() const noexcept;
     void refresh_calibration_fence(std::uint64_t now_us) noexcept;
     bool calibration_fence_status_unchanged() const noexcept;
-    bool calibration_fence_allows_output(std::uint64_t now_us) const noexcept;
+    bool calibration_braking_command(float &longitudinal, float &steering, std::uint64_t now_us, float dt_s) noexcept;
+    bool execute_heading_target(const rover_motion_request_s &request, std::uint64_t now_us,
+                                ControlCycleFeedback &feedback) noexcept;
     bool control_measurement(std::uint64_t now_us, float &speed_m_s,
                              float &yaw_rate_rad_s,
                              std::uint64_t &timestamp_sample) const noexcept;
+    bool yaw_rate_measurement(std::uint64_t now_us, float &yaw_rate_rad_s,
+                              std::uint64_t &timestamp_sample) const noexcept;
     bool publish_control_status(std::uint64_t now_us,
                                 const rover_motion_request_s *request,
                                 const ControlCycleFeedback &feedback) noexcept;
@@ -155,18 +161,16 @@ private:
         vehicle_local_position_subscription_{ORB_ID(vehicle_local_position)};
     uORB::SubscriptionData<vehicle_odometry_s>
         vehicle_odometry_subscription_{ORB_ID(vehicle_odometry)};
-    uORB::SubscriptionData<sensor_gps_s> sensor_gps_subscription_{
-        ORB_ID(sensor_gps)};
     uORB::Publication<actuator_motors_s> actuator_motors_publication_{
         ORB_ID(actuator_motors)};
     uORB::Publication<rover_control_status_s> control_status_publication_{
         ORB_ID(rover_control_status)};
     uORB::SubscriptionData<auto_calibration_status_s> calibration_sub_{ORB_ID(auto_calibration_status)};
     uORB::SubscriptionData<rtk_heading_status_s> calibration_rtk_sub_{ORB_ID(rtk_heading_status)};
-    uORB::SubscriptionData<vehicle_imu_s> calibration_imu_sub_{ORB_ID(vehicle_imu)};
+    uORB::SubscriptionData<vehicle_imu_s> heading_imu_sub_{ORB_ID(vehicle_imu)};
+    uORB::SubscriptionData<actuator_output_status_s> heading_output_sub_{ORB_ID(actuator_output_status)};
 
     dima::ParamFloat<dima::params::RO_CMD_TIMEOUT> command_timeout_{};
-    dima::ParamInt<dima::params::RD_REV_STEER> reverse_steering_{};
     dima::ParamFloat<dima::params::RD_STR_THR_MIX> steering_throttle_mix_{};
     dima::ParamFloat<dima::params::MOT_THR_MIN> throttle_min_{};
     dima::ParamFloat<dima::params::MOT_THR_MAX> throttle_max_{};
@@ -177,7 +181,7 @@ private:
     dima::ParamFloat<dima::params::MOT_ARM_RAMP> arm_ramp_{};
     dima::ParamFloat<dima::params::RO_MAX_THR_SPEED> maximum_speed_{};
     dima::ParamFloat<dima::params::RO_CAL_RADIUS> calibration_radius_{};
-    dima::ParamFloat<dima::params::RO_CAL_STOP_D> calibration_stop_distance_{};
+    dima::ParamFloat<dima::params::RO_CAL_DIST> calibration_straight_distance_{};
     dima::ParamFloat<dima::params::RO_SPEED_LIM> calibration_cruise_{};
     dima::ParamFloat<dima::params::RO_SPEED_P> speed_p_{};
     dima::ParamFloat<dima::params::RO_SPEED_I> speed_i_{};
@@ -207,7 +211,6 @@ private:
     float calibration_left_{0.0F};
     vehicle_local_position_s vehicle_local_position_{};
     vehicle_odometry_s vehicle_odometry_{};
-    sensor_gps_s sensor_gps_{};
     actuator_armed_s observed_actuator_armed_{};
     vehicle_control_mode_s observed_control_mode_{};
     vehicle_status_s observed_vehicle_status_{};
@@ -223,10 +226,30 @@ private:
     std::uint8_t local_heading_reset_counter_{0U};
     std::uint8_t odometry_reset_counter_{0U};
     dima::lib::rover::calibration::CircleFence calibration_fence_{};
+    float calibration_straight_length_m_{};
+    float calibration_braking_deceleration_{};
+    float calibration_brake_input_gain_{}, calibration_brake_input_{};
+    float calibration_brake_initial_speed_{}, calibration_speed_recovery_input_{-1.0F};
+    std::uint8_t calibration_probe_run_{255U}, calibration_braking_generation_{};
+    float calibration_brake_north_{}, calibration_brake_east_{};
+    // 仅记录真实正向输出期间的速度方向；暂时零输出不能丢失制动方向。
+    std::uint64_t calibration_brake_direction_at_{};
+    bool calibration_brake_active_{}, calibration_brake_released_{};
+    bool calibration_active_phase_seen_{};
+    bool calibration_speed_limit_active_{};
     std::uint64_t calibration_fence_center_timestamp_{0U};
     std::uint32_t calibration_fence_session_id_{0U};
     std::uint32_t calibration_fence_device_id_{0U};
     float calibration_session_motor_limit_{};
+    // 航向机动状态只属于执行层；模式仅持有目标与标识，不维护转速/轮端输入。
+    struct HeadingManeuver {
+        std::uint64_t request_timestamp{}, last_heading_epoch{}, opposed_since{}, stop_requested_at{};
+        std::uint32_t session{};
+        float target{}, remaining{}, last_heading{}, opposed_heading{};
+        std::int8_t initial_direction{};
+        std::uint8_t result{};
+        bool started{}, stopping{};
+    } heading_maneuver_{};
     float calibration_entry_cruise_{};
     dima::middleware::lifecycle::ModuleState state_{
         dima::middleware::lifecycle::ModuleState::Stopped};
@@ -237,6 +260,7 @@ private:
     bool have_estimator_baseline_{false};
     bool parameters_valid_{false};
     bool navigation_parameters_valid_{false};
+    bool yaw_rate_parameters_valid_{false};
     bool parameter_update_pending_{false};
     bool safety_inhibit_observed_{true};
     bool calibration_fence_latched_{false};
