@@ -4,6 +4,7 @@
 
 #include "parameters/FileStorage.hpp"
 #include "api/Time.hpp"
+#include "logging/logging.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -37,13 +38,14 @@ int ParameterService::encode_snapshot(
         generation, snapshot_size);
 }
 
-// 参数保存与 Arm 原子互斥，但不再申请逐阶段的 BootHealth/喂狗维护票据。
+// 普通 Armed 禁止保存；自动校准只能在 PWM 独立锁存且确认停波后取得维护 lease。
+// 写入与恢复输出共用原子门，不再申请逐阶段的 BootHealth/喂狗维护票据。
 // 和 PX4 的后台保存一样，RAM 参数锁只覆盖编码，介质 I/O 可被高优先级任务抢占。
 namespace {
 class ParameterSaveLease final {
 public:
     explicit ParameterSaveLease(dima::platform::ArmedFlashCoordinator &armed) noexcept
-        : armed_(armed), acquired_(armed.begin_maintenance())
+        : armed_(armed), acquired_(armed.begin_maintenance(true))
     {
     }
     ~ParameterSaveLease()
@@ -73,6 +75,20 @@ int ParameterService::write_flash_snapshot(std::size_t size) noexcept
     } while (result == -EAGAIN);
     if (result != 0) flashfs_.cancel_operation();
     return result;
+}
+
+void ParameterService::report_storage_error(const char *stage, int error) noexcept
+{
+    // storage_save 可能被校准提交循环按 50 Hz 反复调用；同类存储错误限频上报，
+    // 既保留现场证据（errno 可区分 SD 镜像、擦除拒绝、擦除失败与回写失败），
+    // 也不淹没控制台和 mavlink_log。
+    const std::uint64_t now = hrt_absolute_time();
+    if (last_storage_error_report_us_ != 0U && now >= last_storage_error_report_us_ &&
+        now - last_storage_error_report_us_ < kStorageErrorReportIntervalUs) {
+        return;
+    }
+    last_storage_error_report_us_ = now;
+    PX4_ERR("param: %s (%i)", stage, error);
 }
 
 int ParameterService::write_sd_snapshot(std::size_t size) noexcept
@@ -112,11 +128,11 @@ int ParameterService::storage_save(param_storage_enumerator_t enumerate,
 {
     if (enumerate == nullptr || backend_context == nullptr) return -EINVAL;
     auto &self = *static_cast<ParameterService *>(backend_context);
-    // 对齐 PX4 param_save_default(false)：存储忙时立即返回，交给 autosave 限频重试。
+    // 会话 owner 的 EAGAIN 仅表示写入前资源未取得；后台保存仍按 EBUSY 限频等待。
     dima::platform::MutexGuard lock{self.storage_mutex_, dima::platform::Timeout::no_wait()};
-    if (!lock) return -EBUSY;
+    if (!lock) return enumerate_context != nullptr ? -EAGAIN : -EBUSY;
     ParameterSaveLease lease{self.armed_flash_};
-    if (!lease) return -EPERM;
+    if (!lease) return enumerate_context != nullptr ? -EAGAIN : -EBUSY;
     if (self.storage_generation_ == UINT32_MAX) return -EOVERFLOW;
 
     const std::uint32_t generation = self.storage_generation_ + 1U;
@@ -132,24 +148,44 @@ int ParameterService::storage_save(param_storage_enumerator_t enumerate,
     if (flash_result == 0 || sd_result == 0) self.storage_generation_ = generation;
 
     // Flash 满/损坏时，只有 SD 已提交同代完整快照才允许擦除重建；保留掉电恢复边界。
-    if (self.flashfs_ready_ && (flash_result == -ENOSPC || flash_result == -EIO) &&
-        sd_result == 0) {
-        flash_result = self.flashfs_.begin_erase_all(dima::parameters::FLASH_TOKEN_PARAMS);
-        if (flash_result == 0) {
-            flash_result = self.flashfs_.continue_operation();
-            if (flash_result == 0) {
-                flash_result = self.write_flash_snapshot(snapshot_size);
+    // 擦除重建链路上的失败点全部显性上报：否则校准提交循环只会看到持续的
+    // -ENOSPC，无法区分是 SD 镜像未提交还是分区擦除/回写本身失败。
+    if (self.flashfs_ready_ && (flash_result == -ENOSPC || flash_result == -EIO)) {
+        if (sd_result != 0) {
+            self.report_storage_error("storage rebuild skipped: SD mirror failed",
+                                      sd_result);
+        } else {
+            flash_result = self.flashfs_.begin_erase_all(dima::parameters::FLASH_TOKEN_PARAMS);
+            if (flash_result != 0) {
+                self.report_storage_error("storage erase rejected", flash_result);
             } else {
-                self.flashfs_.cancel_operation();
+                flash_result = self.flashfs_.continue_operation();
+                if (flash_result != 0) {
+                    self.flashfs_.cancel_operation();
+                    self.report_storage_error("storage erase failed", flash_result);
+                } else {
+                    flash_result = self.write_flash_snapshot(snapshot_size);
+                    if (flash_result != 0) {
+                        self.report_storage_error("storage rebuild write failed",
+                                                  flash_result);
+                    }
+                }
             }
         }
+    }
+    if (self.flashfs_ready_ ? flash_result == 0 : sd_result == 0) {
+        // 任意成功保存都结束旧介质修复请求；仅 StorageFull 会唤醒 autosave，
+        // 普通积压请求随后由 dirty 位判空，不重写刚保存的会话结果。
+        (void)self.autosave_.resume_after_storage_available();
     }
     self.sd_mirror_required_ = flash_result == 0 && sd_result != 0;
     self.flash_resync_required_ = self.flashfs_ready_ && sd_result == 0 && flash_result != 0;
 
     // 主副本成功即可确认保存；SD 失败留给后台镜像。保存期间是否有新参数，
     // 由 Parameter Core 的写入计数判断，不再重新编码整份快照进行逐字节比较。
-    return self.flashfs_ready_ ? flash_result : sd_result;
+    const int result = self.flashfs_ready_ ? flash_result : sd_result;
+    // 进入介质操作之后不再返回会话的“未开始”信号，防止部分写入被当成可重复尝试。
+    return enumerate_context != nullptr && result == -EAGAIN ? -EIO : result;
 }
 
 int ParameterService::storage_load(param_storage_visitor_t visitor,

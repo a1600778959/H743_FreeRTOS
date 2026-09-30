@@ -52,6 +52,10 @@ public:
                           const void *data, std::size_t size) noexcept;
     /* Refuse to erase if any valid record belongs to another token. */
     int begin_erase_all(flash_file_token_t exclusive_token) noexcept;
+    /* 软失效指定 token 的全部已提交记录：把 commit 字编程为全零，使其不再被
+     * 扫描/独占校验视为有效。用于一次性历史键迁移（如 'dna0' 迁往 SD 后），
+     * 不移动追加高水位，返回失效条数或 -errno；掉电中断后可幂等重跑。 */
+    int invalidate_records(flash_file_token_t token) noexcept;
     int continue_operation() noexcept;
     void cancel_operation() noexcept;
 

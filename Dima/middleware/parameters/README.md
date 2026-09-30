@@ -65,10 +65,11 @@ CAN 磁力计已删除 `MAG1_CAN_NODE`；来源节点号由首个合法磁场广
 - `Param<T, ID>` 保留生成枚举和编译期类型检查，运行期 bind/update 在 `param.cpp` 按 float/INT32/bool 共享实体。bind 成功后才标记 used 并提交缓存；update 不标记 used，未绑定时不读取 Core，失败清零并撤销绑定。bool 仍读取完整 INT32 后转换，不改变计数、原子候选、通知和重启生效语义，也不维护第二份参数表。
 - Parameter Core 的运行期状态、事务及 get/set/reset 位于 `param.cpp`；持久化后端注册、save/load/status 位于 `param_storage.cpp`，公开兼容接口统一由 `param.h` 提供。
 - TinyBSON 和 flashparams 使用调用者提供的固定或启动期 Buffer；编码/解码热路径不动态分配，不包含 fd、POSIX 或文件系统路径。
-- 运行期保存对齐 PX4 v1.17.0 `autosave.cpp` / `parameters.cpp`：`param_set` 立即更新 RAM，MAVLink 立即回显；Autosave 在独立低优先级 `wq:storage` 合并首次变化后的 300 ms 请求，两笔保存开始时刻至少相隔 2 s。一次调用编码并连续完成 Flash 主副本与可用 SD 备份，不再按 10 ms 分步推进。存储忙立即返回，失败限频重试最多 3 次；ENOSPC 暂停，SD 恢复后可重试。
+- 运行期保存对齐 PX4 v1.17.0 `autosave.cpp` / `parameters.cpp`：`param_set` 立即更新 RAM，MAVLink 立即回显；Autosave 在独立低优先级 `wq:storage` 合并首次变化后的 300 ms 请求，两笔保存开始时刻至少相隔 2 s。一次调用编码并连续完成 Flash 主副本与可用 SD 备份，不再按 10 ms 分步推进。存储忙立即返回，一般失败限频重试最多 3 次；ENOSPC 满区挂起并单次上报事件与文本——后台 autosave 永不触发整区擦除，避免擦除动作发生在与用户操作无关的任意时刻（擦除持有维护互锁会短暂阻塞解锁）。满区恢复只经直接保存（自动校准 COMMIT_LEVEL/事务 finalize）中的擦除重建完成；重建成功后 `storage_save` 唤醒被挂起的 autosave（仅解除 StorageFull，不影响 Manual 停止），此后参数变更恢复正常自动保存。
+- FlashFS 擦除前发现其他 token 的 CRC 有效记录时返回 ENOTEMPTY（当前 ARM newlib 为 90），这是记录保护冲突。Autosave 单次报告后进入 StorageProtected 暂停；参数通知、SD 轮询、Flash resync 和换卡均不重开同一故障的自动重试。未保存标记保持，显式保存仍返回实际错误；修复存储冲突后需重新启用参数服务。不得通过擦除其他记录或伪报保存成功消除日志。自动保存是全局服务，不随自动校准退出而整体关闭。
 - FlashFS 是持续可用的主存储，SD 是带 generation 的镜像和恢复源；同 generation 还比较 payload CRC，差异时按既有 Flash 优先规则重建 SD。
 - 无 card-detect GPIO 时每 3 s 低频探测一次；重新挂载后等待 500 ms 再开始首个镜像写事务。介质级错误立即撤销 FileStorage/FatFs 的可用状态，下一次写入必须先完成重新初始化和挂载；失败不改变已经提交的 Flash 主副本。
-- FlashFS 位于 `0x081E0000～0x08200000` 的单个 128 KiB 扇区，保持追加记录与最终 commit 字。按 PX4 `flashfs32.c::write_flash_entry` 连续写入 payload，末尾不足 32 B 时补 `0xff`；底层逐 Flash 字处理 cache/ECC 并回读核对，删除上层重复回读阶段，启动/加载 CRC 保留。空间不足返回 ENOSPC；只有 SD 已提交完整同代快照且扇区没有其他 token 的有效记录，才允许擦除重建。
+- FlashFS 位于 `0x081E0000～0x08200000` 的单个 128 KiB 扇区，保持追加记录与最终 commit 字。按 PX4 `flashfs32.c::write_flash_entry` 连续写入 payload，末尾不足 32 B 时补 `0xff`；底层逐 Flash 字处理 cache/ECC 并回读核对，删除上层重复回读阶段，启动/加载 CRC 保留。空间不足返回 ENOSPC；只有 SD 已提交完整同代快照且扇区没有其他 token 的有效记录，才允许擦除重建——擦除前 SD 已持有当前 RAM 快照，掉电落在任一步都不丢参数（Flash 旧记录未动或 SD 有最新代可恢复）。分区只含 'parm' 一个 token：DNA 分配表曾以 'dna0' 共用本扇区，两 token 互相锁死独占擦除（满区后永久无法回收），已迁往 SD 原子文件 DroneCan 域，遗留记录由组合根开机经 `FlashFS::invalidate_records` 软失效（编程 commit 字为全零，幂等可续跑）。擦除重建链路上的失败点（SD 镜像未提交、擦除被拒、擦除失败、重建回写失败）由 `storage_save` 按 30 s 限频输出 PX4_ERR 与 errno——此前这些分支完全静默，校准提交循环只能看到持续的 ENOSPC，无法定位是 SD 镜像还是扇区擦除问题。
 - 每笔保存只编码一次；Parameter Core 用写入计数覆盖编码到提交的窗口，有新变化就保留 unsaved 并安排下一笔，删除保存后再次编码、CRC 与逐字节对比。参数 RAM 锁不覆盖 Flash/SD I/O，保存期间仍可读取和设置参数。
 - CRC/格式有效的旧快照若含当前目录已不存在的退役名称，只跳过对应条目；已知参数类型不符或快照格式无效时仍整份拒绝。当前固件不提供旧键别名或参数目录迁移表。
 
@@ -91,3 +92,7 @@ ParamLayer、ConstLayer、DynamicSparseLayer、AtomicTransaction 与 CRC32 的�
 `param_handle()` 仅执行生成枚举到 `param_t` 的单行 `constexpr` 转换，按头文件单行返回例外保留常量折叠；Param 的绑定/更新仍使用已有按值类型共享的源文件实体，不复制参数目录。
 
 `PWM Outputs` 分组经官方 JSON 派生 `PwmOutputField/PwmOutputFunction/kPwmOutputParameters`。生成器检查通道连续、各通道字段及功能值一致；消费者只用生成索引和绑定，通道数另与平台能力静态互证，不维护六路名称副本。可逆通道的严格中位关系由 MotorOutput 在 Disarmed 完整快照中核验。
+
+自动校准会话的存储暂停锁由 CalibrationParameters 从 Level 之前持有到 FINALIZE。`param_storage_save(owner)` 与普通 `param_save_default` 共用同一编码/后端流程，仅允许锁 owner 在暂停期间作最终保存；普通 autosave、外部保存/加载仍被暂停。自动 Level 复用会话锁，手动传感器校准仍独立持锁。最终保存清空 dirty 位后，积压 autosave 不重复保存；Flash 介质修复请求可显式 force，不影响会话暂停语义。
+
+会话最终保存的 EAGAIN 只用于取得存储 mutex/维护租约之前，表示尚未编码或写入；FINALIZE 保持暂停锁并继续等待。开始介质操作后的错误不能映射为该等待信号，避免误重复保存。

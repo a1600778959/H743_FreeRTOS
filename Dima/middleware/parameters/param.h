@@ -118,6 +118,8 @@ int param_load_default(void);
 bool param_storage_pause(const void *owner) PARAM_NOEXCEPT;
 bool param_storage_resume(const void *owner) PARAM_NOEXCEPT;
 bool param_storage_paused(void) PARAM_NOEXCEPT;
+/* 暂停锁 owner 的最终保存；保存期间保持锁，成功后由 owner 显式释放。 */
+int param_storage_save(const void *owner) PARAM_NOEXCEPT;
 uint32_t param_set_count(void) PARAM_NOEXCEPT;
 void param_print_status(void);
 void param_notify_changes(void) PARAM_NOEXCEPT;

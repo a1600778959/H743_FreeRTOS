@@ -452,6 +452,76 @@ int FlashFS::begin_erase_all(flash_file_token_t exclusive_token) noexcept
     return 0;
 }
 
+int FlashFS::invalidate_records(flash_file_token_t token) noexcept
+{
+    if (platform::in_interrupt_context()) {
+        return -EPERM;
+    }
+    if (!initialized_) { return -ENODEV; }
+    if (!ready_) { return -EIO; }
+    platform::MutexGuard lock{mutex_};
+    if (!lock) { return -EDEADLK; }
+    if (operation_ != Operation::Idle) {
+        return -EBUSY;
+    }
+
+    platform::FlashTransaction transaction{
+        transactions_, platform::Timeout::from_ms(50U)};
+    if (!transaction) {
+        return -EBUSY;
+    }
+    platform::FlashWriteLease write_lease{armed_flash_};
+    if (!write_lease) {
+        return -EPERM;
+    }
+
+    /* 只失效“完全有效”的记录：CRC 已损坏的记录本就不阻塞独占擦除。commit
+     * 字独立占一个 Flash 字，编程全零只清位不擦除；任一步失败立即返回，
+     * 已失效的记录保持失效，下一次上电幂等续跑。 */
+    alignas(kFlashWordBytes) std::uint8_t zeros[kFlashWordBytes]{};
+    int invalidated = 0;
+    std::size_t offset = 0U;
+    while (offset + kHeaderFlashBytes <= partition_size_) {
+        HeaderFields header{};
+        if (!partition_.read(offset, &header, sizeof(header))) {
+            return -EIO;
+        }
+        if (header.magic == kMagicBlank || header.magic != kMagicValid ||
+            !header_crc_valid(header)) {
+            offset += kFlashWordBytes;
+            continue;
+        }
+        std::uint32_t commit_marker = 0U;
+        if (!partition_.read(offset + kFlashWordBytes, &commit_marker,
+                             sizeof(commit_marker))) {
+            return -EIO;
+        }
+        const bool size_valid =
+            header.size > 0U &&
+            header.size <= partition_size_ - offset - kHeaderFlashBytes;
+        if (!size_valid) {
+            offset += kFlashWordBytes;
+            continue;
+        }
+        const std::size_t total = compute_total_size(header.size);
+        if (total > partition_size_ - offset) {
+            offset += kFlashWordBytes;
+            continue;
+        }
+        if (header.flag == kFlagValid && commit_marker == kFlagValid &&
+            header.token == token && verify_crc(header, offset)) {
+            if (!partition_.program(offset + kFlashWordBytes, zeros,
+                                    sizeof(zeros))) {
+                ++status_.write_failures;
+                return -EIO;
+            }
+            ++invalidated;
+        }
+        offset += total;
+    }
+    return invalidated;
+}
+
 int FlashFS::continue_operation() noexcept
 {
     if (platform::in_interrupt_context()) {

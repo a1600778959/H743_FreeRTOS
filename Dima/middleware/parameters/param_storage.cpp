@@ -18,7 +18,7 @@ using namespace dima::parameters::internal;
 namespace {
 
 int enumerate_changed(param_storage_visitor_t visitor, void *visitor_context,
-                      void *) noexcept
+                      void *owner) noexcept
 {
     if (!task_read_allowed() || visitor == nullptr) {
         return -EPERM;
@@ -27,7 +27,7 @@ int enumerate_changed(param_storage_visitor_t visitor, void *visitor_context,
     px4::AtomicTransaction transaction;
     // 此检查与遍历同处参数锁内：进入校准之前开始的保存最多序列化旧的完整
     // 快照；进入校准之后的保存无法读到候选，关闭检查/使用间隙。
-    if (g_storage_pause_owner != nullptr) return -EBUSY;
+    if (g_storage_pause_owner != owner) return -EBUSY;
     if (!g_initialized) {
         return -EINVAL;
     }
@@ -79,11 +79,7 @@ int load_value_to_layer(const char *name, param_type_t type, const void *value,
     return layer.store(param, next) ? 0 : -ENOMEM;
 }
 
-} // namespace
-
-extern "C" {
-
-int param_save_default(bool)
+int save_parameters(const void *owner)
 {
     if (!service_write_allowed()) { return -EPERM; }
 
@@ -92,14 +88,14 @@ int param_save_default(bool)
     uint32_t set_count_snapshot{};
     {
         px4::AtomicTransaction transaction;
-        if (g_storage_pause_owner != nullptr) return -EBUSY;
+        if (g_storage_pause_owner != owner) return -EBUSY;
         if (!g_storage || !g_storage->save) { return -ENOSYS; }
         backend = g_storage;
         backend_context = g_storage_context;
         set_count_snapshot = g_set_count;
     }
 
-    const int result = backend->save(enumerate_changed, nullptr, backend_context);
+    const int result = backend->save(enumerate_changed, const_cast<void *>(owner), backend_context);
     if (result == 0) {
         px4::AtomicTransaction transaction;
         ++g_export_count;
@@ -109,6 +105,21 @@ int param_save_default(bool)
         g_unsaved.reset();
     }
     return result;
+}
+
+} // namespace
+
+extern "C" {
+
+int param_save_default(bool)
+{
+    return save_parameters(nullptr);
+}
+
+int param_storage_save(const void *owner) noexcept
+{
+    // 仅持有暂停锁的会话可以保存；整个序列化/Flash/SD 调用期间都不放开 autosave。
+    return owner != nullptr ? save_parameters(owner) : -EINVAL;
 }
 
 int param_load_default(void)

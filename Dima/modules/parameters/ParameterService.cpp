@@ -234,6 +234,7 @@ void ParameterService::reset_runtime_state() noexcept
     last_sd_poll_us_ = 0U;
     last_sd_mirror_attempt_us_ = 0U;
     sd_mirror_ready_after_us_ = 0U;
+    last_storage_error_report_us_ = 0U;
 }
 
 void ParameterService::Run()
@@ -265,7 +266,7 @@ void ParameterService::Run()
         autosave_.request();
     }
     if (flash_resync_required_ && !autosave_.pending()) {
-        autosave_.request();
+        autosave_.request(true);
     }
     service_sd_mirror();
 }

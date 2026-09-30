@@ -49,7 +49,7 @@ public:
      * armed 时延期，MAVLink 回显和实时控制不等待介质写入。 */
     explicit ParamAutosave(
         dima::platform::ArmedFlashCoordinator &armed_flash) noexcept;
-    void request() noexcept;
+    void request(bool force = false) noexcept;
     void enable() noexcept;
     bool resume_after_storage_available() noexcept;
     void stop() noexcept;
@@ -58,12 +58,17 @@ public:
     hrt_abstime lastAutosave() const noexcept;
 
 private:
+    bool _force_save{false};
     enum class DisableReason : std::uint8_t {
-        /* Manual 需显式 enable；StorageFull 只有介质恢复路径才可 resume，避免
-         * ENOSPC 状态下无界高频重试磨损介质并刷日志。 */
+        /* Manual 需显式 enable。StorageFull 满区挂起：后台 autosave 永不
+         * 触发整区擦除；重建只在直接保存（自动校准提交/事务 finalize）中
+         * 进行，成功后由 storage_save 唤醒本挂起。
+         * StorageProtected 表示 Flash 内其他有效记录阻止擦除，换 SD 或
+         * 周期 request 不能解决；修复存储后显式重新启用服务才恢复。 */
         None,
         Manual,
         StorageFull,
+        StorageProtected,
     };
 
     void Run() override;

@@ -31,11 +31,15 @@ enum class LoadedSource : std::uint8_t {
     Temporary,
 };
 
-constexpr std::size_t kAtomicFileDomainCount = 2U;
+constexpr std::size_t kAtomicFileDomainCount = 3U;
 
 std::size_t domain_index(platform::AtomicFileDomain domain) noexcept
 {
-    return domain == platform::AtomicFileDomain::Mission ? 1U : 0U;
+    switch (domain) {
+    case platform::AtomicFileDomain::Mission: return 1U;
+    case platform::AtomicFileDomain::DroneCan: return 2U;
+    default: return 0U;
+    }
 }
 
 /* 保存状态机：tmp 分块写入 -> sync/close -> 逐字节回读验证 -> 删除旧 backup ->

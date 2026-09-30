@@ -44,6 +44,8 @@ private:
     // 无 card-detect GPIO 时，首次成功挂载后再等待 500 ms 才写镜像，避免机械触点
     // 尚未稳定就立即进入 FAT 元数据事务；真正写入前仍会再次检查介质状态。
     static constexpr std::uint64_t kSdMountSettleUs = 500000ULL;
+    // 高频重试的保存（如校准 COMMIT_LEVEL 50 Hz 循环）下，存储错误的最小上报间隔。
+    static constexpr std::uint64_t kStorageErrorReportIntervalUs = 30000000ULL;
     static constexpr std::size_t kSnapshotHeaderBytes = 20U;
     static constexpr std::size_t kPayloadCapacity =
         dima::generated::parameters::kParameterStorageMaxBytes +
@@ -74,6 +76,7 @@ private:
     bool parameters_unsaved() const noexcept;
     void poll_sd_card() noexcept;
     void reset_runtime_state() noexcept;
+    void report_storage_error(const char *stage, int error) noexcept;
 
     static const param_storage_backend_s storage_backend_;
 
@@ -108,6 +111,8 @@ private:
     std::uint64_t last_sd_poll_us_{0U};
     std::uint64_t last_sd_mirror_attempt_us_{0U};
     std::uint64_t sd_mirror_ready_after_us_{0U};
+    // storage_save 可能被校准提交循环高频重试；存储错误按固定间隔限频上报。
+    std::uint64_t last_storage_error_report_us_{0U};
 };
 
 } // namespace dima::modules::parameters
