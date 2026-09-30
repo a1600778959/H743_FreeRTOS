@@ -74,7 +74,7 @@ bool calibration_projection_common(const vehicle_control_mode_s &control) noexce
 
 bool calibration_open_loop_projection(const vehicle_control_mode_s &control) noexcept
 {
-    // 开环校准只拥有 normalized axes；任何 Mission 闭环标志都必须保持关闭。
+    // 校准双轴/航向机动均不启用Speed/YawRate PI；不得借该投影开启Mission闭环。
     return calibration_projection_common(control) &&
         !control.flag_control_velocity_enabled && !control.flag_control_rates_enabled;
 }
