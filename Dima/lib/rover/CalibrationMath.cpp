@@ -32,31 +32,6 @@ bool CircularMean::result(float &angle, float minimum_concentration) const noexc
     return std::isfinite(angle);
 }
 
-void SpeedFit::add(float throttle, float speed, std::size_t level) noexcept
-{
-    if (!std::isfinite(throttle) || !std::isfinite(speed) || throttle <= 0.0F ||
-        speed <= 0.0F || level >= 3U) return;
-    uu += throttle * throttle;
-    uv += throttle * speed;
-    vv += speed * speed;
-    sum_v += speed;
-    ++count;
-    ++levels[level];
-}
-
-bool SpeedFit::result(float &full_speed) const noexcept
-{
-    // 拟合 v=k*u 的零截距前馈模型；只用稳定且整形输入输出一致的样本。
-    // 多档覆盖与相对残差共同拒绝死区/非线性，禁止从一个低速点盲目外推。
-    if (count < 60U || uu <= 0.0 || sum_v <= 0.0 ||
-        levels[0] < 10U || levels[1] < 10U || levels[2] < 10U) return false;
-    const double k = uv / uu;
-    const double rms = std::sqrt(std::max(0.0, vv - uv * uv / uu) / count);
-    if (!std::isfinite(k) || k < 0.1 || k > 20.0 || rms > 0.15 * sum_v / count) return false;
-    full_speed = static_cast<float>(k);
-    return true;
-}
-
 bool baseline(float *samples, std::size_t count, float &length) noexcept
 {
     if (count < 100U || count > 120U) return false;

@@ -5,7 +5,7 @@ namespace dima::lib::rover::calibration {
 // 固定全球中心与定位点的圆形约束；不代表车身外廓，也不依赖 EKF 本地原点。
 struct CircleFence {
     double latitude_deg{}, longitude_deg{};
-    float origin_error_m{}, radius_m{}, stop_distance_m{};
+    float origin_error_m{}, radius_m{}, deceleration_m_s2{};
     float speed_limit_m_s{};
 };
 
@@ -26,6 +26,13 @@ struct CircleFenceResult {
 };
 
 CircleFenceResult evaluate_circle(const CircleFence &fence, double latitude_deg,
-    double longitude_deg, float position_error_m, float position_age_s) noexcept;
+    double longitude_deg, float position_error_m, float position_age_s, float stop_distance_m) noexcept;
+
+CircleFenceResult evaluate_straight(const CircleFence &reference, float length_m,
+    double latitude_deg, double longitude_deg, float position_error_m,
+    float position_age_s, float stop_distance_m) noexcept;
+CircleFenceResult evaluate_braking_probe(const CircleFence &reference, float length_m,
+    double latitude_deg, double longitude_deg, float position_error_m,
+    float position_age_s) noexcept;
 
 } // namespace dima::lib::rover::calibration

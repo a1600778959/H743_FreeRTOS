@@ -20,7 +20,9 @@ CalibrationSessionLimits session_limits(float cruise, float motor) noexcept
     return limits;
 }
 
-CircleFenceResult evaluate_circle(const CircleFence &fence, double latitude,
+namespace {
+
+CircleFenceResult evaluate_position(const CircleFence &fence, double latitude,
     double longitude, float error, float age) noexcept
 {
     const float unavailable = std::numeric_limits<float>::quiet_NaN();
@@ -52,16 +54,54 @@ CircleFenceResult evaluate_circle(const CircleFence &fence, double latitude,
     result.east_m = static_cast<float>(east);
     result.position_valid = std::isfinite(result.distance_m);
     result.inside = result.position_valid && result.distance_m < fence.radius_m;
-    if (!std::isfinite(fence.stop_distance_m) || fence.stop_distance_m <= 0.0F || fence.stop_distance_m > 100.0F) return result;
-
     // 保守使用入场冻结的速度上限，而非某拍较小速度。300 ms 留给接收机
     // 解算/串行链路，100 ms 请求 TTL + 两个 10 ms 控制/输出周期另计；样本
-    // 当前年龄再加入。停车参数覆盖请求发出后的执行器响应及惯性，不能拿
-    // RO_DECEL_LIM 命令限值替代实测上界。实板须证明链路/停车满足这些预算。
-    result.margin_m = 0.5F + 3.0F * (fence.origin_error_m + error) +
-        fence.speed_limit_m_s * (0.30F + 0.10F + 0.01F + 0.01F + age) + fence.stop_distance_m;
+    // 当前年龄再加入。停车距离另由调用方提供本轮实测值，不用平均减速度
+    // 再计算一个假定匀减速距离；定位与请求延迟边界仍与物理测量分开。
+    // 直接计入接收机报告的定位误差，不另乘3倍构造模式侧置信边界。
+    result.margin_m = 0.5F + fence.origin_error_m + error +
+        fence.speed_limit_m_s * (0.30F + 0.10F + 0.01F + 0.01F + age);
+    return result;
+}
+
+} // namespace
+
+CircleFenceResult evaluate_circle(const CircleFence &fence, double latitude,
+    double longitude, float error, float age, float stop) noexcept
+{
+    auto result = evaluate_position(fence, latitude, longitude, error, age);
+    if (!result.position_valid || !std::isfinite(stop) || stop < 0.0F) return result;
+    result.margin_m += stop;
     result.working_radius_m = std::max(0.0F, fence.radius_m - result.margin_m);
     result.can_stop = result.inside && result.distance_m < result.working_radius_m;
+    return result;
+}
+
+CircleFenceResult evaluate_braking_probe(const CircleFence &reference, float length,
+    double latitude, double longitude, float error, float age) noexcept
+{
+    // 首次全输出试验尚无停车观测，只核验冻结的几何范围与有效定位。
+    // 不保留已经退役的低速探测目标、3σ速度地板或0.3减速度假设。
+    auto result = evaluate_position(reference, latitude, longitude, error, age);
+    if (!result.position_valid || !std::isfinite(length) || length < 1.0F || length > 100.0F) return {};
+    result.working_radius_m = length;
+    result.inside = result.distance_m < length;
+    result.can_stop = result.inside; // 在FENCE_BRAKING_PROBE中只表示试验范围，非停车能力证明。
+    return result;
+}
+
+CircleFenceResult evaluate_straight(const CircleFence &reference, float length,
+    double latitude, double longitude, float error, float age, float stop) noexcept
+{
+    auto result = evaluate_circle(reference, latitude, longitude, error, age, stop);
+    if (!result.position_valid || !std::isfinite(result.margin_m) ||
+        !std::isfinite(stop) || stop < 0.0F ||
+        !std::isfinite(length) || length < 1.0F || length > 100.0F) return {};
+    // 直线独立限制距入场点的位移，不用 RO_CAL_RADIUS 裁短航段。端点外的
+    // 0.5 m 用于到点/掉头容差，误差、链路与理论制动余量仍用于越界判定。
+    result.working_radius_m = length + 0.5F;
+    result.inside = result.distance_m < result.working_radius_m + result.margin_m;
+    result.can_stop = result.distance_m < result.working_radius_m;
     return result;
 }
 
