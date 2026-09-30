@@ -7,7 +7,9 @@
 #include "api/Console.hpp"
 #include "api/Memory.hpp"
 #include "api/TaskRuntime.hpp"
+#include "parameters/flashfs.h"
 
+#include <DroneCanContract.hpp>
 #include "events/events.hpp"
 #include "logging/logging.hpp"
 #include "uORB/uORB.hpp"
@@ -18,6 +20,22 @@
 
 namespace dima::rover {
 namespace {
+
+// 一次性迁移用的历史 FlashFS token：DNA 分配表迁往 SD DroneCan 域后，参数
+// 分区里遗留的 'dna0' 记录会永久阻塞整区擦除（独占校验只认 token）。
+dima::parameters::flash_file_token_t legacy_dna_token() noexcept
+{
+    dima::parameters::flash_file_token_t token{};
+    for (std::size_t index = 0U;
+         index < sizeof(token.bytes) &&
+         index < sizeof(dima::protocols::dronecan::generated::
+                            kAllocationStorageToken);
+         ++index) {
+        token.bytes[index] = dima::protocols::dronecan::generated::
+            kAllocationStorageToken[index];
+    }
+    return token;
+}
 
 void *uorb_allocate(size_t size, size_t alignment) noexcept
 {
@@ -114,8 +132,7 @@ ApplicationContext::ApplicationContext(
       vehicle_magnetometer_(services.armed_flash),
       sensor_calibration_(services.armed_flash, vehicle_imu_,
                           vehicle_magnetometer_),
-      dronecan_mag2_(services.can, services.armed_flash, maintenance_,
-                     flashfs_),
+      dronecan_mag2_(services.can, services.armed_flash, maintenance_),
       ekf2_(ekf2_instance()),
       motor_output_(services.actuator_pwm),
       commander_(services.armed_flash, maintenance_, mission_service_),
@@ -260,6 +277,17 @@ bool ApplicationContext::init() noexcept
     if (!parameter_service_.init()) {
         (void)rollback_initialization();
         return false;
+    }
+
+    // 一次性迁移：软失效参数分区里遗留的 legacy 'dna0' 分配表记录，恢复
+    // 'parm' 单 token 独占，使满区时“SD 提交 -> 整区擦除重建”可用。编程
+    // 只清位不擦除；掉电中断后下一次上电幂等续跑，全部失效后为空操作。
+    const int invalidated = flashfs_.invalidate_records(legacy_dna_token());
+    if (invalidated > 0) {
+        PX4_INFO("param: invalidated %i legacy DNA flash records",
+                 invalidated);
+    } else if (invalidated < 0) {
+        PX4_WARN("param: legacy DNA invalidation failed (%i)", invalidated);
     }
 
     services_.diagnostics.set_stage(

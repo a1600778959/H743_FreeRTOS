@@ -16,10 +16,6 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace dima::parameters {
-class FlashFS;
-}
-
 namespace dima::drivers::magnetometer {
 
 // DroneCAN 磁力计后端只拥有 CAN 节点、源选择、Mag/Mag2 解码和原始 sensor_mag
@@ -30,8 +26,7 @@ public:
     DroneCanMag2(dima::platform::CanTransport &transport,
                  dima::platform::ArmedFlashCoordinator &armed,
                  dima::middleware::maintenance::
-                     RuntimeMaintenanceCoordinator &maintenance,
-                 dima::parameters::FlashFS &allocation_storage) noexcept;
+                     RuntimeMaintenanceCoordinator &maintenance) noexcept;
 
     bool start() override;
     void stop() override;
@@ -105,7 +100,12 @@ private:
     dima::platform::ArmedFlashCoordinator &armed_;
     dima::middleware::maintenance::RuntimeMaintenanceCoordinator
         &maintenance_;
-    dima::parameters::FlashFS &allocation_storage_;
+    // 分配表保存在 SD 原子文件域；换卡/无卡启动后首次保存需要先重新发现
+    // primary/backup/tmp，本缓冲只承载该次发现读回，不保存 DroneCanNode 的
+    // 保存缓冲（其由节点持有到事务结束）。
+    alignas(4) std::uint8_t allocation_rediscovery_image_[
+        dima::protocols::dronecan::generated::
+            kAllocationStorageImageBytes]{};
     uORB::Subscription parameter_update_subscription_{
         ORB_ID(parameter_update)};
     // 参数句柄均来自统一生成的 dima::params；这里不保留参数名字符串、句柄

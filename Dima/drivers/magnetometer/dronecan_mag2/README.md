@@ -14,6 +14,7 @@
 
 - `module_dronecan.yaml` 与其他 `module_*.yaml` 一样直接进入统一参数工具链；`UAVCAN1_ENABLE/BITRATE/NODE_ID` 位于 `UAVCAN` 参数组。驱动通过生成的 `dima::ParamInt` 绑定这些参数，不保留 JSON、构建目录 YAML 或 DroneCAN 专用参数头。`SENS_MAG_RATE` 和 `CAL_MAG0_*` 只由独立 `VehicleMagnetometer` 前端拥有。
 - 共享节点能力提供本机节点 ID、1 Hz NodeStatus、GetNodeInfo 和默认开启的集中式动态节点分配；匿名外设仍须支持并发送标准 DNA 请求，已具有节点号的外设直接从广播来源识别。
+- 分配表持久化在 SD 原子文件 DroneCan 域（`0:/dima/dnacan.{bin,bak,tmp}` 三文件轮换）：已知 uid 直接复用原 node id，不写介质；新 uid 先保存成功再对外承诺绑定。曾与参数快照共用参数 FlashFS 分区（'dna0' token），两 token 互相锁死整区擦除后迁出（docs/adr/0006）；遗留记录由组合根开机软失效。无卡会话按空表启动并易失降级（-ENODEV 先按 1 s 节奏重试满 15 s 宽限窗，仍无介质才 RAM-only；绑定不跨上电，仍发有界 StorageFailure 事件），换卡后首次保存先重新发现 primary/backup/tmp。`DroneCAN DNA storage error=-19` 即该降级/重试期间的介质通知，非总线故障。
 - 磁力计节点不提供手动选择参数。协议启动后自动探测首个通过传输、解码和三轴有限值检查的 Mag/Mag2 广播来源，将节点号与生成的 device ID 记录在当前会话，并由 transfer-ID tracker 拒绝重复/过期传输。绑定后不接受其他节点；500 ms 超时只标记离线，协议重启后才重新发现，避免运行中混用校准对象。
 - DroneCAN 驱动只发布未套用 `CAL_MAG0_*` 的 `sensor_mag`，设备 ID 为 0、旧 ID 失配或校准无效都不能阻断原始数据。
 - `Dima/modules/sensors/magnetometer/VehicleMagnetometer.*` 独立订阅 `sensor_mag`，按检测到的 device ID 选择匹配校准或 PX4 identity correction，再按 `SENS_MAG_RATE` 的 1..200 Hz 上限平均并发布 `vehicle_magnetometer`。该参数不改变远端 RM3100 的硬件采样率。

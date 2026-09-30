@@ -2,8 +2,9 @@
 #include "DroneCanMag2.hpp"
 
 #include "logging/logging.hpp"
+#include "api/AtomicFileStore.hpp"
 #include "api/BoardIdentity.hpp"
-#include "parameters/flashfs.h"
+#include "parameters/FileStorage.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -31,14 +32,8 @@ constexpr bool operating_mode_supported(std::int32_t raw) noexcept
            raw == static_cast<std::int32_t>(OperatingMode::Automatic);
 }
 
-dima::parameters::flash_file_token_t allocation_storage_token() noexcept
-{
-    // FlashFS token 来自生成合同，确保动态分配表的持久化键与架构/生成门禁一致。
-    dima::parameters::flash_file_token_t token{};
-    std::copy_n(contract::kAllocationStorageToken,
-                sizeof(token.bytes), token.bytes);
-    return token;
-}
+constexpr dima::platform::AtomicFileDomain kAllocationDomain =
+    dima::platform::AtomicFileDomain::DroneCan;
 
 } // namespace
 
@@ -264,37 +259,52 @@ bool DroneCanMag2::start_protocol(std::uint64_t now) noexcept
         node_configuration.identity.unique_id[index + 8U] =
             static_cast<std::uint8_t>(uid_extension >> (index * 8U));
     }
-    // 集中式分配表通过 FlashFS 固定 token 异步保存；read 必须精确返回完整
-    // 生成镜像大小，短读按 -EILSEQ 拒绝，不能接受半份映像。
-    node_configuration.allocation_storage.context = &allocation_storage_;
+    // 分配表保存在 SD 原子文件 DroneCan 域（三文件轮换 + 回读校验）；曾共用
+    // 参数 FlashFS 分区，因两 token 互相锁死整区擦除而迁出（docs/adr/0006）。
+    // read 必须精确返回完整生成镜像大小，短读按 -EILSEQ 拒绝，不能接受半份
+    // 映像；无卡按首次启动空表处理，其他介质错误 fail-closed。
+    node_configuration.allocation_storage.context = this;
+    node_configuration.allocation_storage.allow_volatile_fallback = true;
     node_configuration.allocation_storage.load = +[](
         void *context, std::uint8_t *data,
         std::size_t capacity) noexcept -> int {
-        auto *const storage = static_cast<dima::parameters::FlashFS *>(context);
-        if (storage == nullptr) return -EINVAL;
-        const int result = storage->read_entry(
-            allocation_storage_token(), data, capacity);
-        if (result < 0) return result;
-        return static_cast<std::size_t>(result) == capacity ? 0 : -EILSEQ;
+        if (context == nullptr) return -EINVAL;
+        std::size_t size = 0U;
+        const int result = dima::file_storage_load(
+            kAllocationDomain, data, capacity, size, nullptr, nullptr);
+        if (result == -ENODEV) return -ENOENT;
+        if (result != 0) return result;
+        return size == capacity ? 0 : -EILSEQ;
     };
     node_configuration.allocation_storage.begin_save = +[](
         void *context, const std::uint8_t *data,
         std::size_t size) noexcept -> int {
-        auto *const storage = static_cast<dima::parameters::FlashFS *>(context);
-        return storage == nullptr
-                   ? -EINVAL
-                   : storage->begin_write_entry(
-                         allocation_storage_token(), data, size);
+        auto *const driver = static_cast<DroneCanMag2 *>(context);
+        if (driver == nullptr) return -EINVAL;
+        int result = dima::file_storage_begin_save(kAllocationDomain, data, size);
+        if (result == -ESTALE) {
+            // 换卡/无卡启动后的首次保存需先重新发现 primary/backup/tmp；发现
+            // 读回只进入驱动自有缓冲，不触碰 DroneCanNode 持有的保存数据。
+            std::size_t ignored = 0U;
+            const int rediscovered = dima::file_storage_load(
+                kAllocationDomain,
+                driver->allocation_rediscovery_image_,
+                sizeof(driver->allocation_rediscovery_image_),
+                ignored, nullptr, nullptr);
+            if (rediscovered != -EBUSY && rediscovered != -EDEADLK) {
+                result = dima::file_storage_begin_save(
+                    kAllocationDomain, data, size);
+            }
+        }
+        return result;
     };
     node_configuration.allocation_storage.continue_save = +[](
-        void *context) noexcept -> int {
-        auto *const storage = static_cast<dima::parameters::FlashFS *>(context);
-        return storage == nullptr ? -EINVAL : storage->continue_operation();
+        void *) noexcept -> int {
+        return dima::file_storage_continue_save(kAllocationDomain);
     };
     node_configuration.allocation_storage.cancel_save = +[](
-        void *context) noexcept {
-        auto *const storage = static_cast<dima::parameters::FlashFS *>(context);
-        if (storage != nullptr) storage->cancel_operation();
+        void *) noexcept {
+        dima::file_storage_cancel_save(kAllocationDomain);
     };
 
     // C ABI 回调只把 context 转回当前对象；广播在回调内同步解码，因为

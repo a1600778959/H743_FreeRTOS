@@ -51,6 +51,11 @@ std::uint32_t read_u32(const std::uint8_t *source) noexcept
            (static_cast<std::uint32_t>(source[3]) << 24U);
 }
 
+// -ENODEV 易失降级的宽限窗：开机 SD 挂载（3 s 轮询）可能晚于首个 DNA 身份
+// 保存，先按 kPersistenceRetryUs 节奏重试满窗口；仍无介质才按 RAM-only
+// 降级，避免“卡在但慢就绪”被每次开机误降级且身份永远落不了盘。
+constexpr std::uint64_t kVolatileFallbackGraceUs = 15000000ULL;
+
 } // namespace
 
 std::uint32_t DroneCanNode::unique_id_fingerprint(
@@ -127,6 +132,7 @@ void DroneCanNode::reset_allocation() noexcept
     last_allocation_message_us_ = 0U;
     storage_retry_after_us_ = 0U;
     next_allocation_error_event_us_ = 0U;
+    pending_commit_staged_us_ = 0U;
     last_allocation_storage_error_ = 0;
     pending_commit_ = {};
     pending_allocation_response_ = {};
@@ -304,6 +310,7 @@ bool DroneCanNode::stage_commit(PendingCommitKind kind,
                     pending_commit_.unique_id);
     }
     encode_allocation_image();
+    pending_commit_staged_us_ = now_us;
     storage_retry_after_us_ = now_us;
     return true;
 }
@@ -684,6 +691,20 @@ void DroneCanNode::service_allocation_storage(
         allocation_storage_active_ = false;
     }
     if (result == -EAGAIN || result == -EBUSY) return;
+    if (result == -ENODEV &&
+        configuration_.allocation_storage.allow_volatile_fallback &&
+        pending_commit_staged_us_ != 0U &&
+        now_us >= pending_commit_staged_us_ &&
+        now_us - pending_commit_staged_us_ >= kVolatileFallbackGraceUs) {
+        // 宽限窗内重试仍无介质的显式降级：绑定只在 RAM 生效，掉电后由确定性
+        // 重分配恢复。仍上报有界 StorageFailure 让操作者可见，不把易失成功
+        // 伪装成持久成功。
+        emit_bounded_allocation_error(
+            AllocationEventKind::StorageFailure, now_us,
+            pending_commit_.node_id, result);
+        apply_completed_commit(now_us);
+        return;
+    }
     ++stats_.allocation_storage_failures;
     last_allocation_storage_error_ =
         result != 0 ? result : -EIO;

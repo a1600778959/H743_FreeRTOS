@@ -33,11 +33,10 @@ DroneCanMag2::DroneCanMag2(
     dima::platform::CanTransport &transport,
     dima::platform::ArmedFlashCoordinator &armed,
     dima::middleware::maintenance::RuntimeMaintenanceCoordinator
-        &maintenance,
-    dima::parameters::FlashFS &allocation_storage) noexcept
+        &maintenance) noexcept
     : px4::ScheduledWorkItem("dronecan_mag2", px4::wq_configurations::io),
       transport_(transport), protocol_node_(transport), armed_(armed),
-      maintenance_(maintenance), allocation_storage_(allocation_storage)
+      maintenance_(maintenance)
 {
 }
 

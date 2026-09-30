@@ -47,6 +47,11 @@ public:
         int (*continue_save)(void *context) noexcept{nullptr};
         void (*cancel_save)(void *context) noexcept{nullptr};
         void *context{nullptr};
+        // 无介质（-ENODEV）时按 RAM-only 完成提交，仍发有界 StorageFailure
+        // 事件：绑定不跨上电，由下一次上电的确定性重分配恢复。降级有宽限窗
+        // （先按重试节奏等满窗口，覆盖开机 SD 慢就绪）；仅 -ENODEV 降级，
+        // I/O 等真实故障保持 fail-closed 重试。
+        bool allow_volatile_fallback{false};
     };
 
     struct Configuration {
@@ -242,6 +247,9 @@ private:
     std::uint64_t last_allocation_message_us_{0U};
     std::uint64_t storage_retry_after_us_{0U};
     std::uint64_t next_allocation_error_event_us_{0U};
+    // 当前 pending commit 的入队时刻；-ENODEV 宽限窗据此判断介质是慢就绪
+    // 还是真的缺席，避免开机挂载竞态被立即误降级为 RAM-only。
+    std::uint64_t pending_commit_staged_us_{0U};
     std::int32_t last_allocation_storage_error_{0};
     PendingCommit pending_commit_{};
     PendingAllocationResponse pending_allocation_response_{};
